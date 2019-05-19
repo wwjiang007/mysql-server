@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2017, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -25,6 +25,8 @@
 #ifndef SIMULATEDBLOCK_H
 #define SIMULATEDBLOCK_H
 
+#include <new>
+
 #include <NdbTick.h>
 #include <kernel_types.h>
 #include <util/version.h>
@@ -39,6 +41,7 @@
 #include "Pool.hpp"
 #include <NodeInfo.hpp>
 #include <NodeState.hpp>
+#include "OutputStream.hpp"
 #include "GlobalData.hpp"
 #include "LongSignal.hpp"
 #include <SignalLoggerManager.hpp>
@@ -64,6 +67,10 @@
 #include <blocks/record_types.hpp>
 
 #include "Ndbinfo.hpp"
+#include "portlib/NdbMem.h"
+#include <ndb_global.h>
+
+struct CHARSET_INFO;
 
 #define JAM_FILE_ID 248
 
@@ -407,7 +414,7 @@ enum OverloadStatus
    live system.
 */
 
-class SimulatedBlock :
+class alignas(NDB_CL) SimulatedBlock :
   public SegmentUtils  /* SimulatedBlock implements the Interface */
 {
   friend class TraceLCP;
@@ -431,6 +438,36 @@ class SimulatedBlock :
 public:
   friend class BlockComponent;
   virtual ~SimulatedBlock();
+
+  static void * operator new (size_t sz)
+  {
+    void* ptr = NdbMem_AlignedAlloc(NDB_CL, sz);
+    require(ptr != NULL);
+#ifdef VM_TRACE
+#ifndef NDB_PURIFY
+#ifdef VM_TRACE
+    const int initValue = 0xf3;
+#else
+    const int initValue = 0x0;
+#endif
+
+    char* charptr = (char*)ptr;
+    const int p = (sz / 4096);
+    const int r = (sz % 4096);
+
+    for(int i = 0; i<p; i++)
+      memset(charptr+(i*4096), initValue, 4096);
+
+    if(r > 0)
+      memset(charptr+p*4096, initValue, r);
+#endif
+#endif
+    return ptr;
+  }
+  static void operator delete  ( void* ptr )
+  {
+    NdbMem_AlignedFree(ptr);
+  }
 
   static const Uint32 BOUNDED_DELAY = 0xFFFFFF00;
 protected:
@@ -495,6 +532,7 @@ public:
   }
   void addInstance(SimulatedBlock* b, Uint32 theInstanceNo);
   virtual void loadWorkers() {}
+  virtual void prepare_scan_ctx(Uint32 scanPtrI) {}
 
   struct ThreadContext
   {
@@ -735,7 +773,7 @@ protected:
 			   SectionHandle* sections) const;
 
   /**
-   * EXECUTE_DIRECT comes in four variants.
+   * EXECUTE_DIRECT comes in five variants.
    *
    * EXECUTE_DIRECT_FN/2 with explicit function, not signal number, see above.
    *
@@ -743,7 +781,10 @@ protected:
    *
    * EXECUTE_DIRECT_MT/5 used when other block may be in another thread.
    *
-   * EXECUTE_DIRECT_SS/5 can pass sections in call to block in same thread.
+   * EXECUTE_DIRECT_WITH_RETURN/4 calls another block within same thread and
+   *   expects that result is passed in signal using prepareRETURN_DIRECT.
+   *
+   * EXECUTE_DIRECT_WITH_SECTIONS/5 with sections to block in same thread.
    */
   void EXECUTE_DIRECT(Uint32 block,
 		      Uint32 gsn,
@@ -758,11 +799,25 @@ protected:
 		         Signal* signal,
 		         Uint32 len,
                          Uint32 givenInstanceNo);
-  void EXECUTE_DIRECT_SS(Uint32 block,
-		         Uint32 gsn,
-		         Signal* signal,
-		         Uint32 len,
-                         SectionHandle* sections);
+  void EXECUTE_DIRECT_WITH_RETURN(Uint32 block,
+                                  Uint32 gsn,
+                                  Signal* signal,
+                                  Uint32 len);
+  void EXECUTE_DIRECT_WITH_SECTIONS(Uint32 block,
+                                    Uint32 gsn,
+                                    Signal* signal,
+                                    Uint32 len,
+                                    SectionHandle* sections);
+  /**
+   * prepareRETURN_DIRECT is used to pass a return signal
+   * direct back to caller of EXECUTE_DIRECT_WITH_RETURN.
+   *
+   * The call to prepareRETURN_DIRECT should be immediately followed by
+   * return and bring back control to caller of EXECUTE_DIRECT_WITH_RETURN.
+   */
+  void prepareRETURN_DIRECT(Uint32 gsn,
+                            Signal* signal,
+                            Uint32 len);
 
   class SectionSegmentPool& getSectionSegmentPool();
   void release(SegmentedSectionPtr & ptr);
@@ -1060,11 +1115,16 @@ protected:
    * If the cause of the shutdown is known use extradata to add an 
    * errormessage describing the problem
    */
-  void progError(int line, int err_code, const char* extradata=NULL, const char* check="") const
-    ATTRIBUTE_NORETURN;
+  [[noreturn]] void progError(int line,
+                              int err_code,
+                              const char* extradata=NULL,
+                              const char* check="") const;
 private:
-  void  signal_error(Uint32, Uint32, Uint32, const char*, int) const
-    ATTRIBUTE_NORETURN;
+  [[noreturn]] void signal_error(Uint32,
+                                 Uint32,
+                                 Uint32,
+                                 const char*,
+                                 int) const;
   const NodeId         theNodeId;
   const BlockNumber    theNumber;
   const Uint32 theInstance;
@@ -1206,18 +1266,39 @@ protected:
   Uint32 change_and_get_io_laggers(int change);
   /**********************
    * Xfrm stuff
+   *
+   * xfrm the attr / key for **hash** generation.
+   * - Keys being equal should generate identical xfrm'ed strings.
+   * - Uniquenes of two non equal keys are preferred, but not required.
    */
   
   /**
    * @return length
    */
-  Uint32 xfrm_key(Uint32 tab, const Uint32* src, 
-		  Uint32 *dst, Uint32 dstSize,
-		  Uint32 keyPartLen[MAX_ATTRIBUTES_IN_INDEX]) const;
+  Uint32 xfrm_key_hash(Uint32 tab, const Uint32* src,
+		       Uint32 *dst, Uint32 dstSize,
+		       Uint32 keyPartLen[MAX_ATTRIBUTES_IN_INDEX]) const;
 
-  Uint32 xfrm_attr(Uint32 attrDesc, CHARSET_INFO* cs,
-                   const Uint32* src, Uint32 & srcPos,
-                   Uint32* dst, Uint32 & dstPos, Uint32 dstSize) const;
+  Uint32 xfrm_attr_hash(Uint32 attrDesc, const CHARSET_INFO* cs,
+                        const Uint32* src, Uint32 & srcPos,
+                        Uint32* dst, Uint32 & dstPos, Uint32 dstSize) const;
+
+
+  /*******************
+   * Compare either a full (non-NULL) key, or a single attr.
+   *
+   * Character strings are compared taking their normalized
+   * 'weight' into considderation, as defined by their collation.
+   *
+   * No intermediate xfrm'ed string are produced during the compare.
+   *
+   * return '<0', '==0' or '>0' for 's1<s2', s1==s2, 's2>s2' resp.
+   */
+  int cmp_key(Uint32 tab, const Uint32* s1, const Uint32 *s2) const;
+
+  int cmp_attr(Uint32 attrDesc, const CHARSET_INFO* cs,
+	       const Uint32 *s1, Uint32 s1Len,
+	       const Uint32 *s2, Uint32 s2Len) const;
   
   /**
    *
@@ -1338,10 +1419,10 @@ public:
     ActiveMutex_list m_activeMutexes;
     
     BlockReference reference() const;
-    void progError(int line,
-                   int err_code,
-                   const char* extra = 0,
-                   const char* check = "") ATTRIBUTE_NORETURN;
+    [[noreturn]] void progError(int line,
+                                int err_code,
+                                const char* extra = 0,
+                                const char* check = "");
   };
   
   friend class MutexManager;
@@ -1428,18 +1509,19 @@ public:
   Uint32 m_currentGsn;
 #endif
 
-#ifdef VM_TRACE
-  Ptr<void> **m_global_variables, **m_global_variables_save;
-  void clear_global_variables();
-  void init_globals_list(void ** tmp, size_t cnt);
+#if defined (USE_INIT_GLOBAL_VARIABLES)
+  void init_global_ptrs(void ** tmp, size_t cnt);
+  void init_global_uint32_ptrs(void ** tmp, size_t cnt);
+  void init_global_uint32(void ** tmp, size_t cnt);
   void disable_global_variables();
   void enable_global_variables();
 #endif
 
 #ifdef VM_TRACE
 public:
+  FileOutputStream debugOutFile;
   NdbOut debugOut;
-  NdbOut& debugOutStream() { return debugOut; };
+  NdbOut& debugOutStream() { return debugOut; }
   bool debugOutOn();
   void debugOutLock() { globalSignalLoggers.lock(); }
   void debugOutUnlock() { globalSignalLoggers.unlock(); }
@@ -1467,7 +1549,7 @@ public:
       case NDB_PARTITION_BALANCE_FOR_RA_BY_LDM_X_4:
         return "NDB_PARTITION_BALANCE_FOR_RA_BY_LDM_X_4";
       default:
-        ndbrequire(false);
+        ndbabort();
     }
     return NULL;
   }
@@ -1548,9 +1630,6 @@ SimulatedBlock::executeFunction_async(GlobalSignalNumber gsn,
                                       Signal *signal)
 {
   ExecFunction f = theExecArray[gsn];
-#ifdef VM_TRACE
-  clear_global_variables();
-#endif
   if (unlikely(gsn > MAX_GSN))
   {
     handle_execute_error(gsn);
@@ -1606,7 +1685,7 @@ SimulatedBlock::executeFunction(GlobalSignalNumber gsn,
 inline
 void SimulatedBlock::block_require(void)
 {
-  ndbrequire(false);
+  ndbabort();
 }
 
 inline
@@ -1933,11 +2012,22 @@ SimulatedBlock::EXECUTE_DIRECT(Uint32 block,
 
 inline
 void
-SimulatedBlock::EXECUTE_DIRECT_SS(Uint32 block, 
-			          Uint32 gsn, 
-			          Signal* signal, 
-			          Uint32 len,
-                                  SectionHandle* sections)
+SimulatedBlock::EXECUTE_DIRECT_WITH_RETURN(Uint32 block,
+                                           Uint32 gsn,
+                                           Signal* signal,
+                                            Uint32 len)
+{
+  EXECUTE_DIRECT(block, gsn, signal, len);
+  // TODO check prepareRETURN_DIRECT have been called
+}
+
+inline
+void
+SimulatedBlock::EXECUTE_DIRECT_WITH_SECTIONS(Uint32 block,
+                                             Uint32 gsn,
+                                             Signal* signal,
+                                             Uint32 len,
+                                             SectionHandle* sections)
 {
   signal->header.m_noOfSections = sections->m_cnt;
   for (Uint32 i = 0; i < sections->m_cnt; i++)
@@ -1946,6 +2036,21 @@ SimulatedBlock::EXECUTE_DIRECT_SS(Uint32 block,
   }
   sections->clear();
   EXECUTE_DIRECT(block, gsn, signal, len);
+}
+
+inline
+void
+SimulatedBlock::prepareRETURN_DIRECT(Uint32 gsn,
+                                     Signal* signal,
+                                     Uint32 len)
+{
+  signal->setLength(len);
+  if (unlikely(gsn > MAX_GSN))
+  {
+    handle_execute_error(gsn);
+    return;
+  }
+  signal->header.theVerId_signalNumber = gsn;
 }
 
 // Do a consictency check before reusing a signal.

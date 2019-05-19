@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -37,6 +37,7 @@
 #include "storage/perfschema/pfs_builtin_memory.h"
 #include "storage/perfschema/pfs_defaults.h"
 #include "storage/perfschema/pfs_digest.h"
+#include "storage/perfschema/pfs_engine_table.h"
 #include "storage/perfschema/pfs_error.h"
 #include "storage/perfschema/pfs_events_stages.h"
 #include "storage/perfschema/pfs_events_statements.h"

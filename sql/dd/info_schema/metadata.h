@@ -1,4 +1,4 @@
-/* Copyright (c) 2017, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -51,7 +51,7 @@ namespace info_schema {
   ------------------------
   Introduced in MySQL 8.0.0 by WL#6599. Never published in a GA version.
 
-  80011: Current. Published in 8.0 GA.
+  80011: Published in 8.0 GA.
   ------------------------------------
   Changes from version 1:
 
@@ -62,12 +62,62 @@ namespace info_schema {
     Changes the column I_S.STATISTICS.NON_UNIQUE type from VARCHAR
     to INT.
 
-  80012: Next I_S version number to use when there is change.
-  -----------------------------------------------------------
-  No changes yet, hence this number is not used yet.
+  Current 80012: Published in 8.0.12
+  ------------------------------------
+  Changes from version 80011:
+
+  - Bug#27945704 UNABLE TO JOIN TABLE_CONSTRAINTS AND REFERENTIAL_CONSTRAINTS
+    Changes the collation of I_S columns that project index name and
+    constraint name to use utf8_tolower_ci.
+
+  - WL#11864 Implement I_S.VIEW_TABLE_USAGE and I_S.VIEW_ROUTINE_USAGE
+
+  - WL#1075 adds one column to INFORMATION_SCHEMA.STATISTICS: "EXPRESSION".
+    This column prints out the expression for functional key parts, or SQL NULL
+    if it is a regular key part. For functional key parts, COLUMN_NAME is set to
+    SQL NULL.
+
+  80013: Published in 8.0.13
+  ------------------------------------
+  Changes from version 80012
+
+  - WL#11000 ST_Distance with units
+    Adds a new view `information_schema`.`st_units_of_measure` with columns
+    `UNIT_NAME`, `CONVERSION_FACTOR`, `DESCRIPTION`, and `UNIT_TYPE`. This view
+    contains the supported spatial units.
+
+  80014: Published in 8.0.14
+  ------------------------------------
+  There are no changes from version 80013. Hence server version 80014 used
+  I_S version 80013.
+
+  80015: Not published.
+  ----------------------------------------------------------------------------
+  There are no changes from version 80014. Hence server version 80015 used
+  I_S version 80013.
+
+  80016: Current
+  ------------------------------------
+  Changes from version 80015.
+
+  - WL#929 - CHECK CONSTRAINTS
+    New INFORMATION_SCHMEA table CHECK_CONSTRAINTS is introduced and
+    INFORMATION_SCHMEA.TABLE_CONSTRAINTS is modified to include check
+    constraints defined on the table.
+
+  - WL#12261 Control (enforce and disable) table encryption
+    - Add new column information_schema.schemata.default_encryption
+    - information_schema.tables.options UDF definition is changed to pass
+      schema default encryption.
+
+  80017: Next IS version number after the previous is public.
+  ----------------------------------------------------------------------------
+  Changes from version 80016:
+  - No changes, this version number is not active yet.
+
 */
 
-static const uint IS_DD_VERSION = 80011;
+static const uint IS_DD_VERSION = 80016;
 
 /**
   Initialize INFORMATION_SCHEMA system views.

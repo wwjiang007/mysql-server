@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -149,6 +149,30 @@ class Sql_service_commands {
   long internal_wait_for_server_gtid_executed(
       Sql_service_interface *sql_interface, std::string &gtid_executed,
       int timeout = 0);
+
+  /**
+   Method to kill the session identified by the given session id in those
+   cases where the server hangs while executing the sql query.
+
+   @param session_id  id of the session to be killed.
+
+   @return the error value returned
+    @retval 0  - success
+    @retval >0 - Failure
+  */
+  long internal_kill_session(Sql_service_interface *sql_interface,
+                             void *arg = NULL);
+
+  /**
+   Method to set a variable using SET PERSIST_ONLY
+   @param sql_interface  the server session interface for query execution
+   @param variable_args  arg void pointer, should be pair <string,string>
+   @return the error value returned
+    @retval 0      OK
+    @retval !=0    Error
+  */
+  long internal_set_persist_only_variable(Sql_service_interface *sql_interface,
+                                          void *variable_args = NULL);
 };
 
 struct st_session_method {
@@ -287,17 +311,16 @@ class Sql_service_command_interface {
   int set_interface_user(const char *user);
 
   /**
-   Method to kill the session identified by the given sesion id in those
+   Method to kill the session identified by the given session id in those
    cases where the server hangs while executing the sql query.
 
    @param session_id  id of the session to be killed.
-   @param session  the session to be killed
 
    @return the error value returned
       @retval 0  - success
       @retval >0 - Failure
- */
-  long kill_session(uint32_t session_id, MYSQL_SESSION session);
+  */
+  long kill_session(unsigned long session_id);
 
   /**
     Method to set the super_read_only variable "ON".
@@ -347,8 +370,9 @@ class Sql_service_command_interface {
     @param [in] timeout        The timeout after which the method should break
 
     @return the error value returned
-      @retval 0      OK
-      @retval !=0    Error when executed or timeout.
+      @retval 0    OK
+      @retval -1   Timeout on the GTID wait
+      @retval 1    Error when executed
   */
   long wait_for_server_gtid_executed(std::string &gtid_executed,
                                      int timeout = 0);
@@ -370,6 +394,16 @@ class Sql_service_command_interface {
     @retval  1  In read super mode
   */
   long get_server_read_only();
+
+  /**
+    Method to set a variable using SET PERSIST_ONLY
+    @param variable the variable name
+    @param value the value for the variable
+    @return the error value returned
+      @retval 0      OK
+      @retval !=0    Error
+  */
+  long set_persist_only_variable(std::string &variable, std::string &value);
 
  private:
   enum_plugin_con_isolation connection_thread_isolation;

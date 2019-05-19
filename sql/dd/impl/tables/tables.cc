@@ -47,6 +47,12 @@ const Tables &Tables::instance() {
 
 ///////////////////////////////////////////////////////////////////////////
 
+const CHARSET_INFO *Tables::name_collation() {
+  return Object_table_definition_impl::fs_name_collation();
+}
+
+///////////////////////////////////////////////////////////////////////////
+
 Tables::Tables() {
   m_target_def.set_table_name("tables");
 
@@ -54,10 +60,9 @@ Tables::Tables() {
                          "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT");
   m_target_def.add_field(FIELD_SCHEMA_ID, "FIELD_SCHEMA_ID",
                          "schema_id BIGINT UNSIGNED NOT NULL");
-  m_target_def.add_field(
-      FIELD_NAME, "FIELD_NAME",
-      "name VARCHAR(64) NOT NULL COLLATE " +
-          String_type(Object_table_definition_impl::fs_name_collation()->name));
+  m_target_def.add_field(FIELD_NAME, "FIELD_NAME",
+                         "name VARCHAR(64) NOT NULL COLLATE " +
+                             String_type(name_collation()->name));
   m_target_def.add_field(FIELD_TYPE, "FIELD_TYPE",
                          "type ENUM('BASE TABLE', 'VIEW', 'SYSTEM VIEW')"
                          "NOT NULL");
@@ -147,6 +152,10 @@ Tables::Tables() {
                          "view_connection_collation_id BIGINT UNSIGNED");
   m_target_def.add_field(FIELD_VIEW_COLUMN_NAMES, "FIELD_VIEW_COLUMN_NAMES",
                          "view_column_names LONGTEXT");
+  m_target_def.add_field(
+      FIELD_LAST_CHECKED_FOR_UPGRADE_VERSION_ID,
+      "FIELD_LAST_CHECKED_FOR_UPGRADE_VERSION_ID",
+      "last_checked_for_upgrade_version_id INT UNSIGNED NOT NULL");
 
   m_target_def.add_index(INDEX_PK_ID, "INDEX_PK_ID", "PRIMARY KEY (id)");
   m_target_def.add_index(INDEX_UK_SCHEMA_ID_NAME, "INDEX_UK_SCHEMA_ID_NAME",
@@ -201,9 +210,8 @@ Abstract_table *Tables::create_entity_object(const Raw_record &r) const {
 
 bool Tables::update_object_key(Item_name_key *key, Object_id schema_id,
                                const String_type &table_name) {
-  char buf[NAME_LEN + 1];
-  key->update(FIELD_SCHEMA_ID, schema_id, FIELD_NAME,
-              Object_table_definition_impl::fs_name_case(table_name, buf));
+  key->update(FIELD_SCHEMA_ID, schema_id, FIELD_NAME, table_name,
+              name_collation());
   return false;
 }
 

@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2011, 2017, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2011, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -32,6 +32,7 @@
 #include "sql/ha_ndbcluster.h"
 #include "sql/ha_ndbcluster_connection.h"
 #include "sql/mysqld.h"     // LOCK_global_system_variables
+#include "sql/ndb_require.h"
 
 
 /* from other files */
@@ -548,7 +549,7 @@ void ndb_index_stat_option_update(THD *, SYS_VAR*,
   DBUG_PRINT("index_stat", ("str: %s", str));
   Ndb_index_stat_opt& opt= ndb_index_stat_opt;
   int ret= ndb_index_stat_str2opt(str, opt);
-  assert(ret == 0); NDB_IGNORE_VALUE(ret);
+  ndbcluster::ndbrequire(ret == 0);
   *(const char**)var_ptr= ndb_index_stat_opt.option;
   DBUG_VOID_RETURN;
 }
@@ -1432,6 +1433,15 @@ ndb_index_stat_proc_update(Ndb_index_stat_proc &pr, Ndb_index_stat *st)
       it is a new analyze request.
     */
     ndb_index_stat_force_update(st, false);
+
+    /*
+      If the index has an unsupported length,
+      remove it from the list and stop monitoring
+    */
+    if (st->is->getNdbError().code == NdbIndexStat::InvalidKeySize)
+    {
+      ndb_index_stat_free(st);
+    }
 
     mysql_cond_broadcast(&ndb_index_stat_thread.stat_cond);
     mysql_mutex_unlock(&ndb_index_stat_thread.stat_mutex);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2002, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -54,7 +54,6 @@ This file contains the implementation of error and warnings related
 #include <stdarg.h>
 #include <algorithm>
 
-#include "binary_log_types.h"
 #include "decimal.h"
 #include "my_dbug.h"
 #include "my_inttypes.h"
@@ -478,6 +477,12 @@ bool Diagnostics_area::has_sql_condition(uint sql_errno) const {
   return false;
 }
 
+const char *Diagnostics_area::get_first_condition_message() {
+  if (m_conditions_list.elements())
+    return m_conditions_list.front()->message_text();
+  return "";
+}
+
 void Diagnostics_area::reset_condition_info(THD *thd) {
   /*
     Special case: @@session.error_count, @@session.warning_count
@@ -799,7 +804,7 @@ bool mysqld_show_warnings(THD *thd, ulong levels_to_show) {
   const char *sqlstate = new_stmt_da.returned_sqlstate();
 
   /* In case of a fatal error, set it into the original DA.*/
-  if (thd->is_fatal_error) {
+  if (thd->is_fatal_error()) {
     first_da->set_error_status(sql_errno, message, sqlstate);
     DBUG_RETURN(true);
   }
@@ -826,7 +831,7 @@ ErrConvString::ErrConvString(const my_decimal *nr) {
 
 ErrConvString::ErrConvString(const MYSQL_TIME *ltime, uint dec) {
   buf_length =
-      my_TIME_to_str(ltime, err_buffer, MY_MIN(dec, DATETIME_MAX_DECIMALS));
+      my_TIME_to_str(*ltime, err_buffer, MY_MIN(dec, DATETIME_MAX_DECIMALS));
 }
 
 /**
@@ -974,4 +979,50 @@ bool is_sqlstate_valid(const LEX_STRING *sqlstate) {
   }
 
   return true;
+}
+
+/**
+  Output warnings on deprecated character sets
+
+  @param [in] thd       The connection handler.
+  @param [in] cs        The character set to check for a deprecation.
+  @param [in] alias     The name/alias of @c cs.
+  @param [in] option    Command line/config file option name, otherwise NULL.
+*/
+void warn_on_deprecated_charset(THD *thd, const CHARSET_INFO *cs,
+                                const char *alias, const char *option) {
+  if (cs == &my_charset_utf8_general_ci) {
+    if (native_strcasecmp(alias, "utf8") == 0) {
+      if (option == nullptr)
+        push_warning(thd, ER_DEPRECATED_UTF8_ALIAS);
+      else
+        LogErr(WARNING_LEVEL, ER_WARN_DEPRECATED_UTF8_ALIAS_OPTION, option);
+    } else {
+      if (option == nullptr)
+        push_deprecated_warn(thd, "utf8mb3", "utf8mb4");
+      else
+        LogErr(WARNING_LEVEL, ER_WARN_DEPRECATED_UTF8MB3_CHARSET_OPTION,
+               option);
+    }
+  }
+}
+
+/**
+  Output warnings on deprecated character collations
+
+  @param [in] thd       The connection handler.
+  @param [in] collation The collation to check for a deprecation.
+  @param [in] option    Command line/config file option name, otherwise NULL.
+*/
+void warn_on_deprecated_collation(THD *thd, const CHARSET_INFO *collation,
+                                  const char *option) {
+  if (my_charset_same(collation, &my_charset_utf8_general_ci)) {
+    if (option == nullptr)
+      push_warning_printf(
+          thd, Sql_condition::SL_WARNING, ER_WARN_DEPRECATED_UTF8MB3_COLLATION,
+          ER_THD(thd, ER_WARN_DEPRECATED_UTF8MB3_COLLATION), collation->name);
+    else
+      LogErr(WARNING_LEVEL, ER_WARN_DEPRECATED_UTF8MB3_COLLATION_OPTION, option,
+             collation->name);
+  }
 }

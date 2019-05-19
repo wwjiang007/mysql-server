@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2014, 2017, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2014, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -24,10 +24,8 @@
 
 #include "sql/ndb_log.h"
 
-#include <stdio.h>
+#include <stdio.h>    // vfprintf, stderr
 
-#include "my_dbug.h"
-#include "mysqld_error.h"
 /*
   Implements a logging interface for the ndbcluster
   plugin using the LogEvent class as defined in log_builtins.h
@@ -36,6 +34,8 @@
 #include "sql/log.h"
 #include <mysql/components/services/log_builtins.h>
 
+#include "my_dbug.h"
+#include "mysqld_error.h"
 
 /*
   Print message to MySQL Server's error log(s)
@@ -120,15 +120,11 @@ void
 ndb_log_detect_prefix(const char* fmt,
                       const char** prefix, const char** fmt_start)
 {
-  DBUG_ENTER("ndb_log_detect_prefix");
-  DBUG_PRINT("enter", ("fmt: '%s'", fmt));
-
   // Check if string starts with "NDB <subsystem>:" by reading
   // at most 15 chars whithout colon, then a colon and space
   char subsystem[16], colon[2];
   if (sscanf(fmt, "NDB %15[^:]%1[:] ", subsystem, colon) == 2)
   {
-    DBUG_PRINT("info",("detected subsystem: '%s'", subsystem));
     static
     const char* allowed_prefixes[] =
     {
@@ -143,8 +139,6 @@ ndb_log_detect_prefix(const char* fmt,
     {
       const char* allowed_prefix = allowed_prefixes[i];
 
-      DBUG_PRINT("info", ("checking allowed_prefix: '%s'",
-                          allowed_prefix));
       if (strncmp(subsystem, allowed_prefix, strlen(allowed_prefix)) == 0)
       {
         // String started with an allowed subsystem prefix, return
@@ -154,9 +148,7 @@ ndb_log_detect_prefix(const char* fmt,
                      4 + /* "NDB " */
                      strlen(allowed_prefix) +
                      2; /* ": " */
-        DBUG_PRINT("info", ("Found! Returning prefix: '%s', fmt_start: '%s'",
-                            *prefix, *fmt_start));
-        DBUG_VOID_RETURN;
+        return;
       }
     }
     // Used subsystem prefix not in allowed list, caller should
@@ -176,7 +168,7 @@ ndb_log_detect_prefix(const char* fmt,
   // this would be the default case
   *prefix = NULL;
   *fmt_start = fmt;
-  DBUG_VOID_RETURN;
+  return;
 }
 
 void
@@ -245,4 +237,21 @@ ndb_log_verbose(unsigned verbose_level, const char* fmt, ...)
   va_start(args, fmt);
   ndb_log_print(NDB_LOG_INFORMATION_LEVEL, prefix, fmt_start, args);
   va_end(args);
+}
+
+void
+ndb_log_error_dump(const char* fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  // Dump the message verbatim to stderr
+  vfprintf(stderr, fmt, args);
+  va_end(args);
+  fprintf(stderr, "\n");
+}
+
+void
+ndb_log_flush_buffered_messages()
+{
+  flush_error_log_messages();
 }

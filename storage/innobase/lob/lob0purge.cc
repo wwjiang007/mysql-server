@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2016, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2016, 2019, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -157,6 +157,10 @@ static void z_rollback(DeleteContext *ctx, dict_index_t *index, trx_id_t trxid,
     flst_node_t *node = first.addr2ptr_x(node_loc);
     z_index_entry_t cur_entry(node, &local_mtr, index);
 
+#ifdef UNIV_DEBUG
+    ulint idx_len = first.get_index_list_length();
+#endif /* UNIV_DEBUG */
+
     if (cur_entry.can_rollback(trxid, undo_no)) {
       node_loc = cur_entry.make_old_version_current(index, trxid, first);
 
@@ -166,8 +170,15 @@ static void z_rollback(DeleteContext *ctx, dict_index_t *index, trx_id_t trxid,
       node_loc = cur_entry.get_next();
     }
 
-    if (n_entries % commit_freq == 0) {
+    if ((n_entries % commit_freq == 0) && !first.is_empty()) {
       mtr_commit(&local_mtr);
+
+#ifdef UNIV_DEBUG
+      if (idx_len == 1) {
+        DBUG_EXECUTE_IF("crash_middle_zlob_rollback", DBUG_SUICIDE(););
+      }
+#endif /* UNIV_DEBUG */
+
       mtr_start(&local_mtr);
       first.load_x(page_id, page_size);
     }
@@ -402,6 +413,7 @@ void purge(DeleteContext *ctx, dict_index_t *index, trx_id_t trxid,
     if (dict_index_is_online_ddl(index)) {
       row_log_table_blob_free(index, ref.page_no());
     }
+    first.free_all_data_pages();
 
     first.free_all_index_pages();
     first.dealloc();
@@ -413,4 +425,4 @@ void purge(DeleteContext *ctx, dict_index_t *index, trx_id_t trxid,
   DBUG_VOID_RETURN;
 }
 
-}; /* namespace lob */
+} /* namespace lob */

@@ -33,7 +33,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "page0zip.h"
 
-#include "my_inttypes.h"
 #include "page0size.h"
 
 /** A BLOB field reference full of zero, for use in assertions and tests.
@@ -71,6 +70,10 @@ const byte field_ref_zero[FIELD_REF_SIZE] = {
 
 #include <algorithm>
 #include <map>
+
+static_assert(DATA_TRX_ID_LEN == 6, "DATA_TRX_ID_LEN != 6");
+static_assert(DATA_ROLL_PTR_LEN == 7, "DATA_ROLL_PTR_LEN != 7");
+static_assert(DATA_TRX_ID + 1 == DATA_ROLL_PTR, "DATA_TRX_ID invalid value!");
 
 #ifndef UNIV_HOTBACKUP
 /** Statistics on compression, indexed by page_zip_des_t::ssize - 1 */
@@ -1562,16 +1565,16 @@ static ibool page_zip_header_cmp(
  columns.  The data must already have been written to the uncompressed page.
  @return end of modification log */
 static byte *page_zip_write_rec_ext(
-    page_zip_des_t *page_zip, /*!< in/out: compressed page */
-    const page_t *page,       /*!< in: page containing rec */
-    const byte *rec,          /*!< in: record being written */
-    dict_index_t *index,      /*!< in: record descriptor */
-    const ulint *offsets,     /*!< in: rec_get_offsets(rec, index) */
-    ulint create,             /*!< in: nonzero=insert, zero=update */
-    ulint trx_id_col,         /*!< in: position of DB_TRX_ID */
-    ulint heap_no,            /*!< in: heap number of rec */
-    byte *storage,            /*!< in: end of dense page directory */
-    byte *data)               /*!< in: end of modification log */
+    page_zip_des_t *page_zip,  /*!< in/out: compressed page */
+    const page_t *page,        /*!< in: page containing rec */
+    const byte *rec,           /*!< in: record being written */
+    const dict_index_t *index, /*!< in: record descriptor */
+    const ulint *offsets,      /*!< in: rec_get_offsets(rec, index) */
+    ulint create,              /*!< in: nonzero=insert, zero=update */
+    ulint trx_id_col,          /*!< in: position of DB_TRX_ID */
+    ulint heap_no,             /*!< in: heap number of rec */
+    byte *storage,             /*!< in: end of dense page directory */
+    byte *data)                /*!< in: end of modification log */
 {
   const byte *start = rec;
   ulint i;
@@ -1665,11 +1668,11 @@ static byte *page_zip_write_rec_ext(
 /** Write an entire record on the compressed page.  The data must already
  have been written to the uncompressed page. */
 void page_zip_write_rec(
-    page_zip_des_t *page_zip, /*!< in/out: compressed page */
-    const byte *rec,          /*!< in: record being written */
-    dict_index_t *index,      /*!< in: the index the record belongs to */
-    const ulint *offsets,     /*!< in: rec_get_offsets(rec, index) */
-    ulint create)             /*!< in: nonzero=insert, zero=update */
+    page_zip_des_t *page_zip,  /*!< in/out: compressed page */
+    const byte *rec,           /*!< in: record being written */
+    const dict_index_t *index, /*!< in: the index the record belongs to */
+    const ulint *offsets,      /*!< in: rec_get_offsets(rec, index) */
+    ulint create)              /*!< in: nonzero=insert, zero=update */
 {
   const page_t *page;
   byte *data;
@@ -2121,9 +2124,6 @@ void page_zip_write_trx_id_and_roll_ptr(
       page_zip_dir_start(page_zip) -
       (rec_get_heap_no_new(rec) - 1) * (DATA_TRX_ID_LEN + DATA_ROLL_PTR_LEN);
 
-#if DATA_TRX_ID + 1 != DATA_ROLL_PTR
-#error "DATA_TRX_ID + 1 != DATA_ROLL_PTR"
-#endif
   field = const_cast<byte *>(rec_get_nth_field(rec, offsets, trx_id_col, &len));
   ut_ad(len == DATA_TRX_ID_LEN);
   ut_ad(field + DATA_TRX_ID_LEN ==
@@ -2132,13 +2132,7 @@ void page_zip_write_trx_id_and_roll_ptr(
 #if defined UNIV_DEBUG || defined UNIV_ZIP_DEBUG
   ut_a(!memcmp(storage, field, DATA_TRX_ID_LEN + DATA_ROLL_PTR_LEN));
 #endif /* UNIV_DEBUG || UNIV_ZIP_DEBUG */
-#if DATA_TRX_ID_LEN != 6
-#error "DATA_TRX_ID_LEN != 6"
-#endif
   mach_write_to_6(field, trx_id);
-#if DATA_ROLL_PTR_LEN != 7
-#error "DATA_ROLL_PTR_LEN != 7"
-#endif
   mach_write_to_7(field + DATA_TRX_ID_LEN, roll_ptr);
   memcpy(storage, field, DATA_TRX_ID_LEN + DATA_ROLL_PTR_LEN);
 

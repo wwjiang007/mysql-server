@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2015, 2017, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -39,7 +39,7 @@
 static bool parse_int(longlong *to, const char *from, size_t from_length)
 {
   int error;
-  char *end= const_cast<char *>(from + from_length);
+  const char *end= from + from_length;
   *to= my_strtoll10(from, &end, &error);
   return error != 0 || end != from + from_length;
 }
@@ -47,7 +47,6 @@ static bool parse_int(longlong *to, const char *from, size_t from_length)
 %}
 
 %pure-parser
-%yacc
 
 %parse-param { class THD *thd }
 %parse-param { class Hint_scanner *scanner }
@@ -89,6 +88,8 @@ static bool parse_int(longlong *to, const char *from, size_t from_length)
 %token INDEX_MERGE_HINT
 %token NO_INDEX_MERGE_HINT
 %token SET_VAR_HINT
+%token SKIP_SCAN_HINT
+%token NO_SKIP_SCAN_HINT
 
 /* Other tokens */
 
@@ -120,7 +121,7 @@ static bool parse_int(longlong *to, const char *from, size_t from_length)
 
 %type <hint_list> hint_list
 
-%type <hint_string> hint_param_index
+%type <lexer.hint_string> hint_param_index
 
 %type <hint_param_index_list> hint_param_index_list opt_hint_param_index_list
 
@@ -135,7 +136,7 @@ static bool parse_int(longlong *to, const char *from, size_t from_length)
   hint_param_table_list_empty_qb
   opt_hint_param_table_list_empty_qb
 
-%type <hint_string>
+%type <lexer.hint_string>
   HINT_ARG_IDENT
   HINT_ARG_NUMBER
   HINT_ARG_QB_NAME
@@ -493,6 +494,10 @@ key_level_hint_type_on:
           {
             $$= INDEX_MERGE_HINT_ENUM;
           }
+        | SKIP_SCAN_HINT
+          {
+            $$= SKIP_SCAN_HINT_ENUM;
+          }
         ;
 
 key_level_hint_type_off:
@@ -507,6 +512,10 @@ key_level_hint_type_off:
         | NO_INDEX_MERGE_HINT
           {
             $$= INDEX_MERGE_HINT_ENUM;
+          }
+        | NO_SKIP_SCAN_HINT
+          {
+            $$= SKIP_SCAN_HINT_ENUM;
           }
         ;
 

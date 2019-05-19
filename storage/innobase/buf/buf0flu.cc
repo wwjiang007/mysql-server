@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2019, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -1125,11 +1125,20 @@ static void buf_flush_write_block_low(buf_page_t *bpage, buf_flush_t flush_type,
 
   /* Force the log to the disk before writing the modified block */
   if (!srv_read_only_mode) {
-    Wait_stats wait_stats;
+    const lsn_t flush_to_lsn = bpage->newest_modification;
 
-    wait_stats = log_write_up_to(*log_sys, bpage->newest_modification, true);
+    /* Do the check before calling log_write_up_to() because in most
+    cases it would allow to avoid call, and because of that we don't
+    want those calls because they would have bad impact on the counter
+    of calls, which is monitored to save CPU on spinning in log threads. */
 
-    MONITOR_INC_WAIT_STATS_EX(MONITOR_ON_LOG_, _PAGE_WRITTEN, wait_stats);
+    if (log_sys->flushed_to_disk_lsn.load() < flush_to_lsn) {
+      Wait_stats wait_stats;
+
+      wait_stats = log_write_up_to(*log_sys, flush_to_lsn, true);
+
+      MONITOR_INC_WAIT_STATS_EX(MONITOR_ON_LOG_, _PAGE_WRITTEN, wait_stats);
+    }
   }
 
   switch (buf_page_get_state(bpage)) {
@@ -2290,18 +2299,26 @@ static ulint af_get_pct_for_dirty() {
  @return percent of io_capacity to flush to manage redo space */
 static ulint af_get_pct_for_lsn(lsn_t age) /*!< in: current age of LSN. */
 {
-  lsn_t max_async_age;
+  const lsn_t log_margin =
+      log_translate_sn_to_lsn(log_free_check_margin(*log_sys));
+
+  ut_a(log_sys->lsn_capacity_for_free_check > log_margin);
+
+  const lsn_t log_capacity = log_sys->lsn_capacity_for_free_check - log_margin;
+
   lsn_t lsn_age_factor;
-  lsn_t af_lwm = (srv_adaptive_flushing_lwm * log_get_capacity()) / 100;
+  lsn_t af_lwm = (srv_adaptive_flushing_lwm * log_capacity) / 100;
 
   if (age < af_lwm) {
     /* No adaptive flushing. */
     return (0);
   }
 
-  max_async_age = log_get_max_modified_age_async();
+  auto limit_for_age = log_get_max_modified_age_async();
+  ut_a(limit_for_age >= log_margin);
+  limit_for_age -= log_margin;
 
-  if (age < max_async_age && !srv_adaptive_flushing) {
+  if (age < limit_for_age && !srv_adaptive_flushing) {
     /* We have still not reached the max_async point and
     the user has disabled adaptive flushing. */
     return (0);
@@ -2311,7 +2328,7 @@ static ulint af_get_pct_for_lsn(lsn_t age) /*!< in: current age of LSN. */
   1) User has enabled adaptive flushing
   2) User may have disabled adaptive flushing but we have reached
   max_async_age. */
-  lsn_age_factor = (age * 100) / max_async_age;
+  lsn_age_factor = (age * 100) / limit_for_age;
 
   ut_ad(srv_max_io_capacity >= srv_io_capacity);
   return (static_cast<ulint>(((srv_max_io_capacity / srv_io_capacity) *
@@ -3501,7 +3518,9 @@ FlushObserver::FlushObserver(space_id_t space_id, trx_t *trx,
   }
 
 #ifdef FLUSH_LIST_OBSERVER_DEBUG
-  ib::info(ER_IB_MSG_130) << "FlushObserver constructor: " << m_trx->id;
+  ib::info(ER_IB_MSG_130) << "FlushObserver constructor: space_id=" << space_id
+                          << ", trx_id="
+                          << (m_trx == nullptr ? TRX_ID_MAX : trx->id);
 #endif /* FLUSH_LIST_OBSERVER_DEBUG */
 }
 
@@ -3513,14 +3532,16 @@ FlushObserver::~FlushObserver() {
   UT_DELETE(m_removed);
 
 #ifdef FLUSH_LIST_OBSERVER_DEBUG
-  ib::info(ER_IB_MSG_131) << "FlushObserver deconstructor: " << m_trx->id;
+  ib::info(ER_IB_MSG_131) << "FlushObserver deconstructor: space_id="
+                          << space_id << ", trx_id="
+                          << (m_trx == nullptr ? TRX_ID_MAX : trx->id);
 #endif /* FLUSH_LIST_OBSERVER_DEBUG */
 }
 
 /** Check whether trx is interrupted
 @return true if trx is interrupted */
 bool FlushObserver::check_interrupted() {
-  if (trx_is_interrupted(m_trx)) {
+  if (m_trx != nullptr && trx_is_interrupted(m_trx)) {
     interrupted();
 
     return (true);

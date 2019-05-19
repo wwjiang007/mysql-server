@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -32,10 +32,7 @@
 
 #include "sql/sql_base.h"
 
-/* DDL names have to fit in system table ndb_schema */
-#define NDB_MAX_DDL_NAME_BYTESIZE 63
-#define NDB_MAX_DDL_NAME_BYTESIZE_STR "63"
-
+#include "sql/ha_ndbcluster_cond.h"
 #include "sql/ndb_conflict.h"
 #include "sql/ndb_table_map.h"
 #include "sql/partitioning/partition_handler.h"
@@ -43,8 +40,6 @@
 #include "storage/ndb/include/kernel/ndb_limits.h"
 #include "storage/ndb/include/ndbapi/NdbApi.hpp"
 #include "storage/ndb/include/ndbapi/ndbapi_limits.h"
-
-#define NDB_IGNORE_VALUE(x) (void)x
 
 #define NDB_HIDDEN_PRIMARY_KEY_LENGTH 8
 
@@ -260,10 +255,6 @@ public:
                                  List<FOREIGN_KEY_INFO> *f_key_list) override;
  uint referenced_by_foreign_key() override;
 
-private:
-  uint is_child_or_parent_of_fk();
-public:
-  bool can_switch_engines() override;
   char* get_foreign_key_create_info() override;
   void free_foreign_key_create_info(char* str) override;
 
@@ -271,6 +262,11 @@ public:
                    const dd::Table *from_table_def,
                    dd::Table *to_table_def) override;
   int delete_table(const char *name, const dd::Table *table_def) override;
+  bool upgrade_table(THD* thd,
+                     const char*,
+                     const char* table_name,
+                     dd::Table* dd_table) override;
+
   row_type get_real_row_type(const HA_CREATE_INFO *create_info) const override
   {
     DBUG_ENTER("ha_ndbcluster::get_real_row_type");
@@ -340,40 +336,58 @@ public:
      cond_push()
      cond   Condition to be pushed. The condition tree must not be
      modified by the by the caller.
+     other_tbls_ok  Are other tables allowed to be referred
+     from the condition terms pushed down.
    RETURN
      The 'remainder' condition that caller must use to filter out records.
      NULL means the handler will not return rows that do not match the
      passed condition.
    NOTES
-   The pushed conditions form a stack (from which one can remove the
-   last pushed condition using cond_pop).
    The table handler filters out rows using (pushed_cond1 AND pushed_cond2 
    AND ... AND pushed_condN)
    or less restrictive condition, depending on handler's capabilities.
    
-   handler->reset() call empties the condition stack.
-   Calls to rnd_init/rnd_end, index_init/index_end etc do not affect the  
-   condition stack.
+   handler->reset() call discard any pushed conditions.
+   Calls to rnd_init/rnd_end, index_init/index_end etc do not affect
+   any condition being pushed.
    The current implementation supports arbitrary AND/OR nested conditions
    with comparisons between columns and constants (including constant
    expressions and function calls) and the following comparison operators:
    =, !=, >, >=, <, <=, like, "not like", "is null", and "is not null". 
    Negated conditions are supported by NOT which generate NAND/NOR groups.
  */ 
-  const Item *cond_push(const Item *cond) override;
- /*
-   Pop the top condition from the condition stack of the handler instance.
-   SYNOPSIS
-     cond_pop()
-     Pops the top if condition stack, if stack is not empty
- */
-  void cond_pop() override;
+  const Item *cond_push(const Item *cond,
+                        bool other_tbls_ok) override;
+
+public:
+  /**
+   * Generate the ScanFilters code for the condition(s) previously
+   * accepted for cond_push'ing.
+   * If code generation failed, the handler will evaluate the
+   * condition for every row returned from NDB.
+   */
+  void generate_scan_filter(NdbInterpretedCode *code,
+                            NdbScanOperation::ScanOptions *options);
+
+  /**
+   * Generate a ScanFilter using both the pushed condition AND
+   * add equality predicates matching the 'key' supplied as
+   * arguments.
+   * @return 1 if generation of the key part failed.
+   */
+  int generate_scan_filter_with_key(
+                            NdbInterpretedCode *code,
+                            NdbScanOperation::ScanOptions *options,
+                            const KEY *key_info,
+                            const key_range *start_key,
+                            const key_range *end_key);
+
 private:
   bool maybe_pushable_join(const char*& reason) const;
 public:
   int assign_pushed_join(const ndb_pushed_join* pushed_join);
   uint number_of_pushed_joins() const override;
-  const TABLE* root_of_pushed_join() const override;
+  const TABLE* member_of_pushed_join() const override;
   const TABLE* parent_of_pushed_join() const override;
 
   int index_read_pushed(uchar *buf, const uchar *key,
@@ -413,9 +427,9 @@ public:
                                   const dd::Table *old_table_def,
                                   dd::Table *new_table_def) override;
 
-  void notify_table_changed(Alter_inplace_info *ha_alter_info) override;
+  void notify_table_changed(Alter_inplace_info *alter_info) override;
 
-private:
+ private:
   void prepare_inplace__drop_index(uint key_num);
   int inplace__final_drop_index(TABLE *table_arg);
 
@@ -448,14 +462,15 @@ private:
 
   int prepare_inplace__add_index(THD *thd, KEY *key_info,
                                  uint num_of_keys) const;
-  int create_ndb_index(THD *thd, const char *name, KEY *key_info,
-                       bool unique) const;
-  int create_ordered_index(THD *thd, const char *name, KEY *key_info) const;
-  int create_unique_index(THD *thd, const char *name, KEY *key_info) const;
+  int create_index_in_NDB(THD *thd, const char *name, KEY *key_info,
+                          const NdbDictionary::Table *ndbtab,
+                          bool unique) const;
   int create_index(THD *thd, const char *name, KEY *key_info,
-                   NDB_INDEX_TYPE idx_type) const;
+                   NDB_INDEX_TYPE idx_type,
+                   const NdbDictionary::Table *ndbtab) const;
   // Index list management
-  int create_indexes(THD *thd, TABLE *tab) const;
+  int create_indexes(THD *thd, TABLE *tab,
+                     const NdbDictionary::Table *ndbtab) const;
   int open_indexes(Ndb *ndb, TABLE *tab);
   void release_indexes(NdbDictionary::Dictionary* dict, int invalidate);
   void inplace__renumber_indexes(uint dropped_index_num);
@@ -469,7 +484,7 @@ private:
   int get_fk_data(THD *thd, Ndb *ndb);
   void release_fk_data();
   int create_fks(THD *thd, Ndb *ndb);
-  int copy_fk_for_offline_alter(THD * thd, Ndb*, NdbDictionary::Table* _dsttab);
+  int copy_fk_for_offline_alter(THD *thd, Ndb *, const char* tabname);
   int inplace__drop_fks(THD*, Ndb*, NdbDictionary::Dictionary*,
                        const NdbDictionary::Table*);
   static int get_fk_data_for_truncate(NdbDictionary::Dictionary*,
@@ -534,9 +549,9 @@ private:
   int set_auto_inc_val(THD *thd, Uint64 value);
   int next_result(uchar *buf); 
   int close_scan();
-  void unpack_record(uchar *dst_row, const uchar *src_row);
-  void unpack_record_and_set_generated_fields(TABLE *, uchar *dst_row,
-                                              const uchar *src_row);
+  int unpack_record(uchar *dst_row, const uchar *src_row);
+  int unpack_record_and_set_generated_fields(TABLE *, uchar *dst_row,
+                                             const uchar *src_row);
   void set_dbname(const char *pathname);
   void set_tabname(const char *pathname);
 
@@ -751,7 +766,8 @@ private:
   NdbQuery* m_active_query;              // Pushed query instance executing
   NdbQueryOperation* m_pushed_operation; // Pushed operation instance
 
-  ha_ndbcluster_cond *m_cond;
+  /* In case we failed to push a 'pushed_cond', the handler will evaluate it */
+  ha_ndbcluster_cond m_cond;
   bool m_disable_multi_read;
   uchar *m_multi_range_result_ptr;
   NdbIndexScanOperation *m_multi_cursor;
@@ -761,6 +777,7 @@ private:
                    uint part_id= ~(uint)0);
   int add_handler_to_open_tables(THD*, Thd_ndb*, ha_ndbcluster* handler);
   int rename_table_impl(THD* thd, Ndb* ndb,
+                        class Ndb_schema_dist_client& schema_dist_client,
                         const NdbDictionary::Table* orig_tab,
                         dd::Table* to_table_def,
                         const char* from, const char* to,

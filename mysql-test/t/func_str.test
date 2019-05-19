@@ -5,6 +5,7 @@
 # When removing this, also remove 'SET default_storage_engine InnoDB' below
 --source include/no_ps_protocol.inc
 --source include/force_myisam_default.inc
+--source include/count_sessions.inc
 
 # Description
 # -----------
@@ -307,10 +308,10 @@ select POSITION(_latin1'B' IN _latin2'abcd');
 select FIND_IN_SET(_latin1'B',_latin1'a,b,c,d');
 
 # fix this:
---disable_parsing
+--disable_testcase BUG#0000
 select FIND_IN_SET(_latin1'B',_latin1'a,b,c,d' COLLATE latin1_bin);
 select FIND_IN_SET(_latin1'B' COLLATE latin1_bin,_latin1'a,b,c,d');
---enable_parsing
+--enable_testcase
 
 --error 1267
 select FIND_IN_SET(_latin1'B' COLLATE latin1_general_ci,_latin1'a,b,c,d' COLLATE latin1_bin);
@@ -320,10 +321,10 @@ select FIND_IN_SET(_latin1'B',_latin2'a,b,c,d');
 select SUBSTRING_INDEX(_latin1'abcdabcdabcd',_latin1'd',2);
 
 # fix this:
---disable_parsing
+--disable_testcase BUG#0000
 select SUBSTRING_INDEX(_latin1'abcdabcdabcd' COLLATE latin1_bin,_latin1'd',2);
 select SUBSTRING_INDEX(_latin1'abcdabcdabcd',_latin1'd' COLLATE latin1_bin,2);
---enable_parsing
+--enable_testcase
 
 --error 1267
 select SUBSTRING_INDEX(_latin1'abcdabcdabcd',_latin2'd',2);
@@ -2067,3 +2068,51 @@ CALL proc(51390, 51394);
 CALL proc(51390, 51394);
 --enable_warnings
 DROP PROCEDURE proc;
+
+--echo #
+--echo # Bug#29133127 ASSERTION `MAYBE_NULL' FAILED
+--echo #              |ITEM_FUNC_CONCAT::VAL_STR(STRING*)
+--echo #
+SET GLOBAL max_allowed_packet=1024;
+
+connect (con1,localhost,root,,);
+
+--source include/turn_off_strict_mode.inc
+SET collation_connection=utf32_unicode_ci;
+SELECT
+CONCAT('"',CONCAT('";"',repeat('a',60),
+                        repeat('b',60),
+                        repeat('c',60),
+                        repeat ('d',100)),'"');
+SELECT
+CONCAT('"',CONCAT_WS('";"',repeat('a',60),
+                           repeat('b',60),
+                           repeat('c',60),
+                           repeat ('d',100)),'"');
+SELECT
+CONCAT_WS('"',CONCAT_WS('";"',repeat('a',60),
+                              repeat('b',60),
+                              repeat('c',60),
+                              repeat ('d',100)),'"');
+--source include/restore_strict_mode.inc
+SELECT
+CONCAT('"',CONCAT('";"',repeat('a',60),
+                        repeat('b',60),
+                        repeat('c',60),
+                        repeat ('d',100)),'"');
+SELECT
+CONCAT('"',CONCAT_WS('";"',repeat('a',60),
+                           repeat('b',60),
+                           repeat('c',60),
+                           repeat ('d',100)),'"');
+SELECT
+CONCAT_WS('"',CONCAT_WS('";"',repeat('a',60),
+                              repeat('b',60),
+                              repeat('c',60),
+                              repeat ('d',100)),'"');
+connection default;
+disconnect con1;
+
+SET GLOBAL max_allowed_packet=default;
+
+--source include/wait_until_count_sessions.inc

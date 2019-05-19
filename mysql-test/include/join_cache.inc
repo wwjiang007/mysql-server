@@ -530,7 +530,7 @@ explain
 select t1.a, count(t2.p) as count
   from t1 left join t2 on t1.a=t2.a and t2.p % 2 = 1 group by t1.a;
 select t1.a, count(t2.p) as count
-  from t1 left join t2 on t1.a=t2.a and t2.p % 2 = 1 group by t1.a asc;
+  from t1 left join t2 on t1.a=t2.a and t2.p % 2 = 1 group by t1.a order by t1.a;
 drop table t1, t2;
 
 --echo #
@@ -1765,6 +1765,7 @@ SELECT t3.c1 FROM t3
 WHERE t3.c1 = SOME (SELECT t1.c2_key FROM t2 JOIN t1 ON t2.pk < t1.c1)
 XOR TRUE;
 
+eval explain format=tree $query_some;  # Tests FORMAT=tree for AlternativeIterator.
 eval explain $query_some;
 eval explain $query_any;
 eval explain $query_in;

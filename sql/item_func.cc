@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -24,7 +24,7 @@
   @file
 
   @brief
-  This file defines all numerical functions
+  This file defines all numerical Items
 */
 
 #include "sql/item_func.h"
@@ -34,7 +34,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cfloat>  // DBL_DIG
-#include <cmath>   // std::log2
+#include <climits>
+#include <cmath>  // std::log2
 #include <iosfwd>
 #include <memory>
 #include <new>
@@ -150,7 +151,7 @@ bool check_reserved_words(LEX_STRING *name) {
 bool eval_const_cond(THD *thd, Item *cond, bool *value) {
   // Function may be used both during resolving and during optimization:
   DBUG_ASSERT(cond->may_evaluate_const(thd));
-  *value = cond->val_int();
+  *value = cond->val_bool();
   return thd->is_error();
 }
 
@@ -338,13 +339,13 @@ void Item_func::fix_after_pullout(SELECT_LEX *parent_select,
 
 bool Item_func::walk(Item_processor processor, enum_walk walk,
                      uchar *argument) {
-  if ((walk & WALK_PREFIX) && (this->*processor)(argument)) return true;
+  if ((walk & enum_walk::PREFIX) && (this->*processor)(argument)) return true;
 
   Item **arg, **arg_end;
   for (arg = args, arg_end = args + arg_count; arg != arg_end; arg++) {
     if ((*arg)->walk(processor, walk, argument)) return true;
   }
-  return (walk & WALK_POSTFIX) && (this->*processor)(argument);
+  return (walk & enum_walk::POSTFIX) && (this->*processor)(argument);
 }
 
 void Item_func::traverse_cond(Cond_traverser traverser, void *argument,
@@ -445,7 +446,15 @@ void Item_func::split_sum_func(THD *thd, Ref_item_array ref_item_array,
 
 void Item_func::update_used_tables() {
   used_tables_cache = get_initial_pseudo_tables();
-  m_accum_properties = 0;
+
+  /*
+    Rollup property not always derivable from arguments, so don't reset that,
+    cf. "GROUP BY (a+b) WITH ROLLUP": the a and the b are never marked, cf. the
+    logic in `resolve_rollup_item', `resolve_rollup_wfs' and
+    `change_func_or_wf_group_ref', so "a+b" being a rollup expression can't be
+    derived from a or b.
+  */
+  m_accum_properties &= PROP_ROLLUP_EXPR;
 
   for (uint i = 0; i < arg_count; i++) {
     args[i]->update_used_tables();
@@ -454,29 +463,32 @@ void Item_func::update_used_tables() {
   }
 }
 
-void Item_func::print(String *str, enum_query_type query_type) {
+void Item_func::print(const THD *thd, String *str,
+                      enum_query_type query_type) const {
   str->append(func_name());
   str->append('(');
-  print_args(str, 0, query_type);
+  print_args(thd, str, 0, query_type);
   str->append(')');
 }
 
-void Item_func::print_args(String *str, uint from, enum_query_type query_type) {
+void Item_func::print_args(const THD *thd, String *str, uint from,
+                           enum_query_type query_type) const {
   for (uint i = from; i < arg_count; i++) {
     if (i != from) str->append(',');
-    args[i]->print(str, query_type);
+    args[i]->print(thd, str, query_type);
   }
 }
 
-void Item_func::print_op(String *str, enum_query_type query_type) {
+void Item_func::print_op(const THD *thd, String *str,
+                         enum_query_type query_type) const {
   str->append('(');
   for (uint i = 0; i < arg_count - 1; i++) {
-    args[i]->print(str, query_type);
+    args[i]->print(thd, str, query_type);
     str->append(' ');
     str->append(func_name());
     str->append(' ');
   }
-  args[arg_count - 1]->print(str, query_type);
+  args[arg_count - 1]->print(thd, str, query_type);
   str->append(')');
 }
 
@@ -620,7 +632,7 @@ Item *Item_func::get_tmp_table_item(THD *thd) {
     the same object as we need to detect if ROLLUP NULL's
     need to be written for this item (in has_rollup_result).
   */
-  if (!has_aggregation() && !const_item() && !has_wf() && !has_rollup_field()) {
+  if (!has_aggregation() && !const_item() && !has_wf() && !has_rollup_expr()) {
     Item *result = new Item_field(result_field);
     DBUG_RETURN(result);
   }
@@ -753,6 +765,26 @@ Item_field *get_gc_for_expr(Item_func **func, Field *fld, Item_result type) {
     return NULL;
 
   /*
+    In order to match expressions against a functional index's expression,
+    it's needed to skip CAST(.. AS .. ) and potentially COLLATE from the latter.
+    This can't be joined with striping json_unquote below, since we might need
+    to skip it too in expression like:
+      CAST(JSON_UNQUOTE(<expr>) AS CHAR(X))
+  */
+
+  if (expr->functype() == Item_func::COLLATE_FUNC &&
+      (*func)->functype() != Item_func::COLLATE_FUNC) {
+    if (!expr->arguments()[0]->can_be_substituted_for_gc()) return nullptr;
+    expr = down_cast<Item_func *>(expr->arguments()[0]);
+  }
+
+  if (expr->functype() == Item_func::TYPECAST_FUNC &&
+      (*func)->functype() != Item_func::TYPECAST_FUNC) {
+    if (!expr->arguments()[0]->can_be_substituted_for_gc()) return nullptr;
+    expr = down_cast<Item_func *>(expr->arguments()[0]);
+  }
+
+  /*
     Skip unquoting function. This is needed to address JSON string
     comparison issue. All JSON_* functions return quoted strings. In
     order to create usable index, GC column expression has to include
@@ -772,7 +804,7 @@ Item_field *get_gc_for_expr(Item_func **func, Field *fld, Item_result type) {
   if (type == fld->result_type() && (*func)->eq(expr, false)) {
     Item_field *field = new Item_field(fld);
     // Mark field for read
-    fld->table->mark_column_used(fld->table->in_use, fld, MARK_COLUMNS_READ);
+    fld->table->mark_column_used(fld, MARK_COLUMNS_READ);
     return field;
   }
   return NULL;
@@ -800,8 +832,19 @@ static bool substitute_gc_expression(Item_func **expr, List<Field> *gc_fields,
     Key_map tkm = field->part_of_key;
     tkm.merge(field->part_of_prefixkey);  // Include prefix keys.
     tkm.intersect(field->table->keys_in_use_for_query);
+    // If the field is a hidden field used by a functional index, we require
+    // that the collation of the field must match the collation of the
+    // expression. If not, we might end up with the wrong result when using
+    // the index (see bug#27337092). Ideally, this should be done for normal
+    // generated columns as well, but that is delayed to a later fix since the
+    // impact might be quite large.
+    const bool incompatible_collations =
+        field->is_field_for_functional_index() &&
+        field->result_type() == STRING_RESULT &&
+        (*expr)->result_type() == STRING_RESULT &&
+        (*expr)->collation.collation != field->charset();
 
-    if (!tkm.is_clear_all()) {
+    if (!tkm.is_clear_all() && !incompatible_collations) {
       item_field = get_gc_for_expr(expr, field, type);
       if (item_field != nullptr) break;
     }
@@ -1148,7 +1191,7 @@ double Item_func_numhybrid::val_real() {
         default:
           break;
       }
-      char *end_not_used;
+      const char *end_not_used;
       int err_not_used;
       String *res = str_op(&str_value);
       return (res ? my_strntod(res->charset(), (char *)res->ptr(),
@@ -1173,8 +1216,9 @@ longlong Item_func_numhybrid::val_int() {
     }
     case INT_RESULT:
       return int_op();
-    case REAL_RESULT:
-      return (longlong)rint(real_op());
+    case REAL_RESULT: {
+      return llrint_with_overflow_check(real_op());
+    }
     case STRING_RESULT: {
       switch (data_type()) {
         case MYSQL_TYPE_DATE:
@@ -1191,7 +1235,7 @@ longlong Item_func_numhybrid::val_int() {
       String *res;
       if (!(res = str_op(&str_value))) return 0;
 
-      char *end = (char *)res->ptr() + res->length();
+      const char *end = res->ptr() + res->length();
       const CHARSET_INFO *cs = res->charset();
       return (*(cs->cset->strtoll10))(cs, res->ptr(), &end, &err_not_used);
     }
@@ -1273,9 +1317,10 @@ bool Item_func_numhybrid::get_time(MYSQL_TIME *ltime) {
   }
 }
 
-void Item_func_signed::print(String *str, enum_query_type query_type) {
+void Item_func_signed::print(const THD *thd, String *str,
+                             enum_query_type query_type) const {
   str->append(STRING_WITH_LEN("cast("));
-  args[0]->print(str, query_type);
+  args[0]->print(thd, str, query_type);
   str->append(STRING_WITH_LEN(" as signed)"));
 }
 
@@ -1286,7 +1331,7 @@ bool Item_func_signed::resolve_type(THD *) {
 }
 
 longlong Item_func_signed::val_int_from_str(int *error) {
-  char buff[MAX_FIELD_WIDTH], *end, *start;
+  char buff[MAX_FIELD_WIDTH], *start;
   size_t length;
   String tmp(buff, sizeof(buff), &my_charset_bin), *res;
   longlong value;
@@ -1307,7 +1352,7 @@ longlong Item_func_signed::val_int_from_str(int *error) {
   length = res->length();
   cs = res->charset();
 
-  end = start + length;
+  const char *end = start + length;
   value = cs->cset->strtoll10(cs, start, &end, error);
   if (*error > 0 || end != start + length) {
     ErrConvString err(res);
@@ -1337,9 +1382,10 @@ longlong Item_func_signed::val_int() {
   return value;
 }
 
-void Item_func_unsigned::print(String *str, enum_query_type query_type) {
+void Item_func_unsigned::print(const THD *thd, String *str,
+                               enum_query_type query_type) const {
   str->append(STRING_WITH_LEN("cast("));
-  args[0]->print(str, query_type);
+  args[0]->print(thd, str, query_type);
   str->append(STRING_WITH_LEN(" as unsigned)"));
 }
 
@@ -1422,14 +1468,15 @@ err:
   return dec;
 }
 
-void Item_decimal_typecast::print(String *str, enum_query_type query_type) {
+void Item_decimal_typecast::print(const THD *thd, String *str,
+                                  enum_query_type query_type) const {
   char len_buf[20 * 3 + 1];
   char *end;
 
   uint precision =
       my_decimal_length_to_precision(max_length, decimals, unsigned_flag);
   str->append(STRING_WITH_LEN("cast("));
-  args[0]->print(str, query_type);
+  args[0]->print(thd, str, query_type);
   str->append(STRING_WITH_LEN(" as decimal("));
 
   end = int10_to_str(precision, len_buf, 10);
@@ -1702,7 +1749,7 @@ longlong Item_func_mul::int_op() {
   res = res1 + res0;
 
   if (a_negative != b_negative) {
-    if ((ulonglong)res > (ulonglong)LLONG_MIN + 1) goto err;
+    if ((ulonglong)res > (ulonglong)LLONG_MAX) goto err;
     res = -res;
   } else
     res_unsigned = true;
@@ -2165,7 +2212,8 @@ double Item_func_pow::val_real() {
   double val2 = args[1]->val_real();
   if ((null_value = (args[0]->null_value || args[1]->null_value)))
     return 0.0; /* purecov: inspected */
-  return check_float_overflow(pow(value, val2));
+  const double pow_result = pow(value, val2);
+  return check_float_overflow(pow_result);
 }
 
 // Trigonometric functions
@@ -2263,9 +2311,9 @@ longlong Item_func_bit::val_int() {
     if (!(res = str_op(&str_value))) return 0;
 
     int ovf_error;
-    char *from = const_cast<char *>(res->ptr());
+    const char *from = res->ptr();
     size_t len = res->length();
-    char *end = from + len;
+    const char *end = from + len;
     return my_strtoll10(from, &end, &ovf_error);
   }
 }
@@ -2279,9 +2327,9 @@ double Item_func_bit::val_real() {
     if (!(res = str_op(&str_value))) return 0.0;
 
     int ovf_error;
-    char *from = const_cast<char *>(res->ptr());
+    const char *from = res->ptr();
     size_t len = res->length();
-    char *end = from + len;
+    const char *end = from + len;
     return my_strtod(from, &end, &ovf_error);
   }
 }
@@ -3118,7 +3166,7 @@ bool Item_func_min_max::date_op(MYSQL_TIME *ltime, my_time_flags_t fuzzydate) {
   if (cmp_datetimes(&result)) return true;
   TIME_from_longlong_packed(ltime, data_type(), result);
   int warnings;
-  return check_date(ltime, non_zero_date(ltime), fuzzydate, &warnings);
+  return check_date(*ltime, non_zero_date(*ltime), fuzzydate, &warnings);
 }
 
 bool Item_func_min_max::time_op(MYSQL_TIME *ltime) {
@@ -3166,9 +3214,9 @@ longlong Item_func_min_max::int_op() {
 
   // Find the least/greatest argument based on integer value.
   for (uint i = 0; i < arg_count; i++) {
-    DBUG_ASSERT(!unsigned_flag || (unsigned_flag && args[i]->unsigned_flag));
     const longlong val = args[i]->val_int();
     if ((null_value = args[i]->null_value)) return 0;
+    DBUG_ASSERT(!unsigned_flag || (unsigned_flag && args[i]->unsigned_flag));
     const bool val_is_smaller = unsigned_flag ? static_cast<ulonglong>(val) <
                                                     static_cast<ulonglong>(res)
                                               : val < res;
@@ -3329,14 +3377,15 @@ longlong Item_func_locate::val_int() {
   return (longlong)match.mb_len + start0 + 1;
 }
 
-void Item_func_locate::print(String *str, enum_query_type query_type) {
+void Item_func_locate::print(const THD *thd, String *str,
+                             enum_query_type query_type) const {
   str->append(STRING_WITH_LEN("locate("));
-  args[1]->print(str, query_type);
+  args[1]->print(thd, str, query_type);
   str->append(',');
-  args[0]->print(str, query_type);
+  args[0]->print(thd, str, query_type);
   if (arg_count == 3) {
     str->append(',');
-    args[2]->print(str, query_type);
+    args[2]->print(thd, str, query_type);
   }
   str->append(')');
 }
@@ -3553,8 +3602,6 @@ longlong Item_func_bit_count::val_int() {
 
 /****************************************************************************
 ** Functions to handle dynamic loadable functions
-** Original source by: Alexis Mikhailov <root@medinf.chuvashia.su>
-** Rewritten by monty.
 ****************************************************************************/
 
 void udf_handler::cleanup() {
@@ -3661,6 +3708,7 @@ bool udf_handler::fix_fields(THD *thd, Item_result_field *func, uint arg_count,
 
   if (u_d->func_init) {
     char init_msg_buff[MYSQL_ERRMSG_SIZE];
+    *init_msg_buff = '\0';
     char *to = num_buffer;
     for (uint i = 0; i < arg_count; i++) {
       /*
@@ -3715,6 +3763,7 @@ bool udf_handler::fix_fields(THD *thd, Item_result_field *func, uint arg_count,
     if (!initid.const_item && used_tables_cache == 0)
       used_tables_cache = RAND_TABLE_BIT;
     func->decimals = min<uint>(initid.decimals, NOT_FIXED_DEC);
+    func->set_data_type_string(func->max_length, &my_charset_bin);
   }
   initialized = 1;
   if (error) {
@@ -3778,9 +3827,7 @@ String *udf_handler::val_str(String *str, String *save_str) {
   DBUG_ENTER("udf_handler::val_str");
 
   if (get_arguments()) DBUG_RETURN(0);
-  char *(*func)(UDF_INIT *, UDF_ARGS *, char *, ulong *, uchar *, uchar *) =
-      (char *(*)(UDF_INIT *, UDF_ARGS *, char *, ulong *, uchar *,
-                 uchar *))u_d->func;
+  Udf_func_string func = reinterpret_cast<Udf_func_string>(u_d->func);
 
   if ((res_length = str->alloced_length()) <
       MAX_FIELD_WIDTH) {  // This happens VERY seldom
@@ -3812,23 +3859,21 @@ String *udf_handler::val_str(String *str, String *save_str) {
 */
 
 my_decimal *udf_handler::val_decimal(bool *null_value, my_decimal *dec_buf) {
-  char buf[DECIMAL_MAX_STR_LENGTH + 1], *end;
+  char buf[DECIMAL_MAX_STR_LENGTH + 1];
   ulong res_length = DECIMAL_MAX_STR_LENGTH;
 
   if (get_arguments()) {
     *null_value = 1;
     return 0;
   }
-  char *(*func)(UDF_INIT *, UDF_ARGS *, char *, ulong *, uchar *, uchar *) =
-      (char *(*)(UDF_INIT *, UDF_ARGS *, char *, ulong *, uchar *,
-                 uchar *))u_d->func;
+  Udf_func_string func = reinterpret_cast<Udf_func_string>(u_d->func);
 
   char *res = func(&initid, &f_args, buf, &res_length, &is_null, &error);
   if (is_null || error) {
     *null_value = 1;
     return 0;
   }
-  end = res + res_length;
+  const char *end = res + res_length;
   str2my_decimal(E_DEC_FATAL_ERROR, res, dec_buf, &end);
   return dec_buf;
 }
@@ -3846,12 +3891,13 @@ void Item_udf_func::cleanup() {
   Item_func::cleanup();
 }
 
-void Item_udf_func::print(String *str, enum_query_type query_type) {
+void Item_udf_func::print(const THD *thd, String *str,
+                          enum_query_type query_type) const {
   str->append(func_name());
   str->append('(');
   for (uint i = 0; i < arg_count; i++) {
     if (i != 0) str->append(',');
-    args[i]->print_item_w_name(str, query_type);
+    args[i]->print_item_w_name(thd, str, query_type);
   }
   str->append(')');
 }
@@ -3930,9 +3976,11 @@ bool Item_func_udf_decimal::resolve_type(THD *) {
 /* Default max_length is max argument length */
 
 bool Item_func_udf_str::resolve_type(THD *) {
-  set_data_type(MYSQL_TYPE_VARCHAR);
+  uint result_length = 0;
   for (uint i = 0; i < arg_count; i++)
-    set_if_bigger(max_length, args[i]->max_length);
+    result_length = std::max(result_length, args[i]->max_length);
+  // If the UDF has an init function, this may be overridden later.
+  set_data_type_string(result_length, &my_charset_bin);
   return false;
 }
 
@@ -3940,6 +3988,7 @@ String *Item_func_udf_str::val_str(String *str) {
   DBUG_ASSERT(fixed == 1);
   String *res = udf.val_str(str, &str_value);
   null_value = !res;
+  if (res) res->set_charset(collation.collation);
   return res;
 }
 
@@ -4837,11 +4886,12 @@ longlong Item_func_benchmark::val_int() {
   return 0;
 }
 
-void Item_func_benchmark::print(String *str, enum_query_type query_type) {
+void Item_func_benchmark::print(const THD *thd, String *str,
+                                enum_query_type query_type) const {
   str->append(STRING_WITH_LEN("benchmark("));
-  args[0]->print(str, query_type);
+  args[0]->print(thd, str, query_type);
   str->append(',');
-  args[1]->print(str, query_type);
+  args[1]->print(thd, str, query_type);
   str->append(')');
 }
 
@@ -5285,7 +5335,7 @@ longlong user_var_entry::val_int(bool *null_value) const {
     }
     case STRING_RESULT: {
       int error;
-      return my_strtoll10(m_ptr, (char **)0,
+      return my_strtoll10(m_ptr, nullptr,
                           &error);  // String is null terminated
     }
     case ROW_RESULT:
@@ -5533,18 +5583,19 @@ my_decimal *Item_func_set_user_var::val_decimal(my_decimal *val) {
 }
 
 // just the assignment, for use in "SET @a:=5" type self-prints
-void Item_func_set_user_var::print_assignment(String *str,
-                                              enum_query_type query_type) {
+void Item_func_set_user_var::print_assignment(
+    const THD *thd, String *str, enum_query_type query_type) const {
   str->append(STRING_WITH_LEN("@"));
   str->append(name);
   str->append(STRING_WITH_LEN(":="));
-  args[0]->print(str, query_type);
+  args[0]->print(thd, str, query_type);
 }
 
 // parenthesize assignment for use in "EXPLAIN EXTENDED SELECT (@e:=80)+5"
-void Item_func_set_user_var::print(String *str, enum_query_type query_type) {
+void Item_func_set_user_var::print(const THD *thd, String *str,
+                                   enum_query_type query_type) const {
   str->append(STRING_WITH_LEN("("));
-  print_assignment(str, query_type);
+  print_assignment(thd, str, query_type);
   str->append(STRING_WITH_LEN(")"));
 }
 
@@ -5752,7 +5803,7 @@ static int get_var_with_binlog(THD *thd, enum_sql_command sql_command,
     LEX *sav_lex = thd->lex, lex_tmp;
     thd->lex = &lex_tmp;
     lex_start(thd);
-    tmp_var_list.push_back(new (*THR_MALLOC) set_var_user(
+    tmp_var_list.push_back(new (thd->mem_root) set_var_user(
         new Item_func_set_user_var(name, new Item_null(), false)));
     /* Create the variable */
     if (sql_set_variables(thd, &tmp_var_list, false)) {
@@ -5892,9 +5943,10 @@ enum Item_result Item_func_get_user_var::result_type() const {
   return m_cached_result_type;
 }
 
-void Item_func_get_user_var::print(String *str, enum_query_type) {
+void Item_func_get_user_var::print(const THD *thd, String *str,
+                                   enum_query_type) const {
   str->append(STRING_WITH_LEN("(@"));
-  append_identifier(current_thd, str, name);
+  append_identifier(thd, str, name.ptr(), name.length());
   str->append(')');
 }
 
@@ -5983,9 +6035,10 @@ my_decimal *Item_user_var_as_out_param::val_decimal(my_decimal *) {
   return 0;
 }
 
-void Item_user_var_as_out_param::print(String *str, enum_query_type) {
+void Item_user_var_as_out_param::print(const THD *thd, String *str,
+                                       enum_query_type) const {
   str->append('@');
-  append_identifier(current_thd, str, name);
+  append_identifier(thd, str, name.ptr(), name.length());
 }
 
 Item_func_get_system_var::Item_func_get_system_var(sys_var *var_arg,
@@ -6030,7 +6083,9 @@ bool Item_func_get_system_var::resolve_type(THD *thd) {
       max_length = MY_INT64_NUM_DECIMAL_DIGITS;
       unsigned_flag = true;
       break;
+    case SHOW_SIGNED_INT:
     case SHOW_SIGNED_LONG:
+    case SHOW_SIGNED_LONGLONG:
       collation.set_numeric();
       set_data_type(MYSQL_TYPE_LONGLONG);
       max_length = MY_INT64_NUM_DECIMAL_DIGITS;
@@ -6086,7 +6141,8 @@ bool Item_func_get_system_var::resolve_type(THD *thd) {
   return false;
 }
 
-void Item_func_get_system_var::print(String *str, enum_query_type) {
+void Item_func_get_system_var::print(const THD *, String *str,
+                                     enum_query_type) const {
   str->append(item_name);
 }
 
@@ -6096,8 +6152,10 @@ enum Item_result Item_func_get_system_var::result_type() const {
     case SHOW_MY_BOOL:
     case SHOW_INT:
     case SHOW_LONG:
-    case SHOW_SIGNED_LONG:
     case SHOW_LONGLONG:
+    case SHOW_SIGNED_INT:
+    case SHOW_SIGNED_LONG:
+    case SHOW_SIGNED_LONGLONG:
     case SHOW_HA_ROWS:
       return INT_RESULT;
     case SHOW_CHAR:
@@ -6206,10 +6264,14 @@ longlong Item_func_get_system_var::val_int() {
       return get_sys_var_safe<uint>(thd);
     case SHOW_LONG:
       return get_sys_var_safe<ulong>(thd);
-    case SHOW_SIGNED_LONG:
-      return get_sys_var_safe<long>(thd);
     case SHOW_LONGLONG:
       return get_sys_var_safe<ulonglong>(thd);
+    case SHOW_SIGNED_INT:
+      return get_sys_var_safe<int>(thd);
+    case SHOW_SIGNED_LONG:
+      return get_sys_var_safe<long>(thd);
+    case SHOW_SIGNED_LONGLONG:
+      return get_sys_var_safe<longlong>(thd);
     case SHOW_HA_ROWS:
       return get_sys_var_safe<ha_rows>(thd);
     case SHOW_BOOL:
@@ -6302,8 +6364,10 @@ String *Item_func_get_system_var::val_str(String *str) {
 
     case SHOW_INT:
     case SHOW_LONG:
-    case SHOW_SIGNED_LONG:
     case SHOW_LONGLONG:
+    case SHOW_SIGNED_INT:
+    case SHOW_SIGNED_LONG:
+    case SHOW_SIGNED_LONGLONG:
     case SHOW_HA_ROWS:
     case SHOW_BOOL:
     case SHOW_MY_BOOL:
@@ -6389,8 +6453,10 @@ double Item_func_get_system_var::val_real() {
     }
     case SHOW_INT:
     case SHOW_LONG:
-    case SHOW_SIGNED_LONG:
     case SHOW_LONGLONG:
+    case SHOW_SIGNED_INT:
+    case SHOW_SIGNED_LONG:
+    case SHOW_SIGNED_LONGLONG:
     case SHOW_HA_ROWS:
     case SHOW_BOOL:
     case SHOW_MY_BOOL:
@@ -6463,13 +6529,6 @@ bool Item_func_match::init_search(THD *thd) {
   TABLE *const table = table_ref->table;
   /* Check if init_search() has been called before */
   if (ft_handler && !master) {
-    /*
-      We should reset ft_handler as it is cleaned up
-      on destruction of FT_SELECT object
-      (necessary in case of re-execution of subquery).
-      TODO: FT_SELECT should not clean up ft_handler.
-    */
-    if (join_key) table->file->ft_handler = ft_handler;
     DBUG_RETURN(false);
   }
 
@@ -6659,7 +6718,7 @@ bool Item_func_match::fix_fields(THD *thd, Item **ref) {
 
   if (!master) {
     Prepared_stmt_arena_holder ps_arena_holder(thd);
-    hints = new (*THR_MALLOC) Ft_hints(flags);
+    hints = new (thd->mem_root) Ft_hints(flags);
     if (!hints) {
       my_error(ER_TABLE_CANT_HANDLE_FT, MYF(0));
       return true;
@@ -6793,11 +6852,12 @@ double Item_func_match::val_real() {
       ft_handler->please->find_relevance(ft_handler, table->record[0], 0));
 }
 
-void Item_func_match::print(String *str, enum_query_type query_type) {
+void Item_func_match::print(const THD *thd, String *str,
+                            enum_query_type query_type) const {
   str->append(STRING_WITH_LEN("(match "));
-  print_args(str, 0, query_type);
+  print_args(thd, str, 0, query_type);
   str->append(STRING_WITH_LEN(" against ("));
-  against->print(str, query_type);
+  against->print(thd, str, query_type);
   if (flags & FT_BOOL)
     str->append(STRING_WITH_LEN(" in boolean mode"));
   else if (flags & FT_EXPAND)
@@ -6971,7 +7031,7 @@ void Item_func_sp::cleanup() {
 }
 
 const char *Item_func_sp::func_name() const {
-  THD *thd = current_thd;
+  const THD *thd = current_thd;
   /* Calculate length to avoid reallocation of string for sure */
   size_t len =
       (((m_name->m_explicit_name ? m_name->m_db.length : 0) +
@@ -7183,6 +7243,29 @@ bool Item_func_sp::execute_impl(THD *thd) {
     my_error(ER_BINLOG_UNSAFE_ROUTINE, MYF(0));
     goto error;
   }
+
+  /*
+    The 'function call' top statement can not distinguish if its sub
+    statements (function) have 'CREATE/DROP TEMPORARY TABLE' or not
+    before executing its sub statements, It is too late to set the
+    binlog format to row in mixed mode when executing the 'CREATE/DROP
+    TEMPORARY TABLE' in sub statement, because the binlog format is not
+    consistent before and after 'CREATE/DROP TEMPORARY TABLE'. Which
+    implies that we have to write the 'function call' top statement
+    into binlog if the function contains 'CREATE/DROP TEMPORARY TABLE'
+    in mixed mode. Because of that constrain we have to write the
+    'function call' top statement into binlog if the function contains
+    the DMLs on temporary table in mixed mode, another reason is that
+    the DMLs on temporary table might be in the same function as
+    'CREATE/DROP TEMPORARY TABLE'. Which requires to set binlog format
+    to statement if the function contains DML statement(s) on temporary
+    table in mixed mode.
+  */
+  if (thd->variables.binlog_format == BINLOG_FORMAT_MIXED &&
+      (thd->lex->stmt_accessed_table(LEX::STMT_READS_TEMP_TRANS_TABLE) ||
+       thd->lex->stmt_accessed_table(LEX::STMT_READS_TEMP_NON_TRANS_TABLE)))
+    thd->clear_current_stmt_binlog_format_row();
+
   /*
     Disable the binlogging if this is not a SELECT statement. If this is a
     SELECT, leave binlogging on, so execute_function() code writes the
@@ -7268,7 +7351,7 @@ bool Item_func_sp::fix_fields(THD *thd, Item **ref) {
     Checking privileges to execute the function while creating view and
     executing the function of select.
    */
-  if (!(thd->lex->context_analysis_only & CONTEXT_ANALYSIS_ONLY_VIEW) ||
+  if (!thd->lex->is_view_context_analysis() ||
       (thd->lex->sql_command == SQLCOM_CREATE_VIEW)) {
     if (context->security_ctx) {
       /* Set view definer security context */
@@ -7303,7 +7386,7 @@ bool Item_func_sp::fix_fields(THD *thd, Item **ref) {
   res = Item_func::fix_fields(thd, ref);
   if (res) DBUG_RETURN(res);
 
-  if (thd->lex->context_analysis_only & CONTEXT_ANALYSIS_ONLY_VIEW) {
+  if (thd->lex->is_view_context_analysis()) {
     /*
       Here we check privileges of the stored routine only during view
       creation, in order to validate the view.  A runtime check is
@@ -7398,8 +7481,8 @@ bool Item_func_version::itemize(Parse_context *pc, Item **res) {
   @retval   false         If schema and table are not hidden by NDB.
 */
 
-static inline bool is_hidden_by_ndb(THD *thd, const String *schema_name,
-                                    const String *table_name) {
+static inline bool is_hidden_by_ndb(THD *thd, String *schema_name,
+                                    String *table_name) {
   if (!strncmp(schema_name->ptr(), "ndb", 3)) {
     List<LEX_STRING> list;
 
@@ -7465,7 +7548,7 @@ longlong Item_func_can_access_database::val_int() {
 
   // Check access
   Security_context *sctx = thd->security_context();
-  if (!(sctx->master_access() & (DB_ACLS | SHOW_DB_ACL) ||
+  if (!(sctx->master_access(schema_name_ptr->ptr()) & (DB_ACLS | SHOW_DB_ACL) ||
         acl_get(thd, sctx->host().str, sctx->ip().str, sctx->priv_user().str,
                 schema_name_ptr->ptr(), 0) ||
         !check_grant_db(thd, schema_name_ptr->ptr()))) {
@@ -7635,7 +7718,8 @@ longlong Item_func_can_access_routine::val_int() {
   char sp_user[USER_HOST_BUFF_SIZE];
   strxmov(sp_user, thd->security_context()->priv_user().str, "@",
           thd->security_context()->priv_host().str, NullS);
-  bool full_access = (thd->security_context()->check_access(SELECT_ACL) ||
+  bool full_access = (thd->security_context()->check_access(
+                          SELECT_ACL, schema_name_ptr->ptr()) ||
                       !strcmp(sp_user, definer_ptr->ptr()));
 
   if (check_full_access) {
@@ -7869,12 +7953,33 @@ longlong Item_func_can_access_view::val_int() {
   bool is_view_valid = true;
   std::unique_ptr<dd::Properties> view_options(
       dd::Properties::parse_properties(options_ptr->c_ptr_safe()));
-  if (view_options->get_bool("view_valid", &is_view_valid)) DBUG_RETURN(0);
 
+  // Warn if the property string is corrupt.
+  if (!view_options.get()) {
+    LogErr(WARNING_LEVEL, ER_WARN_PROPERTY_STRING_PARSE_FAILED,
+           options_ptr->c_ptr_safe());
+    DBUG_ASSERT(false);
+    DBUG_RETURN(0);
+  }
+
+  if (view_options->get("view_valid", &is_view_valid)) DBUG_RETURN(0);
+
+  // Show warning/error if view is invalid.
   THD *thd = current_thd;
-  if (!is_view_valid)
-    push_view_warning_or_error(thd, schema_name_ptr->c_ptr_safe(),
-                               table_name_ptr->c_ptr_safe());
+  const String db_str(schema_name_ptr->c_ptr_safe(), system_charset_info);
+  const String name_str(table_name_ptr->c_ptr_safe(), system_charset_info);
+  if (!is_view_valid &&
+      !thd->lex->m_IS_table_stats.check_error_for_key(db_str, name_str)) {
+    std::string err_message = push_view_warning_or_error(
+        current_thd, schema_name_ptr->ptr(), table_name_ptr->ptr());
+
+    /*
+      Cache the error message, so that we do not show the same error multiple
+      times.
+     */
+    thd->lex->m_IS_table_stats.store_error_message(db_str, name_str, nullptr,
+                                                   err_message.c_str());
+  }
 
   //
   // Check if definer user/host has access.
@@ -8168,9 +8273,17 @@ longlong Item_func_internal_keys_disabled::val_int() {
   std::unique_ptr<dd::Properties> p(
       dd::Properties::parse_properties(options_ptr->c_ptr_safe()));
 
+  // Warn if the property string is corrupt.
+  if (!p.get()) {
+    LogErr(WARNING_LEVEL, ER_WARN_PROPERTY_STRING_PARSE_FAILED,
+           options_ptr->c_ptr_safe());
+    DBUG_ASSERT(false);
+    DBUG_RETURN(0);
+  }
+
   // Read keys_disabled sub type.
   uint keys_disabled = 0;
-  p->get_uint32("keys_disabled", &keys_disabled);
+  p->get("keys_disabled", &keys_disabled);
 
   DBUG_RETURN(keys_disabled);
 }
@@ -8565,8 +8678,16 @@ longlong Item_func_internal_get_view_warning_or_error::val_int() {
     std::unique_ptr<dd::Properties> view_options(
         dd::Properties::parse_properties(options_ptr->c_ptr_safe()));
 
+    // Warn if the property string is corrupt.
+    if (!view_options.get()) {
+      LogErr(WARNING_LEVEL, ER_WARN_PROPERTY_STRING_PARSE_FAILED,
+             options_ptr->c_ptr_safe());
+      DBUG_ASSERT(false);
+      DBUG_RETURN(0);
+    }
+
     // Return 0 if get_bool() or push_view_warning_or_error() fails
-    if (view_options->get_bool("view_valid", &is_view_valid)) DBUG_RETURN(0);
+    if (view_options->get("view_valid", &is_view_valid)) DBUG_RETURN(0);
 
     if (is_view_valid == false) {
       push_view_warning_or_error(current_thd, schema_name_ptr->c_ptr_safe(),
@@ -8614,6 +8735,13 @@ longlong Item_func_get_dd_index_sub_part_length::val_int() {
   enum_field_types field_type = dd_get_old_field_type(col_type);
   if (!Field::type_can_have_key_part(field_type)) DBUG_RETURN(0);
 
+  // Calculate the key length for the column. Note that we pass inn dummy values
+  // for "decimals", "is_unsigned" and "elements" since none of those arguments
+  // will affect the key length for any of the data types that can have a prefix
+  // index (see Field::type_can_have_key_part above).
+  uint32 column_key_length =
+      calc_key_length(field_type, column_length, 0, false, 0);
+
   // Read column charset id from args[3]
   const CHARSET_INFO *column_charset = &my_charset_latin1;
   if (csid) {
@@ -8622,7 +8750,7 @@ longlong Item_func_get_dd_index_sub_part_length::val_int() {
   }
 
   if ((idx_type != dd::Index::IT_FULLTEXT) &&
-      (key_part_length != column_length)) {
+      (key_part_length != column_key_length)) {
     longlong sub_part_length = key_part_length / column_charset->mbmaxlen;
     null_value = false;
     DBUG_RETURN(sub_part_length);

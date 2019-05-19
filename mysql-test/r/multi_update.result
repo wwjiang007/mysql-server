@@ -185,7 +185,7 @@ create table t2 (n int(10), d int(10));
 insert into t1 values(1,1);
 insert into t2 values(1,10),(2,20);
 UPDATE t1,t2 SET t1.d=t2.d WHERE t1.n=t2.n;
-ERROR HY000: You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column
+ERROR HY000: You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column. 
 set sql_safe_updates=0;
 drop table t1,t2;
 set timestamp=1038401397;
@@ -617,7 +617,7 @@ INSERT INTO t1 VALUES (1), (2), (3);
 SET SESSION sql_safe_updates = 1;
 # Must not cause failed assertion
 UPDATE IGNORE t1, t1 t1a SET t1.a = 1 WHERE t1a.a = 1;
-ERROR HY000: You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column
+ERROR HY000: You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column. 
 DROP TABLE t1;
 #
 # Bug#54543: update ignore with incorrect subquery leads to assertion
@@ -647,13 +647,14 @@ set @@optimizer_switch=@optimizer_switch_saved;
 #
 set @optimizer_switch_saved=@@optimizer_switch;
 set optimizer_switch='derived_merge=off';
-CREATE FUNCTION f1 () RETURNS BLOB RETURN 1;
+CREATE FUNCTION f1 () RETURNS BLOB RETURN '2011-01-01';
 CREATE TABLE t1 (f1 DATE);
 INSERT INTO t1 VALUES('2001-01-01');
-UPDATE IGNORE (SELECT 1 FROM t1 WHERE f1 = (SELECT f1() FROM t1)) x, t1 SET f1 = 1;
-Warnings:
-Warning	1292	Incorrect date value: '1' for column 'f1' at row 2
+UPDATE IGNORE (SELECT 1 FROM t1 WHERE f1 = (SELECT f1() FROM t1)) x, t1 SET f1 = '2011-01-01';
 DROP FUNCTION f1;
+DROP TABLE t1;
+CREATE TABLE t1(a TEXT, FULLTEXT(a)) engine = blackhole;
+UPDATE IGNORE (SELECT 1 FROM t1 WHERE(MATCH(a) AGAINST(''))) `x`,`t1` SET a = 1;
 DROP TABLE t1;
 set @@optimizer_switch=@optimizer_switch_saved;
 # Bug#13256831 - ERROR 1032 (HY000): CAN'T FIND RECORD

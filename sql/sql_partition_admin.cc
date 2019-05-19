@@ -88,7 +88,7 @@ bool Sql_cmd_alter_table_exchange_partition::execute(THD *thd) {
 
   DBUG_ENTER("Sql_cmd_alter_table_exchange_partition::execute");
 
-  if (thd->is_fatal_error) /* out of memory creating a copy of alter_info */
+  if (thd->is_fatal_error()) /* out of memory creating a copy of alter_info */
     DBUG_RETURN(true);
 
   /* also check the table to be exchanged with the partition */
@@ -158,7 +158,7 @@ static bool check_exchange_partition(TABLE *table, TABLE *part_table) {
   }
 
   /* The table cannot have foreign keys constraints or be referenced */
-  if (!table->file->can_switch_engines()) {
+  if (table->s->foreign_keys || table->s->foreign_key_parents) {
     my_error(ER_PARTITION_EXCHANGE_FOREIGN_KEY, MYF(0),
              table->s->table_name.str);
     DBUG_RETURN(true);

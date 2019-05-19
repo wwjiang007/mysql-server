@@ -26,6 +26,7 @@
 #include <rpc/rpc.h>
 #include <stdlib.h>
 
+#include "plugin/group_replication/libmysqlgcs/src/bindings/xcom/xcom/checked_data.h"
 #include "plugin/group_replication/libmysqlgcs/src/bindings/xcom/xcom/node_list.h"
 #include "plugin/group_replication/libmysqlgcs/src/bindings/xcom/xcom/node_set.h"
 #include "plugin/group_replication/libmysqlgcs/src/bindings/xcom/xcom/simset.h"
@@ -40,7 +41,7 @@
 #include "plugin/group_replication/libmysqlgcs/src/bindings/xcom/xcom/xdr_utils.h"
 #include "plugin/group_replication/libmysqlgcs/xdr_gen/xcom_vp.h"
 
-define_xdr_funcs(synode_no) define_xdr_funcs(app_data_ptr)
+clone_xdr_array(synode_no)
 
     static app_data_list nextp(app_data_list l);
 static unsigned long msg_count(app_data_ptr a);
@@ -116,6 +117,11 @@ static char *dbg_app_data_single(app_data_ptr a) {
       case view_msg:
         COPY_AND_FREE_GOUT(dbg_node_set(a->body.app_u_u.present));
         break;
+      case get_event_horizon_type:
+        break;
+      case set_event_horizon_type:
+        NDBG(a->body.app_u_u.event_horizon, u);
+        break;
       default:
         STRLIT("unknown type ");
         break;
@@ -147,6 +153,8 @@ app_data_ptr clone_app_data_single(app_data_ptr a) {
   char *str = NULL;
   app_data_ptr p = 0;
   if (0 != a) {
+    bool copied = false;
+
     p = new_app_data();
     p->unique_id = a->unique_id;
     p->lsn = a->lsn;
@@ -175,16 +183,9 @@ app_data_ptr clone_app_data_single(app_data_ptr a) {
         break;
       /* purecov: end */
       case app_type:
-        p->body.app_u_u.data.data_val =
-            calloc((size_t)a->body.app_u_u.data.data_len, sizeof(char));
-        if (p->body.app_u_u.data.data_val == NULL) {
-          p->body.app_u_u.data.data_len = 0;
-          G_ERROR("Memory allocation failed.");
-          break;
-        }
-        p->body.app_u_u.data.data_len = a->body.app_u_u.data.data_len;
-        memcpy(p->body.app_u_u.data.data_val, a->body.app_u_u.data.data_val,
-               (size_t)a->body.app_u_u.data.data_len);
+        copied =
+            copy_checked_data(&p->body.app_u_u.data, &a->body.app_u_u.data);
+        if (!copied) G_ERROR("Memory allocation failed.");
         break;
       case query_type:
         break;
@@ -208,6 +209,11 @@ app_data_ptr clone_app_data_single(app_data_ptr a) {
       case enable_arbitrator:
       case disable_arbitrator:
       case x_terminate_and_exit:
+        break;
+      case get_event_horizon_type:
+        break;
+      case set_event_horizon_type:
+        p->body.app_u_u.event_horizon = a->body.app_u_u.event_horizon;
         break;
       default: /* Should not happen */
         str = dbg_app_data(a);
@@ -277,6 +283,8 @@ size_t app_data_size(app_data const *a) {
     case enable_arbitrator:
     case disable_arbitrator:
     case x_terminate_and_exit:
+    case get_event_horizon_type:
+    case set_event_horizon_type:
       break;
     default: /* Should not happen */
       assert(("No such xcom type" && FALSE));

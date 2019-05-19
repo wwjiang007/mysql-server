@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2005, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2005, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -196,8 +196,8 @@ Tsman::execREAD_CONFIG_REQ(Signal* signal)
 
 #ifdef ERROR_INSERT
   Uint32 disk_data_format = 1;
-  ndbrequire(!ndb_mgm_get_int_parameter(p, CFG_DB_DISK_DATA_FORMAT,
-                                        &disk_data_format));
+  ndb_mgm_get_int_parameter(p, CFG_DB_DISK_DATA_FORMAT,
+                            &disk_data_format);
   g_use_old_format = (disk_data_format == 0);
 #endif
   m_file_pool.init(RT_TSMAN_FILE, pc);
@@ -272,8 +272,7 @@ Tsman::execCONTINUEB(Signal* signal)
     break;
   }
   default:
-    ndbrequire(false);
-    break;
+    ndbabort();
   }
   client_unlock(number(), __LINE__);
 }
@@ -574,7 +573,7 @@ Tsman::execDROP_FILEGROUP_IMPL_REQ(Signal* signal)
       ptr.p->m_state = Tablespace::TS_ONLINE;
       break;
     default:
-      ndbrequire(false);
+      ndbabort();
     }
   } while(0);
 
@@ -878,7 +877,7 @@ Tsman::execFSCLOSECONF(Signal* signal)
   }
   else
   {
-    ndbrequire(false);
+    ndbabort();
   }
   
   {
@@ -978,7 +977,7 @@ Tsman::open_file(Signal* signal,
     req->fileFlags |= FsOpenReq::OM_READ_SIZE;
     break;
   default:
-    ndbrequire(false);
+    ndbabort();
   }
 
   req->page_size = File_formats::NDB_PAGE_SIZE;
@@ -1004,6 +1003,21 @@ Tsman::open_file(Signal* signal,
   // TODO check overflow in cast
   ptr.p->m_create.m_extent_pages = Uint32(extent_pages);
   ptr.p->m_create.m_data_pages = Uint32(data_pages);
+
+  /**
+   * Check whether there are enough free slots in the disk page buffer
+   * for extent pages, which will be locked in the buffer.
+   */
+  {
+    Page_cache_client pgman(this, m_pgman);
+    if (!pgman.extent_pages_available(extent_pages))
+    {
+      return CreateFileImplRef::OutOfDiskPageBufferMemory;
+
+      // CreateFileImplReq::Abort from DBDICT will free the
+      // PGMAN datafile already created
+    }
+  }
 
   /**
    * Update file size
@@ -1512,7 +1526,7 @@ Tsman::load_extent_pages(Signal* signal, Ptr<Datafile> ptr)
   
   if(page_id < 0)
   {
-    ndbrequire(false);
+    ndbabort();
   }
 }
 
@@ -2600,7 +2614,7 @@ Tsman::unmap_page(Signal* signal, Local_key *key, Uint32 uncommitted_bits)
              << " fragment: " << *ext_fragment_id << " "
              << "trying to unmap page: " << *key 
              << " " << *ext_data << endl;
-      ndbrequire(false);
+      ndbabort();
     }
     Uint32 page_no_in_extent = calc_page_no_in_extent(key->m_page_no, &val);
     /**
@@ -2989,7 +3003,7 @@ Tsman::end_lcp(Signal* signal, Uint32 ptrI, Uint32 list, Uint32 filePtrI)
     break;
   }
   default:
-    ndbrequire(false);
+    ndbabort();
   }
   
   nextFile = file.p->nextList;
@@ -3170,7 +3184,7 @@ void Tsman::execGET_TABINFOREQ(Signal* signal)
   Datafile_hash::Iterator iter;
   if (!m_file_hash.first(iter))
   {
-    ndbrequire(false);
+    ndbabort();
     return;                                     // Silence compiler warning
   }
 

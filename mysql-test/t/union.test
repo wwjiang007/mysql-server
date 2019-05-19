@@ -1159,21 +1159,25 @@ SELECT * FROM t1 UNION SELECT * FROM t1 ORDER BY a + 12;
 SELECT * FROM t1 UNION SELECT * FROM t1 ORDER BY a + 12;
 
 --echo # Should not crash
+--error ER_TABLE_CANT_HANDLE_FT
 EXPLAIN
 SELECT * FROM t1 UNION SELECT * FROM t1
   ORDER BY MATCH(a) AGAINST ('+abc' IN BOOLEAN MODE);
 
 --echo # Should not crash
+--error ER_TABLE_CANT_HANDLE_FT
 WITH cte AS (
 SELECT * FROM t1 UNION SELECT * FROM t1
   ORDER BY MATCH(a) AGAINST ('+abc' IN BOOLEAN MODE)
 ) SELECT * FROM cte;
 
 --echo # Should not crash
+--error ER_TABLE_CANT_HANDLE_FT
 SELECT * FROM t1 UNION SELECT * FROM t1
   ORDER BY MATCH(a) AGAINST ('+abc' IN BOOLEAN MODE);
 
 --echo # Should not crash
+--error ER_TABLE_CANT_HANDLE_FT
 (SELECT * FROM t1) UNION (SELECT * FROM t1)
   ORDER BY MATCH(a) AGAINST ('+abc' IN BOOLEAN MODE);
 
@@ -1527,8 +1531,6 @@ DROP TABLE t1, t2;
 --echo # PROJECTING DERIVED TBL.
 --echo #
 
-SET @tmp=@@internal_tmp_disk_storage_engine;
-SET GLOBAL internal_tmp_disk_storage_engine=InnoDB;
 CREATE TABLE t1(g GEOMETRY, p POINT, l LINESTRING);
 INSERT INTO t1 (p, l) VALUES (ST_GeomFromText('POINT(1 1)'),
                               ST_GeomFromText('LINESTRING(0 0,1 1,2 2)'));
@@ -1539,7 +1541,6 @@ CREATE TABLE t2 ENGINE=InnoDB SELECT a FROM
 SHOW CREATE TABLE t2;
 
 DROP TABLE t1, t2;
-SET GLOBAL internal_tmp_disk_storage_engine=@tmp;
 
 CREATE TABLE geometries (
   g GEOMETRY,
@@ -2147,3 +2148,35 @@ SELECT ST_GEOMFROMTEXT('POINT(0 0)')
 UNION
 SELECT * FROM (SELECT NULL) AS a;
 --enable_result_log
+
+--echo #
+--echo # Bug#28237675: ASSERTION IN UNION QUERY WHEN MIXING CHARACTER SETS
+--echo #
+CREATE TABLE t(a VARCHAR(10) CHARSET ASCII);
+# When the literal was convertible to ASCII, the query was successful.
+SELECT _utf8mb4 'a' UNION SELECT a FROM t;
+# When the literal was not convertible to ASCII, it hit an assertion.
+--error ER_CANT_AGGREGATE_2COLLATIONS
+SELECT _utf8mb4 0xC3A6 UNION SELECT a FROM t;
+DROP TABLE t;
+
+--echo #
+--echo # Bug#27849293 INVALID WRITE IN SYSSCHEMA.PR_DIAGNOSTICS
+--echo #
+--echo # Note that this bug can only be seen when running with valgrind.
+PREPARE stmt FROM "SELECT 'foo' UNION ALL SELECT ?";
+SET @param = CONVERT('bar' USING utf8mb3);
+EXECUTE stmt USING @param;
+SET @param = CONVERT('BAR' USING utf8mb4);
+EXECUTE stmt USING @param;
+SET @param = CONVERT('foo' USING ucs2);
+EXECUTE stmt USING @param;
+DEALLOCATE PREPARE stmt;
+
+PREPARE stmt FROM 'SELECT "foo", "foo2" UNION SELECT CONVERT("bar" USING utf8mb3), "bar2" UNION SELECT "foobar", CONVERT("foobar2" USING utf8mb3)';
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+CREATE PROCEDURE p1() SELECT "foo", "foo2" UNION SELECT CONVERT("bar" USING utf8mb3), "bar2" UNION SELECT "foobar", CONVERT("foobar2" USING utf8mb3);
+CALL p1();
+DROP PROCEDURE p1;

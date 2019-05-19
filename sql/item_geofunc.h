@@ -1,7 +1,7 @@
 #ifndef ITEM_GEOFUNC_INCLUDED
 #define ITEM_GEOFUNC_INCLUDED
 
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -27,7 +27,6 @@
 #include <sys/types.h>
 #include <vector>
 
-#include "binary_log_types.h"
 #include "my_dbug.h"
 #include "my_inttypes.h"
 #include "my_sys.h"
@@ -343,7 +342,7 @@ class Item_func_geometry_type : public Item_str_ascii_func {
     set_data_type_string(15, default_charset());
     maybe_null = true;
     return false;
-  };
+  }
 };
 
 /**
@@ -732,18 +731,15 @@ class Item_func_validate : public Item_geometry_func {
   String *val_str(String *) override;
 };
 
-class Item_func_simplify : public Item_geometry_func {
-  BG_result_buf_mgr bg_resbuf_mgr;
-  String arg_val;
-  template <typename Coordsys>
-  int simplify_basic(Geometry *geom, double max_dist, String *str,
-                     Gis_geometry_collection *gc = NULL, String *gcbuf = NULL);
-
+/// Item that implements function ST_Simplify, which simplifies a geometry using
+/// the Douglas-Peucker algorithm.
+class Item_func_st_simplify : public Item_geometry_func {
  public:
-  Item_func_simplify(const POS &pos, Item *a, Item *b)
+  Item_func_st_simplify(const POS &pos, Item *a, Item *b)
       : Item_geometry_func(pos, a, b) {}
-  const char *func_name() const override { return "st_simplify"; }
   String *val_str(String *) override;
+
+  const char *func_name() const override { return "st_simplify"; }
 };
 
 class Item_func_point : public Item_geometry_func {
@@ -789,7 +785,7 @@ class Item_func_pointfromgeohash : public Item_geometry_func {
   bool fix_fields(THD *thd, Item **ref) override;
   Field::geometry_type get_geometry_type() const override {
     return Field::GEOM_POINT;
-  };
+  }
 };
 
 class Item_func_spatial_decomp : public Item_geometry_func {
@@ -860,7 +856,7 @@ class Item_func_spatial_collection : public Item_geometry_func {
     for (unsigned int i = 0; i < arg_count; ++i) {
       if (args[i]->fixed && args[i]->data_type() != MYSQL_TYPE_GEOMETRY) {
         String str;
-        args[i]->print(&str, QT_NO_DATA_EXPANSION);
+        args[i]->print(thd, &str, QT_NO_DATA_EXPANSION);
         str.append('\0');
         my_error(ER_ILLEGAL_VALUE_FOR_TYPE, MYF(0), "non geometric", str.ptr());
         return true;
@@ -903,8 +899,9 @@ class Item_func_spatial_mbr_rel : public Item_bool_func2 {
   }
 
   const char *func_name() const override;
-  void print(String *str, enum_query_type query_type) override {
-    Item_func::print(str, query_type);
+  void print(const THD *thd, String *str,
+             enum_query_type query_type) const override {
+    Item_func::print(thd, str, query_type);
   }
   bool resolve_type(THD *) override {
     maybe_null = true;
@@ -980,8 +977,9 @@ class Item_func_spatial_relation : public Item_bool_func2 {
     maybe_null = true;
     return false;
   }
-  void print(String *str, enum_query_type query_type) override {
-    Item_func::print(str, query_type);
+  void print(const THD *thd, String *str,
+             enum_query_type query_type) const override {
+    Item_func::print(thd, str, query_type);
   }
   longlong val_int() override;
   bool is_null() override {
@@ -1640,18 +1638,13 @@ class Item_func_numpoints : public Item_int_func {
   }
 };
 
-class Item_func_area : public Item_real_func {
-  String value;
-
-  template <typename Coordsys>
-  double bg_area(const Geometry *geom);
-
+class Item_func_st_area : public Item_real_func {
  public:
-  Item_func_area(const POS &pos, Item *a) : Item_real_func(pos, a) {}
+  Item_func_st_area(const POS &pos, Item *a) : Item_real_func(pos, a) {}
   double val_real() override;
   const char *func_name() const override { return "st_area"; }
-  bool resolve_type(THD *thd) override {
-    if (Item_real_func::resolve_type(thd)) return true;
+  bool resolve_type(THD *) override {
+    // ST_Area returns NULL if the geometry is empty.
     maybe_null = true;
     return false;
   }
@@ -1661,7 +1654,8 @@ class Item_func_st_length : public Item_real_func {
   String value;
 
  public:
-  Item_func_st_length(const POS &pos, Item *a) : Item_real_func(pos, a) {}
+  Item_func_st_length(const POS &pos, PT_item_list *ilist)
+      : Item_real_func(pos, ilist) {}
   double val_real() override;
   const char *func_name() const override { return "st_length"; }
   bool resolve_type(THD *thd) override {
@@ -1731,6 +1725,18 @@ class Item_func_st_distance_sphere : public Item_real_func {
       : Item_real_func(pos, ilist) {}
   double val_real() override;
   const char *func_name() const override { return "st_distance_sphere"; }
+};
+
+/// This class implements ST_Transform function that transforms a geometry from
+/// one SRS to another.
+class Item_func_st_transform final : public Item_geometry_func {
+ public:
+  Item_func_st_transform(const POS &pos, Item *a, Item *b)
+      : Item_geometry_func(pos, a, b) {}
+  String *val_str(String *str) override;
+
+ private:
+  const char *func_name() const override { return "st_transform"; }
 };
 
 #endif /*ITEM_GEOFUNC_INCLUDED*/

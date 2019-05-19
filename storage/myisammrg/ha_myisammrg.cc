@@ -113,6 +113,7 @@
 #include "sql/sql_table.h"   // build_table_filename
 #include "sql/thr_malloc.h"  // int_sql_alloc
 #include "storage/myisam/ha_myisam.h"
+#include "storage/myisam/myisamdef.h"
 #include "storage/myisammrg/myrg_def.h"
 #include "typelib.h"
 
@@ -337,6 +338,7 @@ int ha_myisammrg::open(const char *name, int mode MY_ATTRIBUTE((unused)),
 
   /* retrieve children table list. */
   if (is_cloned) {
+    DEBUG_SYNC(current_thd, "before_myrg_open");
     /*
       Open and attaches the MyISAM tables,that are under the MERGE table
       parent, on the MyISAM storage engine interface directly within the
@@ -353,6 +355,13 @@ int ha_myisammrg::open(const char *name, int mode MY_ATTRIBUTE((unused)),
     file->children_attached = true;
 
     info(HA_STATUS_NO_LOCK | HA_STATUS_VARIABLE | HA_STATUS_CONST);
+    /*
+      There may arise a scenario where it might end up with two different
+      MYMERGE_INFO data if any one of the child table is updated in
+      between myrg_open() and the last ha_myisammrg::info(). So we need make
+      sure that the MYMERGE_INFO data are in sync.
+    */
+    table->file->info(HA_STATUS_NO_LOCK | HA_STATUS_VARIABLE | HA_STATUS_CONST);
   } else if (!(file = myrg_parent_open(name, myisammrg_parent_open_callback,
                                        this))) {
     /* purecov: begin inspected */
@@ -1375,7 +1384,7 @@ int ha_myisammrg::create(const char *name, TABLE *, HA_CREATE_INFO *create_info,
 void ha_myisammrg::append_create_info(String *packet) {
   const char *current_db;
   size_t db_length;
-  THD *thd = current_thd;
+  const THD *thd = current_thd;
   TABLE_LIST *open_table, *first;
 
   if (file->merge_insert_method != MERGE_INSERT_DISABLED) {

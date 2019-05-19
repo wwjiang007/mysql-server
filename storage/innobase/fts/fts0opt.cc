@@ -45,8 +45,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "fts0priv.h"
 #include "fts0types.h"
 #include "ha_prototypes.h"
-#include "my_compiler.h"
-#include "my_inttypes.h"
 #include "os0thread-create.h"
 #include "que0types.h"
 #include "row0sel.h"
@@ -1998,7 +1996,7 @@ func_exit:
 
 /** Copy the deleted doc ids that will be purged during this optimize run
  to the being deleted FTS auxiliary tables. The transaction is committed
- upon successfull copy and rolled back on DB_DUPLICATE_KEY error.
+ upon successful copy and rolled back on DB_DUPLICATE_KEY error.
  @return DB_SUCCESS if all OK */
 static ulint fts_optimize_being_deleted_count(
     fts_optimize_t *optim) /*!< in: optimize instance */
@@ -2013,7 +2011,7 @@ static ulint fts_optimize_being_deleted_count(
 
 /** Copy the deleted doc ids that will be purged during this optimize run
  to the being deleted FTS auxiliary tables. The transaction is committed
- upon successfull copy and rolled back on DB_DUPLICATE_KEY error.
+ upon successful copy and rolled back on DB_DUPLICATE_KEY error.
  @return DB_SUCCESS if all OK */
 static MY_ATTRIBUTE((warn_unused_result)) dberr_t
     fts_optimize_create_deleted_doc_id_snapshot(

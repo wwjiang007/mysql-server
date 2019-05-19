@@ -321,7 +321,7 @@ should_be_0
 #
 ANALYZE TABLE foobar UPDATE HISTOGRAM ON foobar WITH 100 BUCKETS;
 Table	Op	Msg_type	Msg_text
-test.foobar	histogram	Error	Table 'test.foobar' doesn't exist.
+test.foobar	histogram	Error	Table 'test.foobar' doesn't exist
 SELECT COUNT(*) AS should_be_0 FROM information_schema.COLUMN_STATISTICS;
 should_be_0
 0
@@ -2086,13 +2086,7 @@ Warning	1292	Truncated incorrect time value: ''
 Warning	1292	Truncated incorrect time value: ''
 Note	1003	/* select#1 */ select `test`.`t1`.`col1` AS `col1`,`test`.`t1`.`col2` AS `col2` from `test`.`t1` where (`test`.`t1`.`col1` < '')
 EXPLAIN SELECT * FROM t1 WHERE col2 < "";
-id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
-1	SIMPLE	t1	NULL	ALL	NULL	NULL	NULL	NULL	1	100.00	Using where
-Warnings:
-Warning	1292	Incorrect date value: '' for column 'col2' at row 1
-Warning	1292	Incorrect datetime value: ''
-Warning	1292	Incorrect datetime value: ''
-Note	1003	/* select#1 */ select `test`.`t1`.`col1` AS `col1`,`test`.`t1`.`col2` AS `col2` from `test`.`t1` where (`test`.`t1`.`col2` < '')
+ERROR HY000: Incorrect DATE value: ''
 DROP TABLE t1;
 CREATE TABLE tbl_int (col1 INT);
 INSERT INTO tbl_int VALUES (1), (2), (2), (2), (3), (6), (8), (8), (NULL), (NULL);
@@ -2591,7 +2585,7 @@ EXPLAIN SELECT * FROM tbl_float WHERE col > 0.0;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	80.00	Using where
 Warnings:
-Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` > 0.0)
+Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` > 0)
 EXPLAIN SELECT * FROM tbl_float WHERE col > 0.1;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	80.00	Using where
@@ -2641,7 +2635,7 @@ EXPLAIN SELECT * FROM tbl_float WHERE col >= 0.0;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	80.00	Using where
 Warnings:
-Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` >= 0.0)
+Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` >= 0)
 EXPLAIN SELECT * FROM tbl_float WHERE col >= 0.1;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	80.00	Using where
@@ -2691,7 +2685,7 @@ EXPLAIN SELECT * FROM tbl_float WHERE col = 0.0;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	10.00	Using where
 Warnings:
-Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` = 0.0)
+Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` = 0)
 EXPLAIN SELECT * FROM tbl_float WHERE col = 0.1;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	10.00	Using where
@@ -2741,7 +2735,7 @@ EXPLAIN SELECT * FROM tbl_float WHERE col <= 0.0;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	10.00	Using where
 Warnings:
-Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` <= 0.0)
+Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` <= 0)
 EXPLAIN SELECT * FROM tbl_float WHERE col <= 0.1;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	10.00	Using where
@@ -2791,7 +2785,7 @@ EXPLAIN SELECT * FROM tbl_float WHERE col < 0.0;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	10.00	Using where
 Warnings:
-Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` < 0.0)
+Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` < 0)
 EXPLAIN SELECT * FROM tbl_float WHERE col < 0.1;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	10.00	Using where
@@ -2841,7 +2835,7 @@ EXPLAIN SELECT * FROM tbl_float WHERE col <> 0.0;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	80.00	Using where
 Warnings:
-Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` <> 0.0)
+Note	1003	/* select#1 */ select `test`.`tbl_float`.`col` AS `col` from `test`.`tbl_float` where (`test`.`tbl_float`.`col` <> 0)
 EXPLAIN SELECT * FROM tbl_float WHERE col <> 0.1;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	SIMPLE	tbl_float	NULL	ALL	NULL	NULL	NULL	NULL	10	80.00	Using where
@@ -3126,4 +3120,18 @@ FROM INFORMATION_SCHEMA.column_statistics
 WHERE table_name = "t1" AND column_name = "col1";
 JSON_EXTRACT(histogram, '$."number-of-buckets-specified"')
 100
+DROP TABLE t1;
+#
+# Bug#27574375 ANALYZA TABLE DOESN'T RETURN ERROR IN CASE
+#              LOCK_WAIT_TIMEOUT HAPPENED
+#
+CREATE TABLE t1 (a INT);
+SET lock_wait_timeout= 1;
+LOCK INSTANCE FOR BACKUP;
+# The error ER_LOCK_WAIT_TIMEOUT is expected here, and when using ANALYZE
+# TABLE errors are printed out in the result set from the query.
+ANALYZE TABLE t1 UPDATE HISTOGRAM ON a WITH 5 BUCKETS;
+Table	Op	Msg_type	Msg_text
+test.t1	histogram	Error	Lock wait timeout exceeded; try restarting transaction
+UNLOCK INSTANCE;
 DROP TABLE t1;

@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -631,7 +631,7 @@ static ST_FIELD_INFO ndb_transid_mysql_connection_map_fields_info[] =
     0,
     MY_I_S_UNSIGNED,
     "",
-    SKIP_OPEN_TABLE
+    0
   },
 
   {
@@ -641,7 +641,7 @@ static ST_FIELD_INFO ndb_transid_mysql_connection_map_fields_info[] =
     0,
     MY_I_S_UNSIGNED,
     "",
-    SKIP_OPEN_TABLE
+    0
   },
   {
     "ndb_transid",
@@ -650,13 +650,11 @@ static ST_FIELD_INFO ndb_transid_mysql_connection_map_fields_info[] =
     0,
     MY_I_S_UNSIGNED,
     "",
-    SKIP_OPEN_TABLE
+    0
   },
 
-  { 0, 0, MYSQL_TYPE_NULL, 0, 0, "", SKIP_OPEN_TABLE }
+  { 0, 0, MYSQL_TYPE_NULL, 0, 0, "", 0 }
 };
-
-#include <mysql/innodb_priv.h>
 
 static
 int
@@ -708,20 +706,22 @@ ndb_transid_mysql_connection_map_init(void *p)
   DBUG_RETURN(0);
 }
 
-#include <mysql/plugin.h>
-
 static struct st_mysql_information_schema i_s_info =
 {
   MYSQL_INFORMATION_SCHEMA_INTERFACE_VERSION
 };
 
-struct st_mysql_plugin i_s_ndb_transid_mysql_connection_map_plugin =
+/*
+  information_schema table plugin providing a list of MySQL
+  connection ID's and their corresponding NDB transaction ID
+*/
+struct st_mysql_plugin ndb_transid_mysql_connection_map_table =
 {
   MYSQL_INFORMATION_SCHEMA_PLUGIN,
   &i_s_info,
   "ndb_transid_mysql_connection_map",
   "Oracle Corporation",
-  "Map between mysql connection id and ndb transaction id",
+  "Map between MySQL connection ID and NDB transaction ID",
   PLUGIN_LICENSE_GPL,
   ndb_transid_mysql_connection_map_init,
   NULL,

@@ -1381,7 +1381,7 @@ void _db_dump_(uint _line_, const char *keyword, const unsigned char *memory,
 
     pos = 0;
     while (length-- > 0) {
-      uint tmp = *((unsigned char *)memory++);
+      uint tmp = *(memory++);
       if ((pos += 3) >= 80) {
         fputc('\n', cs->stack->out_file);
         pos = 3;
@@ -1450,7 +1450,7 @@ next:
     subdir = 0;
     while (ctlp < end && !isseparator(ctlp)) ctlp++;
     len = ctlp - start;
-    if (start[len - 1] == '/') {
+    if (len > 0 && start[len - 1] == '/') {
       len--;
       subdir = SUBDIR;
     }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -23,9 +23,9 @@
 #ifndef SORT_PARAM_INCLUDED
 #define SORT_PARAM_INCLUDED
 
-#include "binary_log_types.h"  // enum_field_types
-#include "my_base.h"           // ha_rows
-#include "my_byteorder.h"      // uint2korr
+#include "field_types.h"   // enum_field_types
+#include "my_base.h"       // ha_rows
+#include "my_byteorder.h"  // uint2korr
 #include "my_dbug.h"
 #include "my_inttypes.h"
 #include "my_io.h"          // mysql_com.h needs my_socket
@@ -142,7 +142,7 @@ class Addon_fields {
   Sort_addon_field *end() { return m_field_descriptors.end(); }
   size_t num_field_descriptors() const { return m_field_descriptors.size(); }
 
-  /// rr_unpack_from_tempfile needs an extra buffer when unpacking.
+  /// SortFileIterator needs an extra buffer when unpacking.
   uchar *allocate_addon_buf(uint sz) {
     if (m_addon_buf != NULL) {
       DBUG_ASSERT(m_addon_buf_length == sz);
@@ -225,7 +225,7 @@ class Addon_fields {
   All the record formats consist of a (possibly composite) key,
   followed by a (possibly composite) payload.
   The key is used for sorting data. Once sorting is done, the payload is
-  stored in some buffer, and read by some rr_from or rr_unpack routine.
+  stored in some buffer, and read by some RowIterator.
 
   For fixed-size keys, with @<rowid@> payload, the @<rowid@> is also
   considered to be part of the key.
@@ -269,18 +269,17 @@ class Addon_fields {
 </dl>
  */
 class Sort_param {
-  uint m_fixed_rec_length;   ///< Maximum length of a record, see above.
-  uint m_fixed_sort_length;  ///< Maximum number of bytes used for sorting.
+  uint m_fixed_rec_length{0};   ///< Maximum length of a record, see above.
+  uint m_fixed_sort_length{0};  ///< Maximum number of bytes used for sorting.
  public:
-  uint ref_length;            // Length of record ref.
-  uint m_addon_length;        // Length of added packed fields.
-  uint fixed_res_length;      // Length of records in final sorted file/buffer.
-  uint max_rows_per_buffer;   // Max (unpacked) rows / buffer.
-  ha_rows max_rows;           // Select limit, or HA_POS_ERROR if unlimited.
-  ha_rows num_examined_rows;  // Number of examined rows.
-  TABLE *sort_form;           // For quicker make_sortkey.
-  bool use_hash;              // Whether to use hash to distinguish cut JSON
-  bool m_force_stable_sort;   // Keep relative order of equal elements
+  uint ref_length{0};        // Length of record ref.
+  uint m_addon_length{0};    // Length of added packed fields.
+  uint fixed_res_length{0};  // Length of records in final sorted file/buffer.
+  uint max_rows_per_buffer{0};  // Max (unpacked) rows / buffer.
+  ha_rows max_rows{0};          // Select limit, or HA_POS_ERROR if unlimited.
+  TABLE *sort_form{nullptr};    // For quicker make_sortkey.
+  bool use_hash{false};         // Whether to use hash to distinguish cut JSON
+  bool m_force_stable_sort{false};  // Keep relative order of equal elements
 
   /**
     ORDER BY list with some precalculated info for filesort.
@@ -288,12 +287,11 @@ class Sort_param {
    */
   Bounds_checked_array<st_sort_field> local_sortorder;
 
-  Addon_fields *addon_fields;  ///< Descriptors for addon fields.
-  bool not_killable;
-  bool using_pq;
+  Addon_fields *addon_fields{nullptr};  ///< Descriptors for addon fields.
+  bool not_killable{false};
+  bool using_pq{false};
   StringBuffer<STRING_BUFFER_USUAL_SIZE> tmp_buffer;
 
-  Sort_param() { memset(this, 0, sizeof(*this)); }
   /**
     Initialize this struct for filesort() usage.
     @see description of record layout above
@@ -359,7 +357,7 @@ class Sort_param {
 
   /**
     Skips the key part, and returns address of payload.
-    For rr_unpack_from_buffer, which does not have access to Sort_param.
+    For SortBufferIterator, which does not have access to Sort_param.
    */
   static uchar *get_start_of_payload(uint default_val, bool is_varlen,
                                      uchar *p) {
@@ -393,9 +391,10 @@ class Sort_param {
     FILESORT_ALG_STD_SORT,
     FILESORT_ALG_STD_STABLE
   };
-  enum_sort_algorithm m_sort_algorithm;
+  enum_sort_algorithm m_sort_algorithm{FILESORT_ALG_NONE};
 
-  Addon_fields_status m_addon_fields_status;
+  Addon_fields_status m_addon_fields_status{
+      Addon_fields_status::unknown_status};
 
   static const uint size_of_varlength_field = 4;
 
@@ -405,13 +404,15 @@ class Sort_param {
   /// Counts number of JSON keys
   int count_json_keys() const;
 
-  uint
-      m_packable_length;  ///< total length of fields which have a packable type
-  bool m_using_packed_addons;  ///< caches the value of using_packed_addons()
-  int m_num_varlen_keys;       ///< number of varlen keys
-  int m_num_json_keys;         ///< number of JSON keys
+  /// total length of fields which have a packable type
+  uint m_packable_length{0};
+  /// caches the value of using_packed_addons()
+  bool m_using_packed_addons{false};
+  int m_num_varlen_keys{0};  ///< number of varlen keys
+  int m_num_json_keys{0};    ///< number of JSON keys
 
  public:
+  Sort_param() = default;
   // Not copyable.
   Sort_param(const Sort_param &) = delete;
   Sort_param &operator=(const Sort_param &) = delete;

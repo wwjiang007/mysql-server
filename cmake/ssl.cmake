@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2018, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2019, Oracle and/or its affiliates. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -93,7 +93,7 @@ MACRO (MYSQL_USE_WOLFSSL)
   IF(CMAKE_SYSTEM_NAME MATCHES "SunOS")
     SET(SSL_LIBRARIES ${SSL_LIBRARIES} ${LIBSOCKET})
   ENDIF()
-  INCLUDE_DIRECTORIES(SYSTEM ${INC_DIRS})
+  INCLUDE_DIRECTORIES(BEFORE SYSTEM ${INC_DIRS})
   SET(SSL_INTERNAL_INCLUDE_DIRS ${WOLFSSL_SOURCE_DIR})
   ADD_DEFINITIONS(
     -DBUILDING_WOLFSSL
@@ -105,6 +105,7 @@ MACRO (MYSQL_USE_WOLFSSL)
     -DOPENSSL_EXTRA
     -DSESSION_CERT
     -DWC_NO_HARDEN
+    -DWOLFSSL_AES_COUNTER
     -DWOLFSSL_AES_DIRECT
     -DWOLFSSL_ALLOW_TLSV10
     -DWOLFSSL_CERT_EXT
@@ -307,6 +308,13 @@ MACRO (MYSQL_CHECK_SSL)
         "^.*OPENSSL_VERSION_NUMBER[\t ]+0x[0-9]([0-9][0-9]).*$" "\\1"
         OPENSSL_MINOR_VERSION "${OPENSSL_VERSION_NUMBER}"
         )
+      STRING(REGEX REPLACE
+        "^.*OPENSSL_VERSION_NUMBER[\t ]+0x[0-9][0-9][0-9]([0-9][0-9]).*$" "\\1"
+        OPENSSL_FIX_VERSION "${OPENSSL_VERSION_NUMBER}"
+        )
+    ENDIF()
+    IF("${OPENSSL_MAJOR_VERSION}.${OPENSSL_MINOR_VERSION}.${OPENSSL_FIX_VERSION}" VERSION_GREATER "1.1.0")
+       ADD_DEFINITIONS(-DHAVE_TLSv13)
     ENDIF()
     IF(OPENSSL_INCLUDE_DIR AND
        OPENSSL_LIBRARY   AND
@@ -356,7 +364,7 @@ MACRO (MYSQL_CHECK_SSL)
     # If we are invoked with -DWITH_SSL=/path/to/custom/openssl
     # and we have found static libraries, then link them statically
     # into our executables and libraries.
-    # Adding IMPORTED_LOCATION allows MERGE_STATIC_LIBS
+    # Adding IMPORTED_LOCATION allows MERGE_CONVENIENCE_LIBRARIES
     # to merge imported libraries as well as our own libraries.
     SET(MY_CRYPTO_LIBRARY "${CRYPTO_LIBRARY}")
     SET(MY_OPENSSL_LIBRARY "${OPENSSL_LIBRARY}")
@@ -378,6 +386,7 @@ MACRO (MYSQL_CHECK_SSL)
     MESSAGE(STATUS "CRYPTO_LIBRARY = ${CRYPTO_LIBRARY}")
     MESSAGE(STATUS "OPENSSL_MAJOR_VERSION = ${OPENSSL_MAJOR_VERSION}")
     MESSAGE(STATUS "OPENSSL_MINOR_VERSION = ${OPENSSL_MINOR_VERSION}")
+    MESSAGE(STATUS "OPENSSL_FIX_VERSION = ${OPENSSL_FIX_VERSION}")
     # The server hangs in OpenSSL_add_all_algorithms() in ssl_start()
     IF(WIN32 AND OPENSSL_MINOR_VERSION VERSION_EQUAL 1)
       MESSAGE(WARNING "OpenSSL 1.1 is experimental on Windows")
@@ -603,8 +612,12 @@ MACRO(MYSQL_CHECK_SSL_DLLS)
         )
       MESSAGE(STATUS "SSL_LIBRARIES = ${SSL_LIBRARIES}")
 
-      # Do copying and dependency patching in a sub-process,
-      # so that we can skip it if already done.
+      # Do copying and dependency patching in a sub-process, so that we can
+      # skip it if already done.  The BYPRODUCTS argument appears to be
+      # necessary to allow Ninja (on MacOS) to resolve dependencies on the dll
+      # files directly, even if there is an explicit dependency on this target.
+      # The BYPRODUCTS option is ignored on non-Ninja generators except to mark
+      # byproducts GENERATED.
       ADD_CUSTOM_TARGET(copy_openssl_dlls ALL
         COMMAND ${CMAKE_COMMAND}
         -DCRYPTO_FULL_NAME="${CRYPTO_FULL_NAME}"
@@ -615,6 +628,10 @@ MACRO(MYSQL_CHECK_SSL_DLLS)
         -DOPENSSL_NAME="${OPENSSL_NAME}"
         -DOPENSSL_VERSION="${OPENSSL_VERSION}"
         -P ${CMAKE_SOURCE_DIR}/cmake/install_name_tool.cmake
+
+        BYPRODUCTS
+        "${CMAKE_BINARY_DIR}/library_output_directory/${CRYPTO_NAME}"
+        "${CMAKE_BINARY_DIR}/library_output_directory/${OPENSSL_NAME}"
 
         WORKING_DIRECTORY
         "${CMAKE_BINARY_DIR}/library_output_directory/${CMAKE_CFG_INTDIR}"

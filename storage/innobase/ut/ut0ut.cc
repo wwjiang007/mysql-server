@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1994, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1994, 2019, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -58,11 +58,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "mysql/components/services/log_builtins.h"
 #include "sql/derror.h"
 
-#ifndef UNIV_NO_ERR_MSGS
-#if defined(__SUNPRO_CC)
-const char *ib::logger::PREFIX = "InnoDB: ";
-#endif /*  __SUNPRO_CC */
-#endif /* !UNIV_NO_ERR_MSGS */
+namespace ut {
+ulong spin_wait_pause_multiplier = 50;
+}
 
 #ifdef _WIN32
 using time_fn = VOID(WINAPI *)(_Out_ LPFILETIME);
@@ -259,18 +257,18 @@ void meb_sprintf_timestamp_without_extra_chars(
 
 #else  /* UNIV_HOTBACKUP */
 
-/** Runs an idle loop on CPU. The argument gives the desired delay
- in microseconds on 100 MHz Pentium + Visual C++.
- @return dummy value */
-ulint ut_delay(ulint delay) /*!< in: delay in microseconds on 100 MHz Pentium */
-{
+ulint ut_delay(ulint delay) {
   ulint i, j;
-
+  /* We don't expect overflow here, as ut::spin_wait_pause_multiplier is limited
+  to 100, and values of delay are not larger than @@innodb_spin_wait_delay
+  which is limited by 1 000. Anyway, in case an overflow happened, the program
+  would still work (as iterations is unsigned). */
+  const ulint iterations = delay * ut::spin_wait_pause_multiplier;
   UT_LOW_PRIORITY_CPU();
 
   j = 0;
 
-  for (i = 0; i < delay * 50; i++) {
+  for (i = 0; i < iterations; i++) {
     j += i;
     UT_RELAX_CPU();
   }
@@ -523,6 +521,8 @@ const char *ut_strerr(dberr_t num) {
       return ("Undo record too big");
     case DB_END_OF_INDEX:
       return ("End of index");
+    case DB_END_OF_BLOCK:
+      return ("End of block");
     case DB_IO_ERROR:
       return ("I/O error");
     case DB_TABLE_IN_FK_CHECK:
@@ -577,10 +577,16 @@ const char *ut_strerr(dberr_t num) {
     case DB_INVALID_ENCRYPTION_META:
       return ("Invalid encryption meta-data information");
 
+    case DB_ABORT_INCOMPLETE_CLONE:
+      return ("Incomplete cloned data directory");
+
     case DB_SERVER_VERSION_LOW:
       return (
           "Cannot boot server with lower version than that built the "
           "tablespace");
+
+    case DB_NO_SESSION_TEMP:
+      return ("No session temporary tablespace allocated");
 
     case DB_ERROR_UNSET:;
       /* Fall through. */
@@ -594,53 +600,6 @@ const char *ut_strerr(dberr_t num) {
   variable has been overwritten with bogus data */
   ut_error;
 }
-
-#ifdef UNIV_PFS_MEMORY
-
-/** Extract the basename of a file without its extension.
-For example, extract "foo0bar" out of "/path/to/foo0bar.cc".
-@param[in]	file		file path, e.g. "/path/to/foo0bar.cc"
-@param[out]	base		result, e.g. "foo0bar"
-@param[in]	base_size	size of the output buffer 'base', if there
-is not enough space, then the result will be truncated, but always
-'\0'-terminated
-@return number of characters that would have been printed if the size
-were unlimited (not including the final ‘\0’) */
-size_t ut_basename_noext(const char *file, char *base, size_t base_size) {
-  /* Assuming 'file' contains something like the following,
-  extract the file name without the extenstion out of it by
-  setting 'beg' and 'len'.
-  ...mysql-trunk/storage/innobase/dict/dict0dict.cc:302
-                                       ^-- beg, len=9
-  */
-
-  std::string::size_type pos = std::string(file).find_last_of("/\\");
-  const char *beg;
-
-  if (pos == std::string::npos) {
-    beg = file;
-  } else {
-    beg = file + pos + 1;
-  }
-
-  size_t len = strlen(beg);
-
-  const char *end = strrchr(beg, '.');
-
-  if (end != NULL) {
-    len = end - beg;
-  }
-
-  const size_t copy_len = std::min(len, base_size - 1);
-
-  memcpy(base, beg, copy_len);
-
-  base[copy_len] = '\0';
-
-  return (len);
-}
-
-#endif /* UNIV_PFS_MEMORY */
 
 namespace ib {
 

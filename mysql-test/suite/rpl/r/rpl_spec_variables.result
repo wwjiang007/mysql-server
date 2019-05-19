@@ -65,17 +65,23 @@ SET @restore_slave_character_set_database=@@global.character_set_database;
 SET @restore_slave_collation_server=@@global.collation_server;
 SET @@global.character_set_database=utf8;
 Warnings:
+Warning	3719	'utf8' is currently an alias for the character set UTF8MB3, but will be an alias for UTF8MB4 in a future release. Please consider using UTF8MB4 in order to be unambiguous.
 Warning	1681	Updating 'character_set_database' is deprecated. It will be made read-only in a future release.
 SET @@session.character_set_database=utf8;
 Warnings:
+Warning	3719	'utf8' is currently an alias for the character set UTF8MB3, but will be an alias for UTF8MB4 in a future release. Please consider using UTF8MB4 in order to be unambiguous.
 Warning	1681	Updating 'character_set_database' is deprecated. It will be made read-only in a future release.
 SET @@global.collation_server=utf8_bin;
+Warnings:
+Warning	3778	'utf8_bin' is a collation of the deprecated character set UTF8MB3. Please consider using UTF8MB4 with an appropriate collation instead.
 SET @@session.collation_server=utf8_bin;
+Warnings:
+Warning	3778	'utf8_bin' is a collation of the deprecated character set UTF8MB3. Please consider using UTF8MB4 with an appropriate collation instead.
 [On Master]
 CREATE SCHEMA s1;
 SHOW CREATE SCHEMA s1;
 Database	Create Database
-s1	CREATE DATABASE `s1` /*!40100 DEFAULT CHARACTER SET latin1 COLLATE latin1_german1_ci */
+s1	CREATE DATABASE `s1` /*!40100 DEFAULT CHARACTER SET latin1 COLLATE latin1_german1_ci */ /*!80016 DEFAULT ENCRYPTION='N' */
 CREATE TABLE s1.t1 (a INT NOT NULL PRIMARY KEY, b VARCHAR(10)) ENGINE=MyISAM;
 SHOW CREATE TABLE s1.t1;
 Table	Create Table
@@ -89,7 +95,7 @@ include/sync_slave_sql_with_master.inc
 CREATE SCHEMA s2;
 SHOW CREATE SCHEMA s2;
 Database	Create Database
-s2	CREATE DATABASE `s2` /*!40100 DEFAULT CHARACTER SET utf8 COLLATE utf8_bin */
+s2	CREATE DATABASE `s2` /*!40100 DEFAULT CHARACTER SET utf8 COLLATE utf8_bin */ /*!80016 DEFAULT ENCRYPTION='N' */
 CREATE TABLE s1.t2 (a INT NOT NULL PRIMARY KEY, b VARCHAR(10)) ENGINE=MyISAM;
 CREATE TABLE s2.t1 (a INT NOT NULL PRIMARY KEY, b VARCHAR(10)) ENGINE=MyISAM;
 SHOW CREATE TABLE s1.t1;

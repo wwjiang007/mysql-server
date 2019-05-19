@@ -4,7 +4,7 @@
 let BASEDIR= `select @@basedir`;
 let DDIR=$MYSQL_TMP_DIR/installdb_test;
 let MYSQLD_LOG=$MYSQL_TMP_DIR/server.log;
-let extra_args=--no-defaults --innodb_dedicated_server=OFF --console --log-syslog=0 --loose-skip-auto_generate_certs --loose-skip-sha256_password_auto_generate_rsa_keys --skip-ssl --basedir=$BASEDIR --lc-messages-dir=$MYSQL_SHAREDIR;
+let extra_args=--no-defaults --innodb_dedicated_server=OFF --console --loose-skip-auto_generate_certs --loose-skip-sha256_password_auto_generate_rsa_keys --skip-ssl --basedir=$BASEDIR --lc-messages-dir=$MYSQL_SHAREDIR;
 let BOOTSTRAP_SQL=$MYSQL_TMP_DIR/tiny_bootstrap.sql;
 let PASSWD_FILE=$MYSQL_TMP_DIR/password_file.txt;
 
@@ -215,6 +215,9 @@ remove_file $MYSQLD_LOG;
 --echo # Bug#22777039 - MYSQLD --INITIALIZE DOES NOT SUPPORT THE KEYRING_FILE_DATA OPTION
 --echo #
 --exec $MYSQLD $extra_args --datadir=$DDIR --initialize --early-plugin-load="keyring_file=$KEYRING_PLUGIN" --keyring_file_data=$MYSQL_TMP_DIR/keyring $KEYRING_PLUGIN_OPT > $MYSQLD_LOG 2>&1
+
+--echo # delete mysqld log
+remove_file $MYSQLD_LOG;
 
 --echo # delete temp keyring file
 remove_file $MYSQL_TMP_DIR/keyring;

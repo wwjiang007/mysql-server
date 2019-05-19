@@ -304,13 +304,13 @@ NULL
 with qn as (select "with" as a)
 with qn2 as (select "with" as a)
 select a from test.qn;
-ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'qn2 as (select "with" as a)
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'with qn2 as (select "with" as a)
 select a from test.qn' at line 2
 # with comma
 with qn as (select "with" as a),
 with qn2 as (select "with" as a)
 select a from test.qn;
-ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'qn2 as (select "with" as a)
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'with qn2 as (select "with" as a)
 select a from test.qn' at line 2
 # ORDER BY removed unless there is LIMIT or single table (check "Using filesort")
 explain
@@ -405,7 +405,7 @@ with qn () as (select 1) select * from qn, qn qn1;
 ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near ') as (select 1) select * from qn, qn qn1' at line 1
 # Materialization
 with qn (foo, bar) as (select 1) select * from qn, qn qn1;
-ERROR HY000: View's SELECT and view's field list have different column counts
+ERROR HY000: In definition of view, derived table or common table expression, SELECT list and column names list have different column counts
 explain with qn (foo, bar) as (select 1, 2 from t1 limit 2) select * from qn, qn qn1;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	PRIMARY	<derived2>	NULL	ALL	NULL	NULL	NULL	NULL	2	100.00	NULL
@@ -444,7 +444,7 @@ foo	int(11)	YES		NULL
 drop table t3;
 # Merge
 with qn (foo, bar) as (select 1 from t1) select * from qn, qn qn1;
-ERROR HY000: View's SELECT and view's field list have different column counts
+ERROR HY000: In definition of view, derived table or common table expression, SELECT list and column names list have different column counts
 with qn (foo, bar) as (select 1, 2 from t1) select * from qn, qn qn1;
 foo	bar	foo	bar
 1	2	1	2
@@ -498,7 +498,7 @@ foo	bar
 NULL	NULL
 2	3
 select * from (select a from t1) dt(foo,bar);
-ERROR HY000: View's SELECT and view's field list have different column counts
+ERROR HY000: In definition of view, derived table or common table expression, SELECT list and column names list have different column counts
 # Column names for QN/DT are printed
 create view v1 as
 with qn (foo, bar) as (select 1,1) select * from qn;
@@ -577,7 +577,7 @@ select 1 AS `foo` group by `foo` union select 2 AS `2` order by `foo`
 drop view v1;
 create view v1 (bar) as
 select 1, 2 from t1;
-ERROR HY000: View's SELECT and view's field list have different column counts
+ERROR HY000: In definition of view, derived table or common table expression, SELECT list and column names list have different column counts
 drop table t1;
 # Prove that a materialized QN is shared among all references:
 create table t1(a int);
@@ -785,11 +785,6 @@ month	total	award
 1	300	best
 3	11	worst
 drop table sales_days;
-# Tmp table cannot be MyISAM
-set global internal_tmp_disk_storage_engine=myisam;
-with qn as (select 1) select * from qn;
-ERROR HY000: 'Materialization of a Common Table Expression' requires @@internal_tmp_disk_storage_engine=InnoDB
-set global internal_tmp_disk_storage_engine=default;
 # Special parser command not allowed to users.
 parse_cte ( select 1 ) ;
 ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'parse_cte ( select 1 )' at line 1
@@ -1321,13 +1316,13 @@ NULL
 with qn as (select "with" as a)
 with qn2 as (select "with" as a)
 select a from test.qn;
-ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'qn2 as (select "with" as a)
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'with qn2 as (select "with" as a)
 select a from test.qn' at line 2
 # with comma
 with qn as (select "with" as a),
 with qn2 as (select "with" as a)
 select a from test.qn;
-ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'qn2 as (select "with" as a)
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'with qn2 as (select "with" as a)
 select a from test.qn' at line 2
 # ORDER BY removed unless there is LIMIT or single table (check "Using filesort")
 explain
@@ -1422,7 +1417,7 @@ with qn () as (select 1) select * from qn, qn qn1;
 ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near ') as (select 1) select * from qn, qn qn1' at line 1
 # Materialization
 with qn (foo, bar) as (select 1) select * from qn, qn qn1;
-ERROR HY000: View's SELECT and view's field list have different column counts
+ERROR HY000: In definition of view, derived table or common table expression, SELECT list and column names list have different column counts
 explain with qn (foo, bar) as (select 1, 2 from t1 limit 2) select * from qn, qn qn1;
 id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	PRIMARY	<derived2>	NULL	ALL	NULL	NULL	NULL	NULL	2	100.00	NULL
@@ -1461,7 +1456,7 @@ foo	int(11)	YES		NULL
 drop table t3;
 # Merge
 with qn (foo, bar) as (select 1 from t1) select * from qn, qn qn1;
-ERROR HY000: View's SELECT and view's field list have different column counts
+ERROR HY000: In definition of view, derived table or common table expression, SELECT list and column names list have different column counts
 with qn (foo, bar) as (select 1, 2 from t1) select * from qn, qn qn1;
 foo	bar	foo	bar
 1	2	1	2
@@ -1515,7 +1510,7 @@ foo	bar
 NULL	NULL
 2	3
 select * from (select a from t1) dt(foo,bar);
-ERROR HY000: View's SELECT and view's field list have different column counts
+ERROR HY000: In definition of view, derived table or common table expression, SELECT list and column names list have different column counts
 # Column names for QN/DT are printed
 create view v1 as
 with qn (foo, bar) as (select 1,1) select * from qn;
@@ -1594,7 +1589,7 @@ select 1 AS `foo` group by `foo` union select 2 AS `2` order by `foo`
 drop view v1;
 create view v1 (bar) as
 select 1, 2 from t1;
-ERROR HY000: View's SELECT and view's field list have different column counts
+ERROR HY000: In definition of view, derived table or common table expression, SELECT list and column names list have different column counts
 drop table t1;
 # Prove that a materialized QN is shared among all references:
 create table t1(a int);
@@ -1802,11 +1797,6 @@ month	total	award
 1	300	best
 3	11	worst
 drop table sales_days;
-# Tmp table cannot be MyISAM
-set global internal_tmp_disk_storage_engine=myisam;
-with qn as (select 1) select * from qn;
-ERROR HY000: 'Materialization of a Common Table Expression' requires @@internal_tmp_disk_storage_engine=InnoDB
-set global internal_tmp_disk_storage_engine=default;
 # Special parser command not allowed to users.
 parse_cte ( select 1 ) ;
 ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'parse_cte ( select 1 )' at line 1

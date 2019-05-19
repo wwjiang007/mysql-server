@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2013, 2018, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -32,6 +32,7 @@
 #include "my_compiler.h"
 #include "my_dbug.h"
 #include "mysql/plugin_group_replication.h"
+#include "sql/field.h"
 #include "sql/log.h"
 #include "sql/plugin_table.h"
 #include "sql/rpl_group_replication.h"
@@ -159,9 +160,8 @@ bool PFS_index_rpl_connection_status_by_thread::match(Master_info *mi) {
 
     if (mi->slave_running == MYSQL_SLAVE_RUN_CONNECT) {
       PSI_thread *psi = thd_get_psi(mi->info_thd);
-      PFS_thread *pfs = reinterpret_cast<PFS_thread *>(psi);
-      if (pfs) {
-        row.thread_id = pfs->m_thread_internal_id;
+      if (psi != nullptr) {
+        row.thread_id = PSI_THREAD_CALL(get_thread_internal_id)(psi);
       }
     }
 
@@ -195,24 +195,20 @@ ha_rows table_replication_connection_status::get_row_count() {
 
 int table_replication_connection_status::rnd_next(void) {
   Master_info *mi = NULL;
-
   channel_map.rdlock();
 
   for (m_pos.set_at(&m_next_pos);
        m_pos.m_index < channel_map.get_max_channels(); m_pos.next()) {
     mi = channel_map.get_mi_at_pos(m_pos.m_index);
-
     if (mi && mi->host[0]) {
-      if (!make_row(mi)) {
-        m_next_pos.set_after(&m_pos);
-        channel_map.unlock();
-        return 0;
-      }
+      make_row(mi);
+      m_next_pos.set_after(&m_pos);
+      channel_map.unlock();
+      return 0;
     }
   }
 
   channel_map.unlock();
-
   return HA_ERR_END_OF_FILE;
 }
 
@@ -333,9 +329,8 @@ int table_replication_connection_status::make_row(Master_info *mi) {
 
   if (mi->slave_running == MYSQL_SLAVE_RUN_CONNECT) {
     PSI_thread *psi = thd_get_psi(mi->info_thd);
-    PFS_thread *pfs = reinterpret_cast<PFS_thread *>(psi);
-    if (pfs) {
-      m_row.thread_id = pfs->m_thread_internal_id;
+    if (psi != nullptr) {
+      m_row.thread_id = PSI_THREAD_CALL(get_thread_internal_id)(psi);
       m_row.thread_id_is_null = false;
     }
   }

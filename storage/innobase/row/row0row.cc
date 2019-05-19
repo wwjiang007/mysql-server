@@ -41,7 +41,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ha_prototypes.h"
 #include "lob0lob.h"
 #include "mach0data.h"
-#include "my_inttypes.h"
 #include "que0que.h"
 #include "read0read.h"
 #include "rem0cmp.h"
@@ -62,17 +61,17 @@ this program; if not, write to the Free Software Foundation, Inc.,
  @retval NULL if the externally stored columns in the clustered index record
  are unavailable and ext != NULL, or row is missing some needed columns. */
 dtuple_t *row_build_index_entry_low(
-    const dtuple_t *row,  /*!< in: row which should be
-                          inserted or purged */
-    const row_ext_t *ext, /*!< in: externally stored column
-                          prefixes, or NULL */
-    dict_index_t *index,  /*!< in: index on the table */
-    mem_heap_t *heap,     /*!< in: memory heap from which
-                          the memory for the index entry
-                          is allocated */
-    ulint flag)           /*!< in: ROW_BUILD_NORMAL,
-                          ROW_BUILD_FOR_PURGE
-                          or ROW_BUILD_FOR_UNDO */
+    const dtuple_t *row,       /*!< in: row which should be
+                               inserted or purged */
+    const row_ext_t *ext,      /*!< in: externally stored column
+                               prefixes, or NULL */
+    const dict_index_t *index, /*!< in: index on the table */
+    mem_heap_t *heap,          /*!< in: memory heap from which
+                               the memory for the index entry
+                               is allocated */
+    ulint flag)                /*!< in: ROW_BUILD_NORMAL,
+                               ROW_BUILD_FOR_PURGE
+                               or ROW_BUILD_FOR_UNDO */
 {
   dtuple_t *entry;
   ulint entry_len;
@@ -223,9 +222,9 @@ dtuple_t *row_build_index_entry_low(
           const dict_index_t *clust_index =
               (ext == nullptr ? index->table->first_index() : ext->index);
 
-          dptr = lob::btr_copy_externally_stored_field(clust_index, &dlen,
-                                                       nullptr, dptr, page_size,
-                                                       flen, false, temp_heap);
+          dptr = lob::btr_copy_externally_stored_field(
+              nullptr, clust_index, &dlen, nullptr, dptr, page_size, flen,
+              false, temp_heap);
         } else {
           dptr = static_cast<uchar *>(dfield_get_data(dfield2));
           dlen = dfield_get_len(dfield2);
@@ -275,7 +274,7 @@ dtuple_t *row_build_index_entry_low(
     indexed long columns may be stored off-page. */
     ut_ad(col->ord_part);
 
-    if (ext) {
+    if (ext && !col->is_virtual()) {
       /* See if the column is stored externally. */
       const byte *buf = row_ext_lookup(ext, col_no, &len);
       if (UNIV_LIKELY_NULL(buf)) {
@@ -695,20 +694,20 @@ dtuple_t *row_rec_to_index_entry(
  search the clustered index record.
  @return own: row reference built; see the NOTE below! */
 dtuple_t *row_build_row_ref(
-    ulint type,          /*!< in: ROW_COPY_DATA, or ROW_COPY_POINTERS:
-                         the former copies also the data fields to
-                         heap, whereas the latter only places pointers
-                         to data fields on the index page */
-    dict_index_t *index, /*!< in: secondary index */
-    const rec_t *rec,    /*!< in: record in the index;
-                         NOTE: in the case ROW_COPY_POINTERS
-                         the data fields in the row will point
-                         directly into this record, therefore,
-                         the buffer page of this record must be
-                         at least s-latched and the latch held
-                         as long as the row reference is used! */
-    mem_heap_t *heap)    /*!< in: memory heap from which the memory
-                         needed is allocated */
+    ulint type,                /*!< in: ROW_COPY_DATA, or ROW_COPY_POINTERS:
+                               the former copies also the data fields to
+                               heap, whereas the latter only places pointers
+                               to data fields on the index page */
+    const dict_index_t *index, /*!< in: secondary index */
+    const rec_t *rec,          /*!< in: record in the index;
+                               NOTE: in the case ROW_COPY_POINTERS
+                               the data fields in the row will point
+                               directly into this record, therefore,
+                               the buffer page of this record must be
+                               at least s-latched and the latch held
+                               as long as the row reference is used! */
+    mem_heap_t *heap)          /*!< in: memory heap from which the memory
+                               needed is allocated */
 {
   dict_table_t *table;
   dict_index_t *clust_index;
@@ -923,7 +922,7 @@ ibool row_search_on_row_ref(
 rec_t *row_get_clust_rec(
     ulint mode,                 /*!< in: BTR_MODIFY_LEAF, ... */
     const rec_t *rec,           /*!< in: record in a secondary index */
-    dict_index_t *index,        /*!< in: secondary index */
+    const dict_index_t *index,  /*!< in: secondary index */
     dict_index_t **clust_index, /*!< out: clustered index */
     mtr_t *mtr)                 /*!< in: mtr */
 {

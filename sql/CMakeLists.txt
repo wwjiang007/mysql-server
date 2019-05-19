@@ -1,4 +1,4 @@
-# Copyright (c) 2006, 2018, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2019, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -26,7 +26,7 @@ INCLUDE_DIRECTORIES(
 )
 INCLUDE_DIRECTORIES(SYSTEM ${BOOST_PATCHES_DIR} ${BOOST_INCLUDE_DIR})
 
-INCLUDE_DIRECTORIES(SYSTEM ${ICU_INCLUDE_DIRS})
+MY_INCLUDE_SYSTEM_DIRECTORIES(ICU)
 
 SET(CONF_SOURCES
   ${CMAKE_CURRENT_BINARY_DIR}/sql_builtin.cc 
@@ -66,7 +66,12 @@ ADD_CUSTOM_COMMAND(
 # Make sure sql_yacc.h is generated before compiling gen_keyword_list
 MYSQL_ADD_EXECUTABLE(gen_keyword_list gen_keyword_list.cc SKIP_INSTALL)
 ADD_DEPENDENCIES(gen_keyword_list GenServerSource)
-TARGET_LINK_LIBRARIES(gen_keyword_list regex strings dbug)
+TARGET_LINK_LIBRARIES(gen_keyword_list ${ICU_LIBRARIES} ${CMAKE_DL_LIBS})
+# ICU headers for WIN32 need extra info about their libs state
+IF(WIN32)
+  ADD_COMPILE_DEFINITIONS(gen_keyword_list.cc COMPILE_DEFINITIONS
+    U_STATIC_IMPLEMENTATION)
+ENDIF()
 
 ADD_CUSTOM_COMMAND(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/keyword_list.h
@@ -86,9 +91,9 @@ SET(DD_SOURCES
   dd/dd_tablespace.cc
   dd/dd_trigger.cc
   dd/dd_view.cc
+  dd/dd_utility.cc
+  dd/properties.cc
 
-  dd/impl/bootstrap_ctx.cc
-  dd/impl/bootstrapper.cc
   dd/impl/dd.cc
   dd/impl/dictionary_impl.cc
   dd/impl/properties_impl.cc
@@ -100,6 +105,9 @@ SET(DD_SOURCES
   dd/impl/sdi_file.cc
   dd/impl/sdi_tablespace.cc
   dd/impl/string_type.cc
+
+  dd/impl/bootstrap/bootstrap_ctx.cc
+  dd/impl/bootstrap/bootstrapper.cc
 
   dd/impl/cache/dictionary_client.cc
   dd/impl/cache/local_multi_map.cc
@@ -114,6 +122,7 @@ SET(DD_SOURCES
   dd/impl/raw/raw_table.cc
 
   dd/impl/system_views/character_sets.cc
+  dd/impl/system_views/check_constraints.cc
   dd/impl/system_views/collations.cc
   dd/impl/system_views/collation_charset_applicability.cc
   dd/impl/system_views/columns.cc
@@ -135,13 +144,17 @@ SET(DD_SOURCES
   dd/impl/system_views/schemata.cc
   dd/impl/system_views/statistics.cc
   dd/impl/system_views/st_spatial_reference_systems.cc
+  dd/impl/system_views/st_units_of_measure.cc
   dd/impl/system_views/st_geometry_columns.cc
   dd/impl/system_views/tables.cc
   dd/impl/system_views/table_constraints.cc
   dd/impl/system_views/triggers.cc
+  dd/impl/system_views/view_routine_usage.cc
+  dd/impl/system_views/view_table_usage.cc
   dd/impl/system_views/views.cc
 
   dd/impl/tables/character_sets.cc
+  dd/impl/tables/check_constraints.cc
   dd/impl/tables/collations.cc
   dd/impl/tables/columns.cc
   dd/impl/tables/column_statistics.cc
@@ -174,6 +187,7 @@ SET(DD_SOURCES
   dd/impl/types/table_stat_impl.cc
   dd/impl/types/abstract_table_impl.cc
   dd/impl/types/charset_impl.cc
+  dd/impl/types/check_constraint_impl.cc
   dd/impl/types/collation_impl.cc
   dd/impl/types/column_impl.cc
   dd/impl/types/column_statistics_impl.cc
@@ -206,6 +220,9 @@ SET(DD_SOURCES
   dd/impl/types/view_table_impl.cc
   dd/impl/types/weak_object_impl.cc
 
+  dd/impl/upgrade/server.cc
+  dd/impl/upgrade/dd.cc
+
   dd/info_schema/metadata.cc
   dd/info_schema/show.cc
   dd/info_schema/show_query_builder.cc
@@ -214,21 +231,23 @@ SET(DD_SOURCES
 
   dd/performance_schema/init.cc
 
-  dd/upgrade/event.cc
-  dd/upgrade/global.cc
-  dd/upgrade/routine.cc
-  dd/upgrade/schema.cc
-  dd/upgrade/table.cc
-  dd/upgrade/upgrade.cc
+  dd/upgrade_57/event.cc
+  dd/upgrade_57/global.cc
+  dd/upgrade_57/routine.cc
+  dd/upgrade_57/schema.cc
+  dd/upgrade_57/table.cc
+  dd/upgrade_57/upgrade.cc
 )
 
 SET(SQL_GIS_SOURCES
   geometry_rtree.cc
+  gis/area.cc
   gis/covered_by.cc
   gis/crosses.cc
   gis/difference.cc
   gis/disjoint.cc
   gis/distance.cc
+  gis/distance_functor.cc
   gis/distance_sphere.cc
   gis/equals.cc
   gis/gc_utils.cc
@@ -241,9 +260,12 @@ SET(SQL_GIS_SOURCES
   gis/overlaps.cc
   gis/ring_flip_visitor.cc
   gis/rtree_support.cc
+  gis/simplify.cc
   gis/srs/srs.cc
   gis/srs/wkt_parser.cc
+  gis/st_units_of_measure.cc
   gis/touches.cc
+  gis/transform.cc
   gis/union.cc
   gis/within.cc
   gis/wkb.cc
@@ -259,30 +281,39 @@ SET(SQL_GIS_SOURCES
 
 SET(MYSQL_SERVER_SUB_COMPONENT_SOURCES
   server_component/backup_lock_service.cc
+  server_component/clone_protocol_service.cc
   server_component/mysql_string_service.cc
   server_component/persistent_dynamic_loader.cc
   server_component/component_sys_var_service.cc
   server_component/component_status_var_service.cc
+  server_component/ongoing_transaction_query_service.cc
   server_component/system_variable_source_imp.cc
   server_component/security_context_imp.cc
+  server_component/host_application_signal_imp.cc
+  server_component/audit_api_message_service_imp.cc
+  server_component/page_track_service.cc
   )
 
 SET(SQL_SHARED_SOURCES
   abstract_query_plan.cc
+  auth/auth_acls.cc
   auth/auth_common.cc
   auth/dynamic_privileges_impl.cc
   auth/dynamic_privilege_table.cc
+  auth/acl_table_user.cc
   auth/sql_authentication.cc
   auth/sql_auth_cache.cc
   auth/sql_authorization.cc
   auth/sql_user_table.cc
   auth/sql_user.cc
+  auth/partial_revokes.cc
   auth/password.cc
   auth/password_policy_service.cc
   auth/sql_security_ctx.cc
   auth/service_security_context.cc
   auto_thd.cc
   keyring_service.cc
+  auth/roles.cc
   auth/role_tables.cc
   auth/sha2_password_common.cc
   auth/sha2_password.cc
@@ -291,6 +322,8 @@ SET(SQL_SHARED_SOURCES
   check_stack.cc
   conn_handler/connection_handler_manager.cc 
   clone_handler.cc
+  composite_iterators.cc
+  create_field.cc
   current_thd.cc
   dd_sql_view.cc
   dd_sp.cc
@@ -319,6 +352,7 @@ SET(SQL_SHARED_SOURCES
   item_cmpfunc.cc 
   item_create.cc
   item_func.cc
+  item_pfs_func.cc
   item_json_func.cc
   item_regexp_func.cc
   item_row.cc 
@@ -341,10 +375,12 @@ SET(SQL_SHARED_SOURCES
   locking_service.cc
   log.cc
   mdl.cc
+  mdl_context_backup.cc
   migrate_keyring.cc
   my_decimal.cc
   mysqld.cc
   mysqld_thd_manager.cc
+  net_ns.cc
   opt_costconstantcache.cc
   opt_costconstants.cc
   opt_costmodel.cc
@@ -396,6 +432,7 @@ SET(SQL_SHARED_SOURCES
   sdi_utils.cc
   session_tracker.cc
   set_var.cc 
+  sorting_iterator.cc
   sp.cc
   sp_cache.cc
   sp_head.cc
@@ -413,8 +450,10 @@ SET(SQL_SHARED_SOURCES
   sql_bootstrap.cc
   sql_initialize.cc
   sql_call.cc
+  sql_check_constraint.cc
   sql_class.cc
   sql_component.cc
+  sql_const_folding.cc
   sql_cmd_ddl_table.cc
   sql_cmd_srs.cc
   sql_connect.cc
@@ -495,6 +534,7 @@ SET(SQL_SHARED_SOURCES
   tztime.cc
   uniques.cc
   xa.cc
+  ssl_acceptor_context.cc
   ${MYSQL_SERVER_SUB_COMPONENT_SOURCES}
 )
 
@@ -587,23 +627,14 @@ ENDIF()
 # Segfault in boost::geometry code at high optimization levels
 IF(CMAKE_CXX_COMPILER_ID MATCHES "SunPro")
   STRING(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKEBT)
-  IF(CMAKEBT MATCHES "^REL")
+  IF(CMAKEBT MATCHES "REL")
     ADD_COMPILE_FLAGS(item_geofunc_buffer.cc COMPILE_FLAGS "-xO2")
   ENDIF()
 ENDIF()
 
-# Assertion in Developer Studio 12.5 (fixed in 12.6 beta).
-IF(CMAKE_CXX_COMPILER_ID MATCHES "SunPro")
-  ADD_COMPILE_FLAGS(
-    gis/srs/srs.cc
-    gis/srs/wkt_parser.cc
-    COMPILE_FLAGS "-DBOOST_NO_CXX11_VARIADIC_TEMPLATES"
-  )
-ENDIF()
-
-ADD_COMPILE_FLAGS(
+ADD_COMPILE_DEFINITIONS(
   ../extra/lz4/xxhash.c
-  COMPILE_FLAGS -DXXH_NAMESPACE=MY_
+  COMPILE_DEFINITIONS XXH_NAMESPACE=MY_
 )
 
 # Fixes "C1128: number of sections exceeded object file format limit" in MSVC
@@ -617,6 +648,13 @@ IF(WIN32)
     item_geofunc_relchecks.cc
     item_geofunc_setops.cc
     COMPILE_FLAGS "/bigobj")
+ENDIF()
+
+# Force optimization of (large) MYSQLparse function in MSVC
+IF(WIN32 AND NOT WIN32_CLANG)
+  ADD_COMPILE_FLAGS(
+    ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.cc
+    COMPILE_FLAGS "/d2OptimizeHugeFunctions")
 ENDIF()
 
 # Common for all versions of GCC/Clang
@@ -652,7 +690,37 @@ ADD_DEPENDENCIES(sql_gis GenBootstrapPriv)
 ADD_DEPENDENCIES(sql_gis GenSysSchema)
 ADD_DEPENDENCIES(sql_gis GenError)
 
+# A class with a reference member lacks a user-defined constructor,
+# which can lead to errors.
+# Constexpr function return type is not a literal type.
+IF(CMAKE_CXX_COMPILER_ID MATCHES "SunPro")
+  SET_TARGET_PROPERTIES(sql_gis PROPERTIES
+    COMPILE_FLAGS "-erroff=refmemnoconstr,w_constexprnonlitret")
+  ADD_COMPILE_FLAGS(
+    item_geofunc_setops.cc
+    COMPILE_FLAGS "-erroff=refmemnoconstr")
+ENDIF()
+
+# -g0 is the same as -g, except that inlining is enabled.
+# With Studio 12.6 we may get linking errors for large binaries,
+# so we add -g0 here to enable inlining of boost/geometry.
+# This also cuts link time by almost one hour for large binaries ....
+IF(CMAKE_CXX_COMPILER_ID MATCHES "SunPro")
+  ADD_COMPILE_FLAGS(
+    ${SQL_GIS_SOURCES}
+    sql_exception_handler.cc
+    COMPILE_FLAGS " -g0 -xdebuginfo=no%decl")
+ENDIF()
+
+# /permissive- gives MSVC compilation error in Boost's pj_gridinfo.hpp
+IF(MSVC AND NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+  ADD_COMPILE_FLAGS(
+    "gis/transform.cc"
+    COMPILE_FLAGS " /permissive")
+ENDIF()
+
 ADD_CONVENIENCE_LIBRARY(sql_dd ${DD_SOURCES})
+ADD_DEPENDENCIES(sql_dd GenFixPrivs)
 ADD_DEPENDENCIES(sql_dd GenServerSource)
 ADD_DEPENDENCIES(sql_dd GenDigestServerSource)
 ADD_DEPENDENCIES(sql_dd GenBootstrapPriv)
@@ -661,16 +729,16 @@ ADD_DEPENDENCIES(sql_dd GenError)
 ADD_DEPENDENCIES(sql_dd GenKeywordList)
 
 #
-# On Windows platform we compile in the clinet-side Windows Native Authentication
+# On Windows platform we compile in the client-side Windows Native Authentication
 # plugin which is used by the client connection code included in the server.
 #
 IF(WIN32)
   ADD_DEFINITIONS(-DAUTHENTICATION_WIN)
   TARGET_LINK_LIBRARIES(sql_main auth_win_client)
   IF(OPENSSL_APPLINK_C)
-    ADD_COMPILE_FLAGS(
+    ADD_COMPILE_DEFINITIONS(
       ../sql-common/client_authentication.cc
-      COMPILE_FLAGS -DHAVE_OPENSSL_APPLINK_C)
+      COMPILE_DEFINITIONS HAVE_OPENSSL_APPLINK_C)
   ENDIF()
 ENDIF()
 
@@ -678,7 +746,9 @@ SET (BINLOG_SOURCE rpl_gtid_misc.cc
                    rpl_gtid_sid_map.cc rpl_gtid_set.cc rpl_gtid_specification.cc
                    rpl_gtid_state.cc rpl_gtid_owned.cc rpl_gtid_execution.cc
                    rpl_gtid_mutex_cond_array.cc rpl_gtid_persist.cc
-                   log_event.cc binlog.cc sql_binlog.cc
+                   log_event.cc binlog.cc sql_binlog.cc basic_ostream.cc
+                   binlog_ostream.cc basic_istream.cc binlog_istream.cc
+                   binlog_reader.cc rpl_log_encryption.cc rpl_cipher.cc
                    rpl_filter.cc rpl_record.cc rpl_trx_tracking.cc
                    rpl_utility.cc rpl_injector.cc rpl_table_access.cc)
 ADD_CONVENIENCE_LIBRARY(binlog ${BINLOG_SOURCE})
@@ -687,7 +757,7 @@ TARGET_LINK_LIBRARIES(binlog binlogevents_static)
 SET (RPL_SOURCE rpl_handler.cc rpl_tblmap.cc rpl_context.cc)
 ADD_DEPENDENCIES(binlog GenError)
 ADD_CONVENIENCE_LIBRARY(rpl ${RPL_SOURCE})
-SET (MASTER_SOURCE rpl_master.cc rpl_binlog_sender.cc)
+SET (MASTER_SOURCE rpl_master.cc rpl_binlog_sender.cc binlog_reader.cc)
 ADD_DEPENDENCIES(rpl GenError)
 ADD_CONVENIENCE_LIBRARY(master ${MASTER_SOURCE})
 ADD_DEPENDENCIES(master GenError)
@@ -698,7 +768,7 @@ SET (SLAVE_SOURCE rpl_slave.cc rpl_reporting.cc rpl_mi.cc rpl_rli.cc
                   rpl_rli_pdb.cc rpl_info_dummy.cc rpl_mts_submode.cc
                   rpl_slave_commit_order_manager.cc rpl_msr.cc
                   rpl_trx_boundary_parser.cc rpl_channel_service_interface.cc
-                  rpl_slave_until_options.cc)
+                  rpl_slave_until_options.cc rpl_applier_reader.cc)
 ADD_CONVENIENCE_LIBRARY(slave ${SLAVE_SOURCE})
 ADD_DEPENDENCIES(slave GenError)
 
@@ -725,7 +795,7 @@ IF(APPLE)
     TARGET_LINK_LIBRARIES(mysqld ${CORESERVICES}) 
   ENDIF() 
   IF(NOT BUILD_IS_SINGLE_CONFIG)
-    ADD_COMPILE_FLAGS(mysqld.cc COMPILE_FLAGS -DAPPLE_XCODE)
+    ADD_COMPILE_DEFINITIONS(mysqld.cc COMPILE_DEFINITIONS APPLE_XCODE)
   ENDIF()
 ENDIF() 
 
@@ -749,6 +819,7 @@ IF(NOT DISABLE_SHARED)
       "$<TARGET_FILE:dbug>"
       "$<TARGET_FILE:mysys>"
       "$<TARGET_FILE:mysys_ssl>"
+      "$<TARGET_FILE:mytime>"
       "$<TARGET_FILE:slave>"
       "$<TARGET_FILE:sql_main>"
       "$<TARGET_FILE:strings>"
@@ -770,7 +841,7 @@ SET_TARGET_PROPERTIES(mysqld PROPERTIES INTERFACE_LINK_LIBRARIES "")
 SET(WITH_MYSQLD_LDFLAGS "" CACHE STRING "Additional linker flags for mysqld")
 MARK_AS_ADVANCED(WITH_MYSQLD_LDFLAGS)
 IF(WITH_MYSQLD_LDFLAGS)
-  GET_TARGET_PROPERTY(mysqld LINK_FLAGS MYSQLD_LINK_FLAGS)
+  GET_TARGET_PROPERTY(MYSQLD_LINK_FLAGS mysqld LINK_FLAGS)
   IF(NOT MYSQLD_LINK_FLAGS)
     SET(MYSQLD_LINK_FLAGS) 
   ENDIF() 

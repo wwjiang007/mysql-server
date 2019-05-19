@@ -321,7 +321,7 @@ struct recv_dblwr_t {
 
   struct Page {
     /** Default constructor */
-    Page() : m_no(), m_ptr(), m_page(){};
+    Page() : m_no(), m_ptr(), m_page() {}
 
     /** Constructor
     @param[in]	no	Doublewrite page number
@@ -592,6 +592,10 @@ the log and store the scanned log records in the buffer pool: we will
 use these free frames to read in pages when we start applying the
 log records to the database. */
 extern ulint recv_n_pool_free_frames;
+
+/** A list of tablespaces for which (un)encryption process was not
+completed before crash. */
+extern std::list<space_id_t> recv_encr_ts_list;
 
 #include "log0recv.ic"
 

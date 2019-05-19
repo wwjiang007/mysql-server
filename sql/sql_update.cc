@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -20,18 +20,17 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
-/*
-  Single table and multi table updates of tables.
-  Multi-table updates were introduced by Sinisa & Monty
-*/
+// Handle UPDATE queries (both single- and multi-table).
 
 #include "sql/sql_update.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 #include <atomic>
+#include <memory>
+#include <new>
 
-#include "binary_log_types.h"
 #include "lex_string.h"
 #include "m_ctype.h"
 #include "my_alloc.h"
@@ -49,16 +48,19 @@
 #include "prealloced_array.h"  // Prealloced_array
 #include "sql/auth/auth_acls.h"
 #include "sql/auth/auth_common.h"  // check_grant, check_access
-#include "sql/binlog.h"            // mysql_bin_log
-#include "sql/debug_sync.h"        // DEBUG_SYNC
-#include "sql/derror.h"            // ER_THD
-#include "sql/field.h"             // Field
-#include "sql/filesort.h"          // Filesort
+#include "sql/basic_row_iterators.h"
+#include "sql/binlog.h"  // mysql_bin_log
+#include "sql/composite_iterators.h"
+#include "sql/debug_sync.h"  // DEBUG_SYNC
+#include "sql/derror.h"      // ER_THD
+#include "sql/field.h"       // Field
+#include "sql/filesort.h"    // Filesort
 #include "sql/handler.h"
 #include "sql/item.h"            // Item
 #include "sql/item_json_func.h"  // Item_json_func
 #include "sql/key.h"             // is_key_used
 #include "sql/key_spec.h"
+#include "sql/locked_tables_list.h"
 #include "sql/mem_root_array.h"
 #include "sql/mysqld.h"       // stage_... mysql_tmpdir
 #include "sql/opt_explain.h"  // Modification_plan
@@ -71,6 +73,9 @@
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
 #include "sql/records.h"  // READ_RECORD
+#include "sql/row_iterator.h"
+#include "sql/select_lex_visitor.h"
+#include "sql/sorting_iterator.h"
 #include "sql/sql_array.h"
 #include "sql/sql_base.h"  // check_record, fill_record
 #include "sql/sql_bitmap.h"
@@ -85,7 +90,6 @@
 #include "sql/sql_partition.h"  // partition_key_modified
 #include "sql/sql_resolver.h"   // setup_order
 #include "sql/sql_select.h"
-#include "sql/sql_sort.h"
 #include "sql/sql_tmp_table.h"  // create_tmp_table
 #include "sql/sql_view.h"       // check_key_in_view
 #include "sql/system_variables.h"
@@ -313,9 +317,24 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
   QEP_TAB_standalone qep_tab_st;
   QEP_TAB &qep_tab = qep_tab_st.as_QEP_TAB();
 
-  Item *conds;
+  if (table->all_partitions_pruned_away) {
+    /*
+      All partitions were pruned away during preparation. Shortcut further
+      processing by "no rows". If explaining, report the plan and bail out.
+    */
+    no_rows = true;
+
+    if (lex->is_explain()) {
+      Modification_plan plan(thd, MT_UPDATE, table,
+                             "No matching rows after partition pruning", true,
+                             0);
+      bool err = explain_single_table_modification(thd, thd, &plan, select_lex);
+      DBUG_RETURN(err);
+    }
+  }
+  Item *conds = nullptr;
   ORDER *order = select_lex->order_list.first;
-  if (select_lex->get_optimizable_conditions(thd, &conds, NULL))
+  if (!no_rows && select_lex->get_optimizable_conditions(thd, &conds, nullptr))
     DBUG_RETURN(true); /* purecov: inspected */
 
   /*
@@ -329,7 +348,7 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
   if (conds || order)
     static_cast<void>(substitute_gc(thd, select_lex, conds, NULL, order));
 
-  if (conds) {
+  if (conds != nullptr) {
     COND_EQUAL *cond_equal = NULL;
     Item::cond_result result;
     if (table_list->check_option) {
@@ -367,7 +386,7 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
         const replacement. However, at the moment there is no such
         thing as Item::clone().
       */
-      if (build_equal_items(thd, conds, &conds, NULL, false,
+      if (build_equal_items(thd, conds, &conds, nullptr, false,
                             select_lex->join_list, &cond_equal))
         DBUG_RETURN(true);
       if (remove_eq_conds(thd, conds, &conds, &result))
@@ -383,12 +402,13 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
       if (thd->lex->is_explain()) {
         Modification_plan plan(thd, MT_UPDATE, table, "Impossible WHERE", true,
                                0);
-        bool err = explain_single_table_modification(thd, &plan, select_lex);
+        bool err =
+            explain_single_table_modification(thd, thd, &plan, select_lex);
         DBUG_RETURN(err);
       }
     }
-    if (conds) {
-      conds = substitute_for_best_equal_field(conds, cond_equal, 0);
+    if (conds != nullptr) {
+      conds = substitute_for_best_equal_field(thd, conds, cond_equal, 0);
       if (conds == NULL) DBUG_RETURN(true);
 
       conds->update_used_tables();
@@ -409,7 +429,8 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
         Modification_plan plan(thd, MT_UPDATE, table,
                                "No matching rows after partition pruning", true,
                                0);
-        bool err = explain_single_table_modification(thd, &plan, select_lex);
+        bool err =
+            explain_single_table_modification(thd, thd, &plan, select_lex);
         DBUG_RETURN(err);
       }
       my_ok(thd);
@@ -428,6 +449,11 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
   qep_tab.set_table(table);
   qep_tab.set_condition(conds);
 
+  if (conds &&
+      thd->optimizer_switch_flag(OPTIMIZER_SWITCH_ENGINE_CONDITION_PUSHDOWN)) {
+    table->file->cond_push(conds, false);
+  }
+
   {  // Enter scope for optimizer trace wrapper
     Opt_trace_object wrapper(&thd->opt_trace);
     wrapper.add_utf8_table(update_table_ref);
@@ -437,7 +463,8 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
       QUICK_SELECT_I *qck;
       no_rows = test_quick_select(thd, keys_to_use, 0, limit, safe_update,
                                   ORDER_NOT_RELEVANT, &qep_tab, conds,
-                                  &needed_reg_dummy, &qck) < 0;
+                                  &needed_reg_dummy, &qck,
+                                  qep_tab.table()->force_index) < 0;
       qep_tab.set_quick(qck);
       if (thd->is_error()) DBUG_RETURN(true);
     }
@@ -445,7 +472,8 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
       if (thd->lex->is_explain()) {
         Modification_plan plan(thd, MT_UPDATE, table, "Impossible WHERE", true,
                                0);
-        bool err = explain_single_table_modification(thd, &plan, select_lex);
+        bool err =
+            explain_single_table_modification(thd, thd, &plan, select_lex);
         DBUG_RETURN(err);
       }
 
@@ -462,8 +490,18 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
   /* If running in safe sql mode, don't allow updates without keys */
   if (table->quick_keys.is_clear_all()) {
     thd->server_status |= SERVER_QUERY_NO_INDEX_USED;
-    if (safe_update && !using_limit) {
-      my_error(ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE, MYF(0));
+
+    /*
+      No safe update error will be returned if:
+      1) Statement is an EXPLAIN OR
+      2) LIMIT is present.
+
+      Append the first warning (if any) to the error message. Allows the user
+      to understand why index access couldn't be chosen.
+    */
+    if (!lex->is_explain() && safe_update && !using_limit) {
+      my_error(ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE, MYF(0),
+               thd->get_stmt_da()->get_first_condition_message());
       DBUG_RETURN(true);
     }
   }
@@ -510,6 +548,7 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
   ha_rows updated_rows = 0;
   ha_rows found_rows = 0;
 
+  unique_ptr_destroy_only<Filesort> fsort;
   READ_RECORD info;
 
   {  // Start of scope for Modification_plan
@@ -530,19 +569,18 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
                            using_filesort, used_key_is_modified, rows);
     DEBUG_SYNC(thd, "planned_single_update");
     if (thd->lex->is_explain()) {
-      bool err = explain_single_table_modification(thd, &plan, select_lex);
+      bool err = explain_single_table_modification(thd, thd, &plan, select_lex);
       DBUG_RETURN(err);
     }
+
+    if (thd->lex->is_ignore()) table->file->extra(HA_EXTRA_IGNORE_DUP_KEY);
+    table->file->try_semi_consistent_read(1);
 
     if (used_key_is_modified || order) {
       /*
         We can't update table directly;  We must first search after all
         matching rows before updating the table!
       */
-
-      Key_map covering_keys_for_cond;  // @todo - move this
-      if (used_index < MAX_KEY && covering_keys_for_cond.is_set(used_index))
-        table->set_keyread(true);
 
       /* note: We avoid sorting if we sort on the used index */
       if (using_filesort) {
@@ -551,20 +589,27 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
           to update
           NOTE: filesort will call table->prepare_for_position()
         */
-        ha_rows sort_examined_rows, sort_found_rows, sort_returned_rows;
-        Filesort fsort(&qep_tab, order, limit);
+        ha_rows examined_rows = 0;
+        setup_read_record(&info, thd, NULL, &qep_tab, false,
+                          /*ignore_not_found_rows=*/false, &examined_rows);
 
-        DBUG_ASSERT(table->sort_result.io_cache == NULL);
-        table->sort_result.io_cache =
-            (IO_CACHE *)my_malloc(key_memory_TABLE_sort_io_cache,
-                                  sizeof(IO_CACHE), MYF(MY_FAE | MY_ZEROFILL));
+        unique_ptr_destroy_only<RowIterator> iterator = move(info.iterator);
 
-        if (filesort(thd, &fsort, true, &sort_examined_rows, &sort_found_rows,
-                     &sort_returned_rows))
-          DBUG_RETURN(true);
+        if (qep_tab.condition() != nullptr) {
+          iterator.reset(new (&info.sort_condition_holder) FilterIterator(
+              thd, move(iterator), qep_tab.condition()));
+        }
 
-        table->sort_result.found_records = sort_returned_rows;
-        thd->inc_examined_row_count(sort_examined_rows);
+        // Force filesort to sort by position.
+        qep_tab.keep_current_rowid = true;
+        fsort.reset(new (thd->mem_root) Filesort(&qep_tab, order, limit));
+        unique_ptr_destroy_only<RowIterator> sort(new (
+            &info.sort_holder) SortingIterator(thd, fsort.get(), move(iterator),
+                                               /*examined_rows=*/nullptr));
+        if (sort->Init()) DBUG_RETURN(true);
+        info.iterator = move(sort);
+        thd->inc_examined_row_count(examined_rows);
+
         /*
           Filesort has already found and selected the rows we want to update,
           so we don't need the where clause
@@ -575,8 +620,17 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
         /*
           We are doing a search on a key that is updated. In this case
           we go trough the matching rows, save a pointer to them and
-          update these in a separate loop based on the pointer.
-        */
+          update these in a separate loop based on the pointer. In the end,
+          we get a result file that looks exactly like what filesort uses
+          internally, which allows us to read from it
+          using SortFileIndirectIterator.
+
+          TODO: Find something less ugly.
+         */
+        Key_map covering_keys_for_cond;  // @todo - move this
+        if (used_index < MAX_KEY && covering_keys_for_cond.is_set(used_index))
+          table->set_keyread(true);
+
         table->prepare_for_position();
 
         /* If quick select is used, initialize it before retrieving rows. */
@@ -599,11 +653,18 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
           Full index scan must be started with init_read_record_idx
         */
 
-        if (used_index == MAX_KEY || qep_tab.quick()
-                ? init_read_record(&info, thd, NULL, &qep_tab, true, false)
-                : init_read_record_idx(&info, thd, table, true, used_index,
-                                       reverse))
-          DBUG_RETURN(true); /* purecov: inspected */
+        if (used_index == MAX_KEY || qep_tab.quick()) {
+          setup_read_record(&info, thd, NULL, &qep_tab, false,
+                            /*ignore_not_found_rows=*/false,
+                            /*examined_rows=*/nullptr);
+        } else {
+          setup_read_record_idx(&info, thd, table, used_index, reverse,
+                                &qep_tab);
+        }
+
+        if (info.iterator->Init()) {
+          DBUG_RETURN(true);
+        }
 
         THD_STAGE_INFO(thd, stage_searching_rows_for_update);
         ha_rows tmp_limit = limit;
@@ -618,7 +679,7 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
           DBUG_RETURN(true);
         }
 
-        while (!(error = info.read_record(&info)) && !thd->killed) {
+        while (!(error = info->Read()) && !thd->killed) {
           DBUG_ASSERT(!thd->is_error());
           thd->inc_examined_row_count(1);
 
@@ -653,40 +714,38 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
           error = 1;                /* purecov: inspected */
         limit = tmp_limit;
         table->file->try_semi_consistent_read(0);
-        end_read_record(&info);
+        if (used_index < MAX_KEY && covering_keys_for_cond.is_set(used_index))
+          table->set_keyread(false);
+        table->file->ha_index_or_rnd_end();
+        info.iterator.reset();
 
         // Change reader to use tempfile
         if (reinit_io_cache(tempfile, READ_CACHE, 0L, 0, 0))
           error = 1; /* purecov: inspected */
 
-        DBUG_ASSERT(table->sort_result.io_cache == NULL);
-        /*
-          After this assignment, init_read_record() will run, and decide to
-          read from sort_result.io_cache. This cache will be freed when qep_tab
-          is destroyed.
-         */
-        table->sort_result.io_cache = tempfile;
+        if (error >= 0) {
+          close_cached_file(tempfile);
+          my_free(tempfile);
+          DBUG_RETURN(error > 0);
+        }
+
+        info.iterator.reset(
+            new (&info.iterator_holder.sort_file_indirect)
+                SortFileIndirectIterator(thd, table, tempfile,
+                                         /*request_cache=*/false,
+                                         /*ignore_not_found_rows=*/false,
+                                         /*examined_rows=*/nullptr));
+        if (info.iterator->Init()) DBUG_RETURN(true);
+
         qep_tab.set_quick(NULL);
         qep_tab.set_condition(NULL);
-        if (error >= 0) DBUG_RETURN(error > 0);
       }
-      if (used_index < MAX_KEY && covering_keys_for_cond.is_set(used_index))
-        table->set_keyread(false);
-      table->file->ha_index_or_rnd_end();
+    } else {
+      // No ORDER BY or updated key underway, so we can use a regular read.
+      if (init_read_record(&info, thd, NULL, &qep_tab, false,
+                           /*ignore_not_found_rows=*/false))
+        DBUG_RETURN(true); /* purecov: inspected */
     }
-
-    if (thd->lex->is_ignore()) table->file->extra(HA_EXTRA_IGNORE_DUP_KEY);
-
-    if (qep_tab.quick() && (error = qep_tab.quick()->reset())) {
-      if (table->file->is_fatal_error(error)) error_flags |= ME_FATALERROR;
-
-      table->file->print_error(error, error_flags);
-      DBUG_RETURN(true);
-    }
-
-    table->file->try_semi_consistent_read(1);
-    if (init_read_record(&info, thd, NULL, &qep_tab, true, false))
-      DBUG_RETURN(true); /* purecov: inspected */
 
     /*
       Generate an error (in TRADITIONAL mode) or warning
@@ -724,7 +783,7 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
     uint dup_key_found;
 
     while (true) {
-      error = info.read_record(&info);
+      error = info->Read();
       if (error || thd->killed) break;
       thd->inc_examined_row_count(1);
       bool skip_record;
@@ -750,6 +809,14 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
                                                TRG_EVENT_UPDATE, 0)) {
         error = 1;
         break;
+      }
+      if (invoke_table_check_constraints(thd, table)) {
+        if (thd->is_error()) {
+          error = 1;
+          break;
+        }
+        // continue when IGNORE clause is used.
+        continue;
       }
       found_rows++;
 
@@ -930,7 +997,7 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
     thd->get_transaction()->mark_modified_non_trans_table(
         Transaction_ctx::STMT);
 
-  end_read_record(&info);
+  info.iterator.reset();
 
   /*
     error < 0 means really no error at all: we processed all rows until the
@@ -980,7 +1047,6 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
   }
   thd->check_for_truncated_fields = CHECK_FIELD_IGNORE;
   thd->current_found_rows = found_rows;
-  thd->current_changed_rows = updated_rows;
   // Following test is disabled, as we get RQG errors that are hard to debug
   // DBUG_ASSERT((error >= 0) == thd->is_error());
   DBUG_RETURN(error >= 0 || thd->is_error());
@@ -1306,8 +1372,8 @@ bool Sql_cmd_update::prepare_inner(THD *thd) {
                                 OPTION_BUFFER_RESULT);
 
     Prepared_stmt_arena_holder ps_holder(thd);
-    result = new (*THR_MALLOC)
-        Query_result_update(thd, update_fields, update_value_list);
+    result = new (thd->mem_root)
+        Query_result_update(update_fields, update_value_list);
     if (result == NULL) DBUG_RETURN(true); /* purecov: inspected */
 
     select->set_query_result(result);
@@ -1384,7 +1450,13 @@ bool Sql_cmd_update::prepare_inner(THD *thd) {
   for (TABLE_LIST *tl = select->leaf_tables; tl; tl = tl->next_leaf) {
     tl->updating = tl->map() & tables_for_update;
     if (tl->updating) {
-      if (tl->table->vfield &&
+      // Cannot update a table if the storage engine does not support update.
+      if (tl->table->file->ha_table_flags() & HA_UPDATE_NOT_SUPPORTED) {
+        my_error(ER_ILLEGAL_HA, MYF(0), tl->table_name);
+        DBUG_RETURN(true);
+      }
+
+      if ((tl->table->vfield || tl->table->gen_def_fields_ptr != nullptr) &&
           validate_gc_assignment(update_fields, update_value_list, tl->table))
         DBUG_RETURN(true); /* purecov: inspected */
 
@@ -1488,17 +1560,14 @@ bool Sql_cmd_update::prepare_inner(THD *thd) {
   if (select->has_ft_funcs() && setup_ftfuncs(thd, select))
     DBUG_RETURN(true); /* purecov: inspected */
 
-  if (select->inner_refs_list.elements && select->fix_inner_refs(thd))
-    DBUG_RETURN(true); /* purecov: inspected */
-
   if (select->query_result() &&
-      select->query_result()->prepare(select->fields_list, lex->unit))
+      select->query_result()->prepare(thd, select->fields_list, lex->unit))
     DBUG_RETURN(true); /* purecov: inspected */
 
   Opt_trace_array trace_steps(trace, "steps");
   opt_trace_print_expanded_query(thd, select, &trace_wrapper);
 
-  if (select->has_sj_candidates() && select->flatten_subqueries())
+  if (select->has_sj_candidates() && select->flatten_subqueries(thd))
     DBUG_RETURN(true); /* purecov: inspected */
 
   select->set_sj_candidates(NULL);
@@ -1520,7 +1589,7 @@ bool Sql_cmd_update::execute_inner(THD *thd) {
   Connect fields with tables and create list of tables that are updated
 */
 
-bool Query_result_update::prepare(List<Item> &, SELECT_LEX_UNIT *u) {
+bool Query_result_update::prepare(THD *thd, List<Item> &, SELECT_LEX_UNIT *u) {
   SQL_I_List<TABLE_LIST> update;
   List_iterator_fast<Item> field_it(*fields);
   List_iterator_fast<Item> value_it(*values);
@@ -1617,8 +1686,8 @@ bool Query_result_update::prepare(List<Item> &, SELECT_LEX_UNIT *u) {
 
   if (update_operations == NULL) DBUG_RETURN(true);
   for (uint i = 0; i < update_table_count; i++) {
-    fields_for_table[i] = new (*THR_MALLOC) List_item;
-    values_for_table[i] = new (*THR_MALLOC) List_item;
+    fields_for_table[i] = new (thd->mem_root) List_item;
+    values_for_table[i] = new (thd->mem_root) List_item;
   }
   if (thd->is_error()) DBUG_RETURN(true);
 
@@ -1639,7 +1708,7 @@ bool Query_result_update::prepare(List<Item> &, SELECT_LEX_UNIT *u) {
   for (uint i = 0; i < update_table_count; i++)
     set_if_bigger(max_fields,
                   fields_for_table[i]->elements + select->leaf_table_count);
-  copy_field = new (*THR_MALLOC) Copy_field[max_fields];
+  copy_field = new (thd->mem_root) Copy_field[max_fields];
 
   for (TABLE_LIST *ref = leaves; ref != NULL; ref = ref->next_leaf) {
     if (tables_to_update & ref->map()) {
@@ -1758,6 +1827,7 @@ bool Query_result_update::optimize() {
 
   SELECT_LEX *const select = unit->first_select();
   JOIN *const join = select->join;
+  THD *thd = join->thd;
 
   ASSERT_BEST_REF_IN_JOIN_ORDER(join);
 
@@ -1805,10 +1875,9 @@ bool Query_result_update::optimize() {
         for (uint i = 1; i < join->tables; ++i) {
           JOIN_TAB *tab = join->best_ref[i];
           if (tab->condition())
-            tab->condition()->walk(
-                &Item::add_field_to_set_processor,
-                Item::enum_walk(Item::WALK_POSTFIX | Item::WALK_SUBQUERY),
-                reinterpret_cast<uchar *>(main_table));
+            tab->condition()->walk(&Item::add_field_to_set_processor,
+                                   enum_walk::SUBQUERY_POSTFIX,
+                                   reinterpret_cast<uchar *>(main_table));
           /*
             On top of checking conditions, we need to check conditions
             referenced by index lookup on the following tables. They implement
@@ -1819,11 +1888,11 @@ bool Query_result_update::optimize() {
             before-update value;
             consider this flow of a nested loop join:
             read a row from main_table and:
-            - init ref access (cp_buffer_from_ref() in join_read_always_key()):
+            - init ref access (cp_buffer_from_ref() in RefIterator):
               copy referenced value from main_table into 2nd table's ref buffer
-            - look up a first row in 2nd table (join_read_always_key)
+            - look up a first row in 2nd table (RefIterator::Read())
               - if it joins, update row of main_table on the fly
-            - look up a second row in 2nd table (join_read_next_same).
+            - look up a second row in 2nd table (again RefIterator::Read()).
             Because cp_buffer_from_ref() is not called again, the before-update
             value of the row of main_table is still in the 2nd table's ref
             buffer. So the lookup is not influenced by the just-done update of
@@ -1833,10 +1902,9 @@ bool Query_result_update::optimize() {
             for (uint i = 0; i < tab->ref().key_parts; i++) {
               Item *ref_item = tab->ref().items[i];
               if ((table_ref->map() & ref_item->used_tables()) != 0)
-                ref_item->walk(
-                    &Item::add_field_to_set_processor,
-                    Item::enum_walk(Item::WALK_POSTFIX | Item::WALK_SUBQUERY),
-                    reinterpret_cast<uchar *>(main_table));
+                ref_item->walk(&Item::add_field_to_set_processor,
+                               enum_walk::SUBQUERY_POSTFIX,
+                               reinterpret_cast<uchar *>(main_table));
             }
           }
         }
@@ -1879,6 +1947,7 @@ bool Query_result_update::optimize() {
            tmp_unit = tmp_unit->next_unit()) {
         for (sl = tmp_unit->first_select(); sl; sl = sl->next_select()) {
           if (sl->master_unit()->item) {
+            // Prevent early freeing in JOIN::join_free()
             select->uncacheable |= UNCACHEABLE_CHECKOPTION;
             goto loop_end;
           }
@@ -1922,11 +1991,11 @@ bool Query_result_update::optimize() {
       */
       tbl->prepare_for_position();
 
-      Field_string *field = new (*THR_MALLOC)
-          Field_string(tbl->file->ref_length, 0, tbl->alias, &my_charset_bin);
+      Field_string *field = new (thd->mem_root) Field_string(
+          tbl->file->ref_length, false, tbl->alias, &my_charset_bin);
       if (!field) DBUG_RETURN(1);
       field->init(tbl);
-      Item_field *ifield = new (*THR_MALLOC) Item_field((Field *)field);
+      Item_field *ifield = new (thd->mem_root) Item_field(field);
       if (!ifield) DBUG_RETURN(1);
       ifield->maybe_null = 0;
       if (temp_fields.push_back(ifield)) DBUG_RETURN(1);
@@ -1960,7 +2029,7 @@ bool Query_result_update::optimize() {
   DBUG_RETURN(0);
 }
 
-void Query_result_update::cleanup() {
+void Query_result_update::cleanup(THD *thd) {
   TABLE_LIST *table;
   for (table = update_tables; table; table = table->next_local) {
     table->table->no_cache = 0;
@@ -1984,7 +2053,7 @@ void Query_result_update::cleanup() {
     for (uint i = 0; i < update_table_count; i++) destroy(update_operations[i]);
 }
 
-bool Query_result_update::send_data(List<Item> &) {
+bool Query_result_update::send_data(THD *thd, List<Item> &) {
   TABLE_LIST *cur_table;
   DBUG_ENTER("Query_result_update::send_data");
 
@@ -2014,6 +2083,12 @@ bool Query_result_update::send_data(List<Item> &) {
               thd, update_operations[offset], *fields_for_table[offset],
               *values_for_table[offset], table, TRG_EVENT_UPDATE, 0))
         DBUG_RETURN(true);
+
+      if (invoke_table_check_constraints(thd, table)) {
+        if (thd->is_error()) DBUG_RETURN(true);
+        // continue when IGNORE clause is used.
+        continue;
+      }
 
       /*
         Reset the table->auto_increment_field_not_null as it is valid for
@@ -2115,9 +2190,8 @@ bool Query_result_update::send_data(List<Item> &) {
       /* Write row, ignoring duplicated updates to a row */
       error = tmp_table->file->ha_write_row(tmp_table->record[0]);
       if (error != HA_ERR_FOUND_DUPP_KEY && error != HA_ERR_FOUND_DUPP_UNIQUE) {
-        if (error && create_ondisk_from_heap(
-                         thd, tmp_table, tmp_table_param[offset].start_recinfo,
-                         &tmp_table_param[offset].recinfo, error, true, NULL)) {
+        if (error &&
+            create_ondisk_from_heap(thd, tmp_table, error, true, NULL)) {
           update_completed = true;
           DBUG_RETURN(true);  // Not a table_is_full error
         }
@@ -2128,12 +2202,12 @@ bool Query_result_update::send_data(List<Item> &) {
   DBUG_RETURN(false);
 }
 
-void Query_result_update::send_error(uint errcode, const char *err) {
+void Query_result_update::send_error(THD *, uint errcode, const char *err) {
   /* First send error what ever it is ... */
   my_error(errcode, MYF(0), err);
 }
 
-void Query_result_update::abort_result_set() {
+void Query_result_update::abort_result_set(THD *thd) {
   /* the error was handled or nothing deleted and no side effects return */
   if (error_handled ||
       (!thd->get_transaction()->cannot_safely_rollback(Transaction_ctx::STMT) &&
@@ -2150,7 +2224,7 @@ void Query_result_update::abort_result_set() {
         thd->get_transaction()->cannot_safely_rollback(Transaction_ctx::STMT));
     if (!update_completed && update_table_count > 1) {
       /* @todo: Add warning here */
-      (void)do_updates();
+      (void)do_updates(thd);
     }
   }
   if (thd->get_transaction()->cannot_safely_rollback(Transaction_ctx::STMT)) {
@@ -2176,7 +2250,7 @@ void Query_result_update::abort_result_set() {
       thd->get_transaction()->cannot_safely_rollback(Transaction_ctx::STMT));
 }
 
-bool Query_result_update::do_updates() {
+bool Query_result_update::do_updates(THD *thd) {
   TABLE_LIST *cur_table;
   int local_error = 0;
   ha_rows org_updated;
@@ -2303,7 +2377,7 @@ bool Query_result_update::do_updates() {
            copy_field_ptr++)
         copy_field_ptr->invoke_do_copy(copy_field_ptr);
 
-      if (table->in_use->is_error()) goto err;
+      if (thd->is_error()) goto err;
 
       // The above didn't update generated columns
       if (table->vfield &&
@@ -2322,6 +2396,12 @@ bool Query_result_update::do_updates() {
         table->triggers->disable_fields_temporary_nullability();
 
         if (rc || check_record(thd, table->field)) goto err;
+      }
+
+      if (invoke_table_check_constraints(thd, table)) {
+        if (thd->is_error()) goto err;
+        // continue when IGNORE clause is used.
+        continue;
       }
 
       if (!records_are_comparable(table) || compare_records(table)) {
@@ -2390,7 +2470,7 @@ err:
   DBUG_RETURN(true);
 }
 
-bool Query_result_update::send_eof() {
+bool Query_result_update::send_eof(THD *thd) {
   char buff[STRING_BUFFER_USUAL_SIZE];
   ulonglong id;
   THD::killed_state killed_status = THD::NOT_KILLED;
@@ -2402,7 +2482,7 @@ bool Query_result_update::send_eof() {
      error takes into account killed status gained in do_updates()
   */
   int local_error = thd->is_error();
-  if (!local_error) local_error = (update_table_count) ? do_updates() : 0;
+  if (!local_error) local_error = (update_table_count) ? do_updates(thd) : 0;
   /*
     if local_error is not set ON until after do_updates() then
     later carried out killing should not affect binlogging.
@@ -2451,7 +2531,6 @@ bool Query_result_update::send_eof() {
   id = thd->arg_of_last_insert_id_function
            ? thd->first_successful_insert_id_in_prev_stmt
            : 0;
-  thd->current_changed_rows = updated_rows;
 
   snprintf(buff, sizeof(buff), ER_THD(thd, ER_UPDATE_INFO), (long)found_rows,
            (long)updated_rows,

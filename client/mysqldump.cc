@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -22,28 +22,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 */
 
-/* mysqldump.c  - Dump a tables contents and format to an ASCII file
-**
-** The author's original notes follow :-
-**
-** AUTHOR: Igor Romanenko (igor@frog.kiev.ua)
-** DATE:   December 3, 1994
-** WARRANTY: None, expressed, impressed, implied
-**          or other
-** STATUS: Public domain
-** Adapted and optimized for MySQL by
-** Michael Widenius, Sinisa Milivojevic, Jani Tolonen
-** -w --where added 9/10/98 by Jim Faucette
-** slave code by David Saez Padros <david@ols.es>
-** master/autocommit code by Brian Aker <brian@tangent.org>
-** SSL by
-** Andrei Errapart <andreie@no.spam.ee>
-** Tonu Samuel  <tonu@please.do.not.remove.this.spam.ee>
-** XML by Gary Huntress <ghuntress@mediaone.net> 10/10/01, cleaned up
-** and adapted to mysqldump 05/11/01 by Jani Tolonen
-** Added --single-transaction option 06/06/2002 by Peter Zaitsev
-** 10 Jun 2003: SET NAMES and --no-set-names by Alexander Barkov
-*/
+// Dump a table's contents and format to an ASCII file.
 
 #define DUMP_VERSION "10.13"
 
@@ -68,6 +47,7 @@
 #include "my_io.h"
 #include "my_macros.h"
 #include "my_sys.h"
+#include "my_systime.h"  // GETDATE_DATE_TIME
 #include "my_user.h"
 #include "mysql.h"
 #include "mysql/service_mysql_alloc.h"
@@ -1365,8 +1345,9 @@ static FILE *open_sql_file_for_table(const char *table, int flags) {
   FILE *res;
   char filename[FN_REFLEN], tmp_path[FN_REFLEN];
   convert_dirname(tmp_path, path, NullS);
-  res = my_fopen(fn_format(filename, table, tmp_path, ".sql", 4), flags,
-                 MYF(MY_WME));
+  res = my_fopen(fn_format(filename, table, tmp_path, ".sql",
+                           MYF(MY_UNPACK_FILENAME | MY_APPEND_EXT)),
+                 flags, MYF(MY_WME));
   return res;
 }
 
@@ -1464,7 +1445,10 @@ static int connect_to_db(char *host, char *user, char *passwd) {
   verbose_msg("-- Connecting to %s...\n", host ? host : "localhost");
   mysql_init(&mysql_connection);
   if (opt_compress) mysql_options(&mysql_connection, MYSQL_OPT_COMPRESS, NullS);
-  SSL_SET_OPTIONS(&mysql_connection);
+  if (SSL_SET_OPTIONS(&mysql_connection)) {
+    fprintf(stderr, "%s", SSL_SET_OPTIONS_ERROR);
+    DBUG_RETURN(1);
+  }
   if (opt_protocol)
     mysql_options(&mysql_connection, MYSQL_OPT_PROTOCOL, (char *)&opt_protocol);
   if (opt_bind_addr)
@@ -2536,7 +2520,6 @@ static uint get_table_structure(char *table, char *db, char *table_type,
       "TABLE_SCHEMA = '%s' AND TABLE_NAME = '%s' "
       "ORDER BY ORDINAL_POSITION";
   FILE *sql_file = md_result_file;
-  size_t len;
   bool is_log_table;
   bool is_replication_metadata_table;
   unsigned int colno;
@@ -2567,12 +2550,8 @@ static uint get_table_structure(char *table, char *db, char *table_type,
 
   verbose_msg("-- Retrieving table structure for table %s...\n", table);
 
-  len = snprintf(query_buff, sizeof(query_buff), "SET SQL_QUOTE_SHOW_CREATE=%d",
-                 (opt_quoted || opt_keywords));
-  if (!create_options)
-    my_stpcpy(query_buff + len,
-              " ,SQL_MODE=concat(@@sql_mode, _utf8mb4 "
-              "',NO_KEY_OPTIONS,NO_TABLE_OPTIONS,NO_FIELD_OPTIONS') ");
+  snprintf(query_buff, sizeof(query_buff), "SET SQL_QUOTE_SHOW_CREATE=%d",
+           (opt_quoted || opt_keywords));
 
   result_table = quote_name(table, table_buff, 1);
   opt_quoted_table = quote_name(table, table_buff2, 0);
@@ -3350,7 +3329,7 @@ static bool dump_column_statistics_for_table(char *table_name, char *db_name) {
     } else {
       fprintf(sql_file,
               "/*!80002 ANALYZE TABLE %s UPDATE HISTOGRAM ON %s "
-              "WITH %s BUCKETS; */;\n",
+              "WITH %s BUCKETS */;\n",
               quoted_table, quoted_column, row[1]);
     }
   }
@@ -3533,7 +3512,8 @@ static void dump_table(char *table, char *db) {
     */
     convert_dirname(tmp_path, path, NullS);
     my_load_path(tmp_path, tmp_path, NULL);
-    fn_format(filename, table, tmp_path, ".txt", MYF(MY_UNPACK_FILENAME));
+    fn_format(filename, table, tmp_path, ".txt",
+              MYF(MY_UNPACK_FILENAME | MY_APPEND_EXT));
 
     /* Must delete the file that 'INTO OUTFILE' will write to */
     my_delete(filename, MYF(0));

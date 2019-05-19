@@ -50,9 +50,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "log0log.h"
 #include "m_string.h"
 #include "mach0data.h"
-#include "my_compiler.h"
-#include "my_dbug.h"
-#include "my_inttypes.h"
 #include "que0que.h"
 #include "rem0cmp.h"
 #include "row0ins.h"
@@ -63,6 +60,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0rec.h"
 #include "trx0undo.h"
 #include "usr0sess.h"
+
+#include "my_dbug.h"
 
 /*************************************************************************
 IMPORTANT NOTE: Any operation that generates redo MUST check that there
@@ -97,7 +96,6 @@ ins_node_t *ins_node_create(
   node->select = NULL;
 
   node->trx_id = 0;
-  node->duplicate = NULL;
 
   node->entry_sys_heap = mem_heap_create(128);
 
@@ -194,7 +192,6 @@ void ins_node_set_new_row(
   node->state = INS_NODE_SET_IX_LOCK;
   node->index = NULL;
   node->entry = NULL;
-  node->duplicate = NULL;
 
   node->row = row;
 
@@ -326,7 +323,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 {
   const rec_t *rec;
   upd_t *update;
-  dberr_t err;
+  dberr_t err = DB_SUCCESS;
   btr_cur_t *cursor = btr_pcur_get_btr_cur(pcur);
   TABLE *mysql_table = NULL;
   ut_ad(cursor->index->is_clustered());
@@ -343,9 +340,12 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
     ut_ad(thr->prebuilt->trx == thr_get_trx(thr));
   }
 
-  update =
-      row_upd_build_difference_binary(cursor->index, entry, rec, NULL, true,
-                                      thr_get_trx(thr), heap, mysql_table);
+  update = row_upd_build_difference_binary(cursor->index, entry, rec, NULL,
+                                           true, thr_get_trx(thr), heap,
+                                           mysql_table, &err);
+  if (err != DB_SUCCESS) {
+    return (err);
+  }
   if (mode != BTR_MODIFY_TREE) {
     ut_ad((mode & ~BTR_ALREADY_S_LATCHED) == BTR_MODIFY_LEAF);
 
@@ -922,8 +922,10 @@ func_exit:
 /** Perform referential actions or checks when a parent row is deleted or
  updated and the constraint had an ON DELETE or ON UPDATE condition which was
  not RESTRICT.
- @return DB_SUCCESS, DB_LOCK_WAIT, or error code */
-static MY_ATTRIBUTE((warn_unused_result)) dberr_t
+ @return DB_SUCCESS, DB_LOCK_WAIT, or error code
+ Disable inlining because of a bug in gcc8 which may lead to stack exhaustion.
+*/
+static NO_INLINE MY_ATTRIBUTE((warn_unused_result)) dberr_t
     row_ins_foreign_check_on_constraint(
         que_thr_t *thr,          /*!< in: query thread whose run_node
                                  is an update node */
@@ -1123,6 +1125,10 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   if (table->fts) {
     doc_id = fts_get_doc_id_from_rec(table, clust_rec, clust_index, tmp_heap);
   }
+  if (cascade->is_delete && foreign->v_cols != NULL &&
+      foreign->v_cols->size() > 0 && table->vc_templ == NULL) {
+    innobase_init_vc_templ(table);
+  }
 
   if (node->is_delete ? (foreign->type & DICT_FOREIGN_ON_DELETE_SET_NULL)
                       : (foreign->type & DICT_FOREIGN_ON_UPDATE_SET_NULL)) {
@@ -1245,7 +1251,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
   mtr_commit(mtr);
 
-  ut_a(cascade->pcur->rel_pos == BTR_PCUR_ON);
+  ut_a(cascade->pcur->m_rel_pos == BTR_PCUR_ON);
 
   cascade->state = UPD_NODE_UPDATE_CLUSTERED;
 
@@ -1703,6 +1709,11 @@ do_possible_lock_wait:
 
     lock_wait_suspend_thread(thr);
 
+    if (trx->error_state != DB_SUCCESS) {
+      err = trx->error_state;
+      goto exit_func;
+    }
+
     thr->lock_state = QUE_THR_LOCK_NOLOCK;
 
     DBUG_PRINT("to_be_dropped", ("table: %s", check_table->name.m_name));
@@ -1755,6 +1766,9 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
   trx = thr_get_trx(thr);
 
+  if (trx->check_foreigns == FALSE) {
+    return (DB_SUCCESS);
+  }
   DEBUG_SYNC_C_IF_THD(thr_get_trx(thr)->mysql_thd,
                       "foreign_constraint_check_for_ins");
 
@@ -1980,7 +1994,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
       if (row_ins_dupl_error_with_rec(rec, entry, index, offsets)) {
         err = DB_DUPLICATE_KEY;
 
-        thr_get_trx(thr)->error_info = index;
+        thr_get_trx(thr)->error_index = index;
 
         /* If the duplicate is on hidden FTS_DOC_ID,
         state so in the error log */
@@ -2133,13 +2147,6 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
       offsets =
           rec_get_offsets(rec, cursor->index, offsets, ULINT_UNDEFINED, &heap);
 
-      ulint lock_type;
-
-      lock_type = ((trx->isolation_level <= TRX_ISO_READ_COMMITTED) ||
-                   (cursor->index->table->skip_gap_locks()))
-                      ? LOCK_REC_NOT_GAP
-                      : LOCK_ORDINARY;
-
       /* We set a lock on the possible duplicate: this
       is needed in logical logging of MySQL to make
       sure that in roll-forward we get the same duplicate
@@ -2154,12 +2161,13 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
         duplicates ( REPLACE, LOAD DATAFILE REPLACE,
         INSERT ON DUPLICATE KEY UPDATE). */
 
-        err =
-            row_ins_set_exclusive_rec_lock(lock_type, btr_cur_get_block(cursor),
-                                           rec, cursor->index, offsets, thr);
+        err = row_ins_set_exclusive_rec_lock(LOCK_REC_NOT_GAP,
+                                             btr_cur_get_block(cursor), rec,
+                                             cursor->index, offsets, thr);
       } else {
-        err = row_ins_set_shared_rec_lock(lock_type, btr_cur_get_block(cursor),
-                                          rec, cursor->index, offsets, thr);
+        err = row_ins_set_shared_rec_lock(LOCK_REC_NOT_GAP,
+                                          btr_cur_get_block(cursor), rec,
+                                          cursor->index, offsets, thr);
       }
 
       switch (err) {
@@ -2172,7 +2180,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
       if (row_ins_dupl_error_with_rec(rec, entry, cursor->index, offsets)) {
       duplicate:
-        trx->error_info = cursor->index;
+        trx->error_index = cursor->index;
         err = DB_DUPLICATE_KEY;
         goto func_exit;
       }
@@ -2457,7 +2465,7 @@ and return. don't execute actual insert. */
         case DB_SUCCESS_LOCKED_REC:
         case DB_DUPLICATE_KEY:
           if (thr != NULL) {
-            thr_get_trx(thr)->error_info = cursor->index;
+            thr_get_trx(thr)->error_index = cursor->index;
           }
       }
     } else {
@@ -2816,7 +2824,13 @@ dberr_t row_ins_sec_index_entry_low(ulint flags, ulint mode,
   This prevents a concurrent change of index->online_status.
   The memory object cannot be freed as long as we have an open
   reference to the table, or index->table->n_ref_count > 0. */
-  const bool check = !index->is_committed();
+  bool check = !index->is_committed();
+
+  DBUG_EXECUTE_IF("idx_mimic_not_committed", {
+    check = true;
+    mode = BTR_MODIFY_TREE;
+  });
+
   if (check) {
     DEBUG_SYNC_C("row_ins_sec_index_enter");
     if (mode == BTR_MODIFY_LEAF) {
@@ -2963,40 +2977,6 @@ dberr_t row_ins_sec_index_entry_low(ulint flags, ulint mode,
           __FILE__, __LINE__, &mtr);
     }
   }
-
-  if (!(flags & BTR_NO_LOCKING_FLAG) && dict_index_is_unique(index) &&
-      thr_get_trx(thr)->duplicates &&
-      thr_get_trx(thr)->isolation_level >= TRX_ISO_REPEATABLE_READ) {
-    /* When using the REPLACE statement or ON DUPLICATE clause, a
-    gap lock is taken on the position of the to-be-inserted record,
-    to avoid other concurrent transactions from inserting the same
-    record. */
-
-    dberr_t err;
-    const rec_t *rec = page_rec_get_next_const(btr_cur_get_rec(&cursor));
-
-    ut_ad(!page_rec_is_infimum(rec));
-
-    offsets =
-        rec_get_offsets(rec, index, offsets, ULINT_UNDEFINED, &offsets_heap);
-
-    err = row_ins_set_exclusive_rec_lock(LOCK_GAP, btr_cur_get_block(&cursor),
-                                         rec, index, offsets, thr);
-
-    switch (err) {
-      case DB_SUCCESS:
-      case DB_SUCCESS_LOCKED_REC:
-        if (thr_get_trx(thr)->error_state != DB_DUPLICATE_KEY) {
-          break;
-        }
-        /* Fall through (skip actual insert) after we have
-        successfully acquired the gap lock. */
-      default:
-        goto func_exit;
-    }
-  }
-
-  ut_ad(thr_get_trx(thr)->error_state == DB_SUCCESS);
 
   if (dup_chk_only) {
     goto func_exit;
@@ -3490,10 +3470,6 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
 
   DBUG_PRINT("row_ins", ("table: %s", node->table->name.m_name));
 
-  if (node->duplicate) {
-    thr_get_trx(thr)->error_state = DB_DUPLICATE_KEY;
-  }
-
   if (node->state == INS_NODE_ALLOC_ROW_ID) {
     row_ins_alloc_row_id_step(node);
 
@@ -3520,42 +3496,12 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
         case DB_SUCCESS:
           break;
         case DB_DUPLICATE_KEY:
-          ut_ad(dict_index_is_unique(node->index));
-
-          if (thr_get_trx(thr)->isolation_level >= TRX_ISO_REPEATABLE_READ &&
-              thr_get_trx(thr)->duplicates) {
-            /* When we are in REPLACE statement or
-            INSERT ..  ON DUPLICATE UPDATE
-            statement, we process all the
-            unique secondary indexes, even after we
-            encounter a duplicate error. This is
-            done to take necessary gap locks in
-            secondary indexes to block concurrent
-            transactions from inserting the
-            searched records. */
-            if (!node->duplicate) {
-              /* Save 1st dup error. Ignore
-              subsequent dup errors. */
-              node->duplicate = node->index;
-              thr_get_trx(thr)->error_state = DB_DUPLICATE_KEY;
-            }
-            break;
-          }
-          // fall through
+          thr_get_trx(thr)->error_state = DB_DUPLICATE_KEY;
+          thr_get_trx(thr)->error_index = node->index;
+        // fall through
         default:
           DBUG_RETURN(err);
       }
-    }
-
-    if (node->duplicate && node->table->is_temporary()) {
-      ut_ad(thr_get_trx(thr)->error_state == DB_DUPLICATE_KEY);
-      /* For TEMPORARY TABLE, we won't lock anything,
-      so we can simply break here instead of requiring
-      GAP locks for other unique secondary indexes,
-      pretending we have consumed all indexes. */
-      node->index = NULL;
-      node->entry = NULL;
-      break;
     }
 
     node->index = node->index->next();
@@ -3569,26 +3515,14 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
       node->index = node->index->next();
       node->entry = UT_LIST_GET_NEXT(tuple_list, node->entry);
     }
-
-    /* After encountering a duplicate key error, we process
-    remaining indexes just to place gap locks and no actual
-    insertion will take place.  These gap locks are needed
-    only for unique indexes.  So skipping non-unique indexes. */
-    if (node->duplicate) {
-      while (node->index && !dict_index_is_unique(node->index)) {
-        node->index = node->index->next();
-        node->entry = UT_LIST_GET_NEXT(tuple_list, node->entry);
-      }
-      thr_get_trx(thr)->error_state = DB_DUPLICATE_KEY;
-    }
   }
 
   ut_ad(node->entry == NULL);
 
-  thr_get_trx(thr)->error_info = node->duplicate;
+  thr_get_trx(thr)->error_index = NULL;
   node->state = INS_NODE_ALLOC_ROW_ID;
 
-  DBUG_RETURN(node->duplicate ? DB_DUPLICATE_KEY : DB_SUCCESS);
+  DBUG_RETURN(DB_SUCCESS);
 }
 
 /** Inserts a row to a table. This is a high-level function used in SQL

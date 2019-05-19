@@ -35,8 +35,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "data0data.h"
 #include "ha_prototypes.h"
-#include "my_compiler.h"
-#include "my_inttypes.h"
+
 #ifndef UNIV_HOTBACKUP
 #include "btr0cur.h"
 #include "dict0dict.h"
@@ -605,12 +604,12 @@ big_rec_t *dtuple_convert_big_rec(dict_index_t *index, /*!< in: index */
     /* Clear the extern field reference (BLOB pointer). */
     memset(data + local_prefix_len, 0, BTR_EXTERN_FIELD_REF_SIZE);
 
-    if (upd != nullptr && upd->is_modified(longest_i)) {
+    if (upd != nullptr &&
+        ((uf = upd->get_field_by_field_no(longest_i, index)) != nullptr)) {
       /* When the externally stored LOB is going to be
       updated, the old LOB reference (BLOB pointer) can be
       used to access the old LOB object. So copy the LOB
       reference here. */
-      uf = upd->get_field_by_field_no(longest_i, index);
 
       if (dfield_is_ext(&uf->old_val)) {
         byte *field_ref = static_cast<byte *>(dfield_get_data(&uf->old_val)) +
@@ -756,7 +755,7 @@ byte *dfield_t::blobref() const {
   return (static_cast<byte *>(data) + len - BTR_EXTERN_FIELD_REF_SIZE);
 }
 
-ulint dfield_t::lob_version() const {
+uint32_t dfield_t::lob_version() const {
   ut_ad(ext);
   byte *field_ref = blobref();
 

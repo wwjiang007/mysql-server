@@ -1,4 +1,4 @@
-# Copyright (c) 2012, 2018, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -43,4 +43,9 @@ TARGET_LINK_LIBRARIES(mysys_ssl dbug strings ${SSL_LIBRARIES} ${ZLIB_LIBRARY})
 # Needed to resolve OpenSSL dependency on Windows
 IF(WIN32 AND NOT WITH_SSL STREQUAL "wolfssl")
   TARGET_LINK_LIBRARIES(mysys_ssl crypt32)
+ENDIF()
+
+# MD5_Init() MD5_Update() MD5_Final() are all deprecated
+IF(SOLARIS AND CMAKE_COMPILER_IS_GNUCXX)
+  ADD_COMPILE_FLAGS(my_md5.cc COMPILE_FLAGS "-Wno-deprecated-declarations")
 ENDIF()

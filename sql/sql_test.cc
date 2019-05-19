@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -94,7 +94,7 @@ void print_where(Item *cond, const char *info, enum_query_type query_type) {
   char buff[256];
   String str(buff, sizeof(buff), system_charset_info);
   str.length(0);
-  if (cond) cond->print(&str, query_type);
+  if (cond) cond->print(current_thd, &str, query_type);
   str.append('\0');
 
   DBUG_LOCK_FILE;
@@ -183,13 +183,17 @@ void print_keyuse_array(Opt_trace_context *trace,
                        "ref_table_rows= %lu keypart_map= %0lx",
                        keyuse.optimize, keyuse.used_tables,
                        (ulong)keyuse.ref_table_rows, keyuse.keypart_map));
+
     Opt_trace_object(trace)
         .add_utf8_table(keyuse.table_ref)
-        .add_utf8("field", (keyuse.keypart == FT_KEYPART)
-                               ? "<fulltext>"
-                               : keyuse.table_ref->table->key_info[keyuse.key]
-                                     .key_part[keyuse.keypart]
-                                     .field->field_name)
+        .add_utf8("field",
+                  (keyuse.keypart == FT_KEYPART)
+                      ? "<fulltext>"
+                      : get_field_name_or_expression(
+                            keyuse.table_ref->table->in_use,
+                            keyuse.table_ref->table->key_info[keyuse.key]
+                                .key_part[keyuse.keypart]
+                                .field))
         .add("equals", keyuse.val)
         .add("null_rejecting", keyuse.null_rejecting);
   }

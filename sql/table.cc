@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -75,6 +76,7 @@
 #include "sql/derror.h"          // ER_THD
 #include "sql/error_handler.h"   // Strict_error_handler
 #include "sql/field.h"
+#include "sql/filesort.h"  // filesort_free_buffers
 #include "sql/gis/srid.h"
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"  // and_conds
@@ -94,7 +96,8 @@
 #include "sql/query_options.h"
 #include "sql/query_result.h"  // Query_result
 #include "sql/sql_base.h"
-#include "sql/sql_class.h"  // THD
+#include "sql/sql_check_constraint.h"  // Sql_table_check_constraint
+#include "sql/sql_class.h"             // THD
 #include "sql/sql_error.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_opt_exec_shared.h"
@@ -111,6 +114,7 @@
 #include "sql/thd_raii.h"
 #include "sql/thr_malloc.h"
 #include "sql/trigger_def.h"
+#include "sql_const.h"
 #include "sql_string.h"
 #include "template_utils.h"  // down_cast
 #include "thr_mutex.h"
@@ -348,13 +352,16 @@ TABLE_CATEGORY get_table_category(const LEX_STRING &db,
   @param table_name  table name.
   @param key         table cache key (db \0 table_name \0...)
   @param key_length  length of the key
+  @param open_secondary  true if the TABLE_SHARE represents a table
+                         in a secondary storage engine
 
   @return            pointer to allocated table share
     @retval NULL     error (out of memory, too long path name)
 */
 
 TABLE_SHARE *alloc_table_share(const char *db, const char *table_name,
-                               const char *key, size_t key_length) {
+                               const char *key, size_t key_length,
+                               bool open_secondary) {
   MEM_ROOT mem_root;
   TABLE_SHARE *share = NULL;
   char *key_buff, *path_buff;
@@ -388,7 +395,7 @@ TABLE_SHARE *alloc_table_share(const char *db, const char *table_name,
                        &path_buff, path_length + 1, &cache_element_array,
                        table_cache_instances * sizeof(*cache_element_array),
                        NULL)) {
-    new (share) TABLE_SHARE();
+    new (share) TABLE_SHARE(refresh_version, open_secondary);
 
     share->set_table_cache_key(key_buff, key, key_length);
 
@@ -397,8 +404,6 @@ TABLE_SHARE *alloc_table_share(const char *db, const char *table_name,
     my_stpcpy(share->path.str, path);
     share->normalized_path.str = share->path.str;
     share->normalized_path.length = path_length;
-
-    share->version = refresh_version;
 
     /*
       Since alloc_table_share() can be called without any locking (for
@@ -485,17 +490,35 @@ void init_tmp_table_share(THD *thd, TABLE_SHARE *share, const char *key,
   DBUG_VOID_RETURN;
 }
 
-// NOTE: This has a copy in pfs_server_stubs.cc.
-TABLE_SHARE::TABLE_SHARE()
-    : row_type(ROW_TYPE_DEFAULT),
-      real_row_type(ROW_TYPE_DEFAULT),
-      stats_auto_recalc(HA_STATS_AUTO_RECALC_DEFAULT) {}
-
 Key_map TABLE_SHARE::usable_indexes(const THD *thd) const {
   Key_map usable_indexes(keys_in_use);
   if (!thd->optimizer_switch_flag(OPTIMIZER_SWITCH_USE_INVISIBLE_INDEXES))
     usable_indexes.intersect(visible_indexes);
   return usable_indexes;
+}
+
+#ifndef DBUG_OFF
+/**
+  Assert that the #LOCK_open mutex is held when the reference count of
+  a TABLE_SHARE is accessed.
+
+  @param share the TABLE_SHARE
+  @return true if the assertion holds, terminates the process otherwise
+*/
+bool assert_ref_count_is_locked(const TABLE_SHARE *share) {
+  // The mutex is not needed while the TABLE_SHARE is being
+  // constructed, or if it is for a temporary table.
+  if (share->table_category != TABLE_UNKNOWN_CATEGORY &&
+      share->tmp_table == NO_TMP_TABLE) {
+    mysql_mutex_assert_owner(&LOCK_open);
+  }
+  return true;
+}
+#endif
+
+void TABLE_SHARE::clear_version() {
+  table_cache_manager.assert_owner_all_and_tdc();
+  m_version = 0;
 }
 
 /**
@@ -568,7 +591,7 @@ void TABLE_SHARE::destroy() {
 void free_table_share(TABLE_SHARE *share) {
   DBUG_ENTER("free_table_share");
   DBUG_PRINT("enter", ("table: %s.%s", share->db.str, share->table_name.str));
-  DBUG_ASSERT(share->ref_count == 0);
+  DBUG_ASSERT(share->ref_count() == 0);
 
   if (share->m_flush_tickets.is_empty()) {
     /*
@@ -1141,7 +1164,7 @@ static int make_field_from_frm(THD *thd, TABLE_SHARE *share,
   const CHARSET_INFO *charset = NULL;
   Field::geometry_type geom_type = Field::GEOM_GEOMETRY;
   LEX_STRING comment;
-  Generated_column *gcol_info = 0;
+  Value_generator *gcol_info = nullptr;
   bool fld_stored_in_db = true;
   Field *reg_field;
 
@@ -1189,7 +1212,7 @@ static int make_field_from_frm(THD *thd, TABLE_SHARE *share,
                         1 - field is physically stored
         byte 5-...  = generated column expression (text data)
       */
-      gcol_info = new (*THR_MALLOC) Generated_column();
+      gcol_info = new (thd->mem_root) Value_generator();
       if ((uint)(*gcol_screen_pos)[0] != 1) return 4;
 
       gcol_info_length = uint2korr(*gcol_screen_pos + 1);
@@ -2218,70 +2241,123 @@ err:
 //////////////////////////////////////////////////////////////////////////
 
 /**
-  @brief validate_generated_expr
-    Validate the generated expression to see whether there are invalid
-    Item objects.
-  @note
-    Needs to be done after fix_fields to allow checking references
-    to other generated columns.
+  Validate the expression to see whether there are invalid Item objects.
 
-  @param field  Pointer of generated column
+  Needs to be done after fix_fields to allow checking references
+  to other generated columns, default value expressions or check constraints.
+
+  @param expr         Pointer to the expression
+  @param source       Source of value generator(a generated column, a regular
+                      column with generated default value or
+                      a check constraint).
+  @param source_name  Name of the source (generated column, a reguler column
+                      with generated default value or a check constraint).
+  @param column_index The column order.
 
   @retval true  The generated expression has some invalid objects
   @retval false No illegal objects in the generated expression
  */
-static bool validate_generated_expr(Field *field) {
-  DBUG_ENTER("validate_generate_expr");
-  Item *expr = field->gcol_info->expr_item;
-  const char *field_name = field->field_name;
+static bool validate_value_generator_expr(Item *expr,
+                                          Value_generator_source source,
+                                          const char *source_name,
+                                          int column_index) {
+  DBUG_ENTER("validate_value_generator_expr");
   DBUG_ASSERT(expr);
 
-  /**
-    These are not allowed:
-    1) SP/UDF
-    2) System variables and parameters
-    3) ROW values
-    4) Subquery (already checked by parser, assert the condition)
-   */
-  if (expr->has_stored_program() ||                                  // 1)
-      (expr->used_tables() & (RAND_TABLE_BIT | INNER_TABLE_BIT)) ||  // 2)
-      (expr->cols() != 1))                                           // 3)
-  {
-    my_error(ER_GENERATED_COLUMN_FUNCTION_IS_NOT_ALLOWED, MYF(0), field_name);
+  // Map to get actual error code from error_type for the source.
+  enum error_type { ER_NAME_FUNCTION, ER_FUNCTION, ER_VARIABLES, MAX_ERROR };
+  uint error_code_map[][MAX_ERROR] = {
+      // Generated column errors.
+      {ER_GENERATED_COLUMN_NAMED_FUNCTION_IS_NOT_ALLOWED,
+       ER_GENERATED_COLUMN_FUNCTION_IS_NOT_ALLOWED,
+       ER_GENERATED_COLUMN_VARIABLES},
+      // Default expressions errors.
+      {ER_DEFAULT_VAL_GENERATED_NAMED_FUNCTION_IS_NOT_ALLOWED,
+       ER_DEFAULT_VAL_GENERATED_FUNCTION_IS_NOT_ALLOWED,
+       ER_DEFAULT_VAL_GENERATED_VARIABLES},
+      // Check constraint errors.
+      {ER_CHECK_CONSTRAINT_NAMED_FUNCTION_IS_NOT_ALLOWED,
+       ER_CHECK_CONSTRAINT_FUNCTION_IS_NOT_ALLOWED,
+       ER_CHECK_CONSTRAINT_VARIABLES}};
+  uint err_code = error_code_map[source][ER_NAME_FUNCTION];
+
+  // No non-deterministic functions are allowed as GC but most of them are
+  // allowed as default value expressions
+  if ((expr->used_tables() & RAND_TABLE_BIT &&
+       (source == VGS_GENERATED_COLUMN))) {
+    Item_func *func_item;
+    if (expr->type() == Item::FUNC_ITEM &&
+        ((func_item = down_cast<Item_func *>(expr)))) {
+      my_error(err_code, MYF(0), source_name, func_item->func_name());
+      DBUG_RETURN(true);
+    } else {
+      my_error(error_code_map[source][ER_FUNCTION], MYF(0), source_name);
+      DBUG_RETURN(true);
+    }
+  }
+  // System variables or parameters are not allowed
+  else if (expr->used_tables() & INNER_TABLE_BIT) {
+    my_error(error_code_map[source][ER_VARIABLES], MYF(0), source_name);
     DBUG_RETURN(true);
   }
-  DBUG_ASSERT(!expr->has_subquery());  // 4)
+
+  // Assert that we aren't dealing with ROW values (rejected in
+  // pre_validate_value_generator_expr()).
+  DBUG_ASSERT(expr->cols() == 1);
+
+  // Sub-queries are not allowed (already checked by parser, hence the assert)
+  DBUG_ASSERT(!expr->has_subquery());
   /*
     Walk through the Item tree, checking the validity of items
-    belonging to the generated column.
+    belonging to the expression.
   */
-  int args[2];
-  args[0] = field->field_index;
-  args[1] = ER_GENERATED_COLUMN_FUNCTION_IS_NOT_ALLOWED;  // default error code.
-  if (expr->walk(&Item::check_gcol_func_processor, Item::WALK_POSTFIX,
-                 pointer_cast<uchar *>(&args))) {
-    my_error(args[1], MYF(0), field_name);
+  Check_function_as_value_generator_parameters checker_args(err_code, source);
+  checker_args.col_index = column_index;
+  if (expr->walk(&Item::check_function_as_value_generator, enum_walk::POSTFIX,
+                 pointer_cast<uchar *>(&checker_args))) {
+    my_error(checker_args.err_code, MYF(0), source_name,
+             checker_args.banned_function_name);
     DBUG_RETURN(true);
+  }
+
+  // Stored programs are not allowed. This case is already covered, but still
+  // keeping it here as a safetynet.
+  if (expr->has_stored_program()) {
+    /* purecov: begin deadcode */
+    DBUG_ASSERT(false);
+    my_error(err_code, MYF(0), source_name, "stored progam");
+    DBUG_RETURN(true);
+    /* purecov: end */
   }
 
   DBUG_RETURN(false);
 }
 
 /**
-  @brief  fix_fields_gcol_func
-    Process generated expression of the field.
+  Process the generated expression, generated default value of the column or
+  check constraint expression.
 
-  @param thd                The thread object
-  @param field              The processed field
+  @param thd             The thread object
+  @param table           The table to which the column belongs
+  @param val_generator   The expression to unpack
+  @param source          Source of value generator(a generated column, a regular
+                         column with generated default value or
+                         a check constraint).
+  @param source_name     Name of the source (generated column, a reguler column
+                         with generated default value or a check constraint).
+  @param field           Field to which the val_generator is attached to for
+                         generated columns and default expression.
 
   @retval true An error occurred, something was wrong with the function.
   @retval false Ok, generated expression is fixed sucessfully
  */
-static bool fix_fields_gcol_func(THD *thd, Field *field) {
+static bool fix_value_generators_fields(THD *thd, TABLE *table,
+                                        Value_generator *val_generator,
+                                        Value_generator_source source,
+                                        const char *source_name, Field *field) {
   uint dir_length, home_dir_length;
   bool result = true;
-  Item *func_expr = field->gcol_info->expr_item;
-  TABLE *table = field->table;
+  Item *func_expr = val_generator->expr_item;
   TABLE_LIST tables;
   TABLE_LIST *save_table_list, *save_first_table, *save_last_table;
   int error;
@@ -2290,9 +2366,20 @@ static bool fix_fields_gcol_func(THD *thd, Field *field) {
   char *db_name;
   char db_name_string[FN_REFLEN];
   bool save_use_only_table_context;
+  std::unique_ptr<Functional_index_error_handler>
+      functional_index_error_handler;
   enum_mark_columns save_mark_used_columns = thd->mark_used_columns;
   DBUG_ASSERT(func_expr);
-  DBUG_ENTER("fix_fields_gcol_func");
+  DBUG_ENTER("fix_value_generators_fields");
+
+  // Insert a error handler that takes care of converting column names to
+  // functional index names. Since functional indexes is implemented as
+  // indexed hidden generated columns, we may end up printing out the
+  // auto-generated column name if we don't have an extra error handler.
+  if (source == VGS_GENERATED_COLUMN)
+    functional_index_error_handler =
+        std::unique_ptr<Functional_index_error_handler>(
+            new Functional_index_error_handler(field, thd));
 
   /*
     Set-up the TABLE_LIST object to be a list with a single table
@@ -2319,11 +2406,24 @@ static bool fix_fields_gcol_func(THD *thd, Field *field) {
   save_last_table = context->last_name_resolution_table;
   context->table_list = &tables;
   context->first_name_resolution_table = &tables;
-  context->last_name_resolution_table = NULL;
-  func_expr->walk(&Item::change_context_processor, Item::WALK_POSTFIX,
+  context->last_name_resolution_table = nullptr;
+  func_expr->walk(&Item::change_context_processor, enum_walk::POSTFIX,
                   (uchar *)context);
   save_where = thd->where;
-  thd->where = "generated column function";
+
+  dd::String_type where_str;
+  if (source == VGS_GENERATED_COLUMN || source == VGS_DEFAULT_EXPRESSION) {
+    thd->where = field->is_field_for_functional_index()
+                     ? "functional index"
+                     : (source == VGS_GENERATED_COLUMN)
+                           ? "generated column function"
+                           : "default value expression";
+  } else {
+    DBUG_ASSERT(source == VGS_CHECK_CONSTRAINT);
+    where_str =
+        "check constraint " + dd::String_type(source_name) + " expression";
+    thd->where = where_str.c_str();
+  }
 
   /* Save the context before fixing the fields*/
   save_use_only_table_context = thd->lex->use_only_table_context;
@@ -2350,15 +2450,15 @@ static bool fix_fields_gcol_func(THD *thd, Field *field) {
   context->last_name_resolution_table = save_last_table;
 
   /*
-    Above, 'context' is either the one of unpack_gcol_info()'s temporary fresh
-    LEX 'new_lex', or the one of the top query as used in
-    TABLE::refix_gc_items(). None of them reflects where the gcol is situated
-    in the query.  Moreover, a gcol_info may be shared by N references to the
-    same gcol, each ref being in a different context (top query,
-    subquery). So, underlying items are not situated in a defined place: give
-    them a null context.
+    Above, 'context' is either the one of unpack_value_generator()'s temporary
+    fresh LEX 'new_lex', or the one of the top query as used in
+    TABLE::refix_value_generator_items(). None of them reflects where the val
+    generator is situated in the query.  Moreover, a gcol_info may be shared
+    by N references to the same gcol, each ref being in a different context
+    (top query, subquery). So, underlying items are not situated in a defined
+    place: give them a null context.
   */
-  func_expr->walk(&Item::change_context_processor, Item::WALK_POSTFIX, nullptr);
+  func_expr->walk(&Item::change_context_processor, enum_walk::POSTFIX, nullptr);
 
   if (unlikely(error)) {
     DBUG_PRINT("info",
@@ -2367,9 +2467,11 @@ static bool fix_fields_gcol_func(THD *thd, Field *field) {
   }
   thd->where = save_where;
   /*
-    Checking if all items are valid to be part of the generated column.
+    Checking if all items are valid to be part of the expression.
   */
-  if (validate_generated_expr(field)) goto end;
+  if (validate_value_generator_expr(func_expr, source, source_name,
+                                    field ? field->field_index : 0))
+    goto end;
 
   // Virtual columns expressions that substitute themselves are invalid
   DBUG_ASSERT(new_func == func_expr);
@@ -2390,7 +2492,7 @@ end:
   @retval true if error
  */
 
-bool Generated_column::register_base_columns(TABLE *table) {
+bool Value_generator::register_base_columns(TABLE *table) {
   DBUG_ENTER("register_base_columns");
   my_bitmap_map *bitbuf = static_cast<my_bitmap_map *>(
       alloc_root(&table->mem_root, bitmap_buffer_size(table->s->fields)));
@@ -2400,7 +2502,7 @@ bool Generated_column::register_base_columns(TABLE *table) {
   MY_BITMAP *save_old_read_set = table->read_set;
   table->read_set = &base_columns_map;
   Mark_field mark_fld(MARK_COLUMNS_TEMP);
-  expr_item->walk(&Item::mark_field_in_map, Item::WALK_PREFIX,
+  expr_item->walk(&Item::mark_field_in_map, enum_walk::PREFIX,
                   (uchar *)&mark_fld);
   table->read_set = save_old_read_set;
 
@@ -2414,31 +2516,31 @@ bool Generated_column::register_base_columns(TABLE *table) {
   DBUG_RETURN(false);
 }
 
-void Generated_column::dup_expr_str(MEM_ROOT *root, const char *src,
-                                    size_t len) {
+void Value_generator::dup_expr_str(MEM_ROOT *root, const char *src,
+                                   size_t len) {
   expr_str.str = pointer_cast<char *>(memdup_root(root, src, len));
   expr_str.length = len;
 }
 
-void Generated_column::print_expr(THD *thd, String *out) {
+void Value_generator::print_expr(THD *thd, String *out) {
   out->length(0);
   Sql_mode_parse_guard parse_guard(thd);
   // Printing db and table name is useless
   auto flags = enum_query_type(QT_NO_DB | QT_NO_TABLE | QT_FORCE_INTRODUCERS);
-  expr_item->print(out, flags);
+  expr_item->print(thd, out, flags);
 }
 
-/*
-   Unpack the definition of a virtual column. Parses the text obtained from
-   TABLE_SHARE and produces an Item.
-*/
-bool unpack_gcol_info(THD *thd, TABLE *table, Field *field,
-                      bool is_create_table, bool *error_reported) {
-  DBUG_ENTER("unpack_gcol_info");
-  DBUG_ASSERT(field->table == table);
-  LEX_STRING *gcol_expr = &field->gcol_info->expr_str;
-  DBUG_ASSERT(gcol_expr);
-  DBUG_ASSERT(!field->gcol_info->expr_item);  // No Item in TABLE_SHARE
+bool unpack_value_generator(THD *thd, TABLE *table,
+                            Value_generator **val_generator,
+                            Value_generator_source source,
+                            const char *source_name, Field *field,
+                            bool is_create_table, bool *error_reported) {
+  DBUG_ENTER("unpack_value_generator");
+  DBUG_ASSERT(field == nullptr || field->table == table);
+
+  LEX_STRING *val_gen_expr = &(*val_generator)->expr_str;
+  DBUG_ASSERT(val_gen_expr);
+  DBUG_ASSERT(!(*val_generator)->expr_item);  // No Item in TABLE_SHARE
   /*
     Step 1: Construct a statement for the parser.
     The parsed string needs to take the following format:
@@ -2462,15 +2564,15 @@ bool unpack_gcol_info(THD *thd, TABLE *table, Field *field,
 
   if (!(gcol_expr_str = (char *)alloc_root(
             &table->mem_root,
-            gcol_expr->length + PARSE_GCOL_KEYWORD.length + 3))) {
+            val_gen_expr->length + PARSE_GCOL_KEYWORD.length + 3))) {
     DBUG_RETURN(true);
   }
   memcpy(gcol_expr_str, PARSE_GCOL_KEYWORD.str, PARSE_GCOL_KEYWORD.length);
   str_len = PARSE_GCOL_KEYWORD.length;
   memcpy(gcol_expr_str + str_len, "(", 1);
   str_len++;
-  memcpy(gcol_expr_str + str_len, gcol_expr->str, gcol_expr->length);
-  str_len += gcol_expr->length;
+  memcpy(gcol_expr_str + str_len, val_gen_expr->str, val_gen_expr->length);
+  str_len += val_gen_expr->length;
   memcpy(gcol_expr_str + str_len, ")", 1);
   str_len++;
   memcpy(gcol_expr_str + str_len, "\0", 1);
@@ -2483,9 +2585,8 @@ bool unpack_gcol_info(THD *thd, TABLE *table, Field *field,
   */
   Query_arena *backup_stmt_arena_ptr = thd->stmt_arena;
   Query_arena backup_arena;
-  Query_arena gcol_arena(&table->mem_root,
-                         Query_arena::STMT_CONVENTIONAL_EXECUTION);
-  thd->set_n_backup_active_arena(&gcol_arena, &backup_arena);
+  Query_arena gcol_arena(&table->mem_root, Query_arena::STMT_REGULAR_EXECUTION);
+  thd->swap_query_arena(gcol_arena, &backup_arena);
   thd->stmt_arena = &gcol_arena;
   ulong save_old_privilege = thd->want_privilege;
   thd->want_privilege = 0;
@@ -2505,14 +2606,14 @@ bool unpack_gcol_info(THD *thd, TABLE *table, Field *field,
   thd->lex->expr_allows_subselect = save_allow_subselects;
 
   /*
-    From now on use gcol_info generated by the parser. It has an expr_item,
-    and no expr_str.
+    From now on use val_generator generated by the parser. It has an
+    expr_item, and no expr_str.
   */
-  field->gcol_info = parser_state.result;
+  *val_generator = parser_state.result;
   /* Keep attribute of generated column */
-  field->gcol_info->set_field_stored(field->stored_in_db);
+  if (field != nullptr) (*val_generator)->set_field_stored(field->stored_in_db);
 
-  DBUG_ASSERT(field->gcol_info->expr_item && !field->gcol_info->expr_str.str);
+  DBUG_ASSERT((*val_generator)->expr_item && !(*val_generator)->expr_str.str);
 
   /* Use strict mode regardless of strict mode setting when validating */
   if (!thd->is_strict_mode()) {
@@ -2522,11 +2623,12 @@ bool unpack_gcol_info(THD *thd, TABLE *table, Field *field,
   }
 
   /* Validate the Item tree. */
-  status = fix_fields_gcol_func(thd, field);
+  status = fix_value_generators_fields(thd, table, (*val_generator), source,
+                                       source_name, field);
 
   // Permanent changes to the item_tree are completed.
   if (!thd->lex->is_ps_or_view_context_analysis())
-    field->gcol_info->permanent_changes_completed = true;
+    (*val_generator)->permanent_changes_completed = true;
 
   if (disable_strict_mode) {
     thd->pop_internal_handler();
@@ -2542,15 +2644,16 @@ bool unpack_gcol_info(THD *thd, TABLE *table, Field *field,
       *error_reported = true;
     }
     // Any memory allocated in this function is freed in parse_err
-    field->gcol_info = 0;
+    *val_generator = nullptr;
     goto parse_err;
   }
-  if (field->gcol_info->register_base_columns(table)) goto parse_err;
+  if ((*val_generator)->register_base_columns(table)) goto parse_err;
   lex_end(thd->lex);
   thd->lex = old_lex;
+  (*val_generator)->backup_stmt_unsafe_flags(new_lex.get_stmt_unsafe_flags());
   thd->stmt_arena = backup_stmt_arena_ptr;
-  thd->restore_active_arena(&gcol_arena, &backup_arena);
-  field->gcol_info->item_free_list = gcol_arena.free_list;
+  thd->swap_query_arena(backup_arena, &gcol_arena);
+  (*val_generator)->item_list = gcol_arena.item_list();
   thd->want_privilege = save_old_privilege;
   thd->lex->expr_allows_subselect = save_allow_subselects;
 
@@ -2563,7 +2666,7 @@ parse_err:
   lex_end(thd->lex);
   thd->lex = old_lex;
   thd->stmt_arena = backup_stmt_arena_ptr;
-  thd->restore_active_arena(&gcol_arena, &backup_arena);
+  thd->swap_query_arena(backup_arena, &gcol_arena);
   thd->variables.character_set_client = old_character_set_client;
   thd->want_privilege = save_old_privilege;
   thd->lex->expr_allows_subselect = save_allow_subselects;
@@ -2604,7 +2707,7 @@ bool unpack_partition_info(THD *thd, TABLE *outparam, TABLE_SHARE *share,
     set the memory root to be the memory root of the table since we
     call the parser and fix_fields which both can allocate memory for
     item objects. We keep the arena to ensure that we can release the
-    free_list when closing the table object.
+    item list when closing the table object.
     SEE Bug #21658
   */
 
@@ -2615,7 +2718,7 @@ bool unpack_partition_info(THD *thd, TABLE *outparam, TABLE_SHARE *share,
   Query_arena backup_arena;
   Query_arena part_func_arena(&outparam->mem_root,
                               Query_arena::STMT_INITIALIZED);
-  thd->set_n_backup_active_arena(&part_func_arena, &backup_arena);
+  thd->swap_query_arena(part_func_arena, &backup_arena);
   thd->stmt_arena = &part_func_arena;
   bool tmp;
   bool work_part_info_used;
@@ -2625,7 +2728,7 @@ bool unpack_partition_info(THD *thd, TABLE *outparam, TABLE_SHARE *share,
       is_create_table, engine_type, &work_part_info_used);
   if (tmp) {
     thd->stmt_arena = backup_stmt_arena_ptr;
-    thd->restore_active_arena(&part_func_arena, &backup_arena);
+    thd->swap_query_arena(backup_arena, &part_func_arena);
     return true;
   }
   outparam->part_info->is_auto_partitioned = share->auto_partitioned;
@@ -2637,18 +2740,37 @@ bool unpack_partition_info(THD *thd, TABLE *outparam, TABLE_SHARE *share,
   if (!work_part_info_used)
     tmp = fix_partition_func(thd, outparam, is_create_table);
   thd->stmt_arena = backup_stmt_arena_ptr;
-  thd->restore_active_arena(&part_func_arena, &backup_arena);
+  thd->swap_query_arena(backup_arena, &part_func_arena);
   if (!tmp) {
     if (work_part_info_used)
       tmp = fix_partition_func(thd, outparam, is_create_table);
   }
-  outparam->part_info->item_free_list = part_func_arena.free_list;
+  outparam->part_info->item_list = part_func_arena.item_list();
   // TODO: Compare with share->part_info for validation of code!
   DBUG_ASSERT(!share->m_part_info || share->m_part_info->column_list ==
                                          outparam->part_info->column_list);
   DBUG_ASSERT(!share->m_part_info ||
               outparam->part_info->list_of_part_fields ==
                   share->m_part_info->list_of_part_fields);
+
+  // part_info->part_expr->table_name and
+  // part_info->subpart_expr->table_name will have been set to
+  // TABLE::alias (passed on from Field). But part_info cannot refer
+  // to TABLE::alias since this may be changed when the table object
+  // is reused. Traverse part_expr and subpart_expr and set table_name
+  // to nullptr, to avoid dereferencing an invalid pointer.
+
+  // @todo bug#29354690: When part_info handling is refactored and properly
+  // attached to a single TABLE object, this extra code can be
+  // deleted.
+  if (outparam->part_info->part_expr != nullptr) {
+    outparam->part_info->part_expr->walk(&Item::set_table_name,
+                                         enum_walk::SUBQUERY_POSTFIX, nullptr);
+  }
+  if (outparam->part_info->subpart_expr != nullptr) {
+    outparam->part_info->subpart_expr->walk(
+        &Item::set_table_name, enum_walk::SUBQUERY_POSTFIX, nullptr);
+  }
   return tmp;
 }
 
@@ -2687,9 +2809,9 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
   uint records, i, bitmap_size;
   bool error_reported = false;
   const bool internal_tmp = share->table_category == TABLE_CATEGORY_TEMPORARY;
-  DBUG_ASSERT(!internal_tmp || share->ref_count != 0);
+  DBUG_ASSERT(!internal_tmp || share->ref_count() != 0);
   uchar *record, *bitmaps;
-  Field **field_ptr, **vfield_ptr = NULL;
+  Field **field_ptr;
   Field *fts_doc_id_field = NULL;
   my_ptrdiff_t move_offset;
   DBUG_ENTER("open_table_from_share");
@@ -2728,7 +2850,7 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
 
   /* Allocate handler */
   outparam->file = 0;
-  if (!(prgflag & OPEN_FRM_FILE_ONLY)) {
+  if (!(prgflag & SKIP_NEW_HANDLER)) {
     if (!(outparam->file = get_new_handler(share, share->m_part_info != NULL,
                                            root, share->db_type())))
       goto err;
@@ -2879,7 +3001,7 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
   */
 
   bitmap_size = share->column_bitmap_size;
-  if (!(bitmaps = (uchar *)alloc_root(root, bitmap_size * 5))) goto err;
+  if (!(bitmaps = (uchar *)alloc_root(root, bitmap_size * 7))) goto err;
   bitmap_init(&outparam->def_read_set, (my_bitmap_map *)bitmaps, share->fields,
               false);
   bitmap_init(&outparam->def_write_set,
@@ -2891,39 +3013,140 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
   bitmap_init(&outparam->def_fields_set_during_insert,
               (my_bitmap_map *)(bitmaps + bitmap_size * 4), share->fields,
               false);
+  bitmap_init(&outparam->fields_for_functional_indexes,
+              (my_bitmap_map *)(bitmaps + bitmap_size * 5), share->fields,
+              false);
+  bitmap_init(&outparam->pack_row_tmp_set,
+              (my_bitmap_map *)(bitmaps + bitmap_size * 6), share->fields,
+              false);
   outparam->default_column_bitmaps();
 
   /*
     Process generated columns, if any.
   */
-  outparam->vfield = vfield_ptr;
+  outparam->vfield = nullptr;
   if (share->vfields) {
-    if (!(vfield_ptr = (Field **)alloc_root(
-              root, (uint)((share->vfields + 1) * sizeof(Field *)))))
-      goto err;
+    Field **vfield_ptr = pointer_cast<Field **>(
+        alloc_root(root, (uint)((share->vfields + 1) * sizeof(Field *))));
+    if (!vfield_ptr) goto err;
 
     outparam->vfield = vfield_ptr;
 
     for (field_ptr = outparam->field; *field_ptr; field_ptr++) {
       if ((*field_ptr)->gcol_info) {
-        if (unpack_gcol_info(thd, outparam, *field_ptr, is_create_table,
-                             &error_reported)) {
-          *vfield_ptr = NULL;
+        if (unpack_value_generator(thd, outparam, &(*field_ptr)->gcol_info,
+                                   VGS_GENERATED_COLUMN,
+                                   (*field_ptr)->field_name, *field_ptr,
+                                   is_create_table, &error_reported)) {
+          *vfield_ptr = nullptr;
           error = 4;  // in case no error is reported
           goto err;
+        }
+
+        // Mark hidden generated columns for functional indexes.
+        if ((*field_ptr)->is_field_for_functional_index()) {
+          bitmap_set_bit(&outparam->fields_for_functional_indexes,
+                         (*field_ptr)->field_index);
         }
         *(vfield_ptr++) = *field_ptr;
       }
     }
-    *vfield_ptr = 0;  // End marker
+    *vfield_ptr = nullptr;  // End marker
   }
+
+  // Check default value expressions against table's storage engine
+  if (share->gen_def_field_count && outparam->file &&
+      (!(outparam->file->ha_table_flags() & HA_SUPPORTS_DEFAULT_EXPRESSION))) {
+    my_error(ER_UNSUPPORTED_ACTION_ON_DEFAULT_VAL_GENERATED, MYF(0),
+             "Specified storage engine");
+    error_reported = true;
+    goto err;
+  }
+
+  // Unpack generated default fields and store reference to this type of fields
+  outparam->gen_def_fields_ptr = nullptr;
+  if (share->gen_def_field_count) {
+    Field **gen_def_field = pointer_cast<Field **>(alloc_root(
+        root, (uint)((share->gen_def_field_count + 1) * sizeof(Field *))));
+    if (!gen_def_field) goto err;
+
+    outparam->gen_def_fields_ptr = gen_def_field;
+    for (field_ptr = outparam->field; *field_ptr; field_ptr++) {
+      if ((*field_ptr)->has_insert_default_general_value_expression()) {
+        if (unpack_value_generator(
+                thd, outparam, &(*field_ptr)->m_default_val_expr,
+                VGS_DEFAULT_EXPRESSION, (*field_ptr)->field_name, *field_ptr,
+                is_create_table, &error_reported)) {
+          (*field_ptr)->m_default_val_expr = nullptr;
+          *gen_def_field = nullptr;
+          // In case no error is reported
+          error = 4;
+          goto err;
+        }
+        *(gen_def_field++) = *field_ptr;
+      }
+    }
+    *gen_def_field = nullptr;  // End marker
+  }
+
+  /*
+    Set up table check constraints from the table share and unpack check
+    constraint expression.
+  */
+  if (share->check_constraint_share_list != nullptr) {
+    DBUG_ASSERT(share->check_constraint_share_list->size() > 0);
+
+    outparam->table_check_constraint_list =
+        new (root) Sql_table_check_constraint_list(root);
+    if (outparam->table_check_constraint_list == nullptr) goto err;  // OOM
+
+    for (auto &cc_share : *share->check_constraint_share_list) {
+      // Check constraint name.
+      LEX_CSTRING name;
+      if (lex_string_strmake(root, &name, cc_share->name().str,
+                             cc_share->name().length))
+        goto err;  // OOM
+
+      // Check constraint expression.
+      LEX_CSTRING expr_str;
+      if (lex_string_strmake(root, &expr_str, cc_share->expr_str().str,
+                             cc_share->expr_str().length))
+        goto err;  // OOM
+
+      /*
+        Value generator instance for the check constraint expression. Memory
+        for val_gen is allocated in the thd->mem_root here intentionally.
+        Parser instantiate another value generator object in TABLE's mem_root
+        in unpack_value_generator().
+      */
+      Value_generator *val_gen = new (thd->mem_root) Value_generator();
+      val_gen->dup_expr_str(thd->mem_root, expr_str.str, expr_str.length);
+
+      Sql_table_check_constraint *table_cc =
+          new (root) Sql_table_check_constraint(
+              name, expr_str, cc_share->is_enforced(), val_gen, outparam);
+      if (table_cc == nullptr) goto err;  // OOM
+
+      // Unpack check constraint expression.
+      if (unpack_value_generator(thd, outparam, &val_gen, VGS_CHECK_CONSTRAINT,
+                                 table_cc->name().str, nullptr, is_create_table,
+                                 &error_reported))
+        goto err;
+
+      // Use value generator obtained from the parser.
+      table_cc->set_value_generator(val_gen);
+
+      if (outparam->table_check_constraint_list->push_back(table_cc)) goto err;
+    }
+  }
+
   /* The table struct is now initialized;  Open the table */
   error = 2;
   if (db_stat) {
     const dd::Table *table_def = table_def_param;
     dd::cache::Dictionary_client::Auto_releaser releaser(thd->dd_client());
 
-    if (!table_def && !(prgflag & OPEN_NO_DD_TABLE)) {
+    if (!table_def) {
       if (thd->dd_client()->acquire(share->db.str, share->table_name.str,
                                     &table_def)) {
         error_reported = true;
@@ -3018,10 +3241,19 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
 err:
   if (!error_reported) open_table_error(thd, share, error, my_errno());
   destroy(outparam->file);
-  if (outparam->part_info) free_items(outparam->part_info->item_free_list);
+  if (outparam->part_info) free_items(outparam->part_info->item_list);
   if (outparam->vfield) {
     for (Field **vfield = outparam->vfield; *vfield; vfield++)
-      free_items((*vfield)->gcol_info->item_free_list);
+      free_items((*vfield)->gcol_info->item_list);
+  }
+  if (outparam->gen_def_fields_ptr) {
+    for (Field **gen_def = outparam->gen_def_fields_ptr; *gen_def; gen_def++)
+      free_items((*gen_def)->m_default_val_expr->item_list);
+  }
+  if (outparam->table_check_constraint_list != nullptr) {
+    for (auto &table_cc : *outparam->table_check_constraint_list) {
+      free_items(table_cc->value_generator()->item_list);
+    }
   }
   outparam->file = 0;  // For easier error checking
   outparam->db_stat = 0;
@@ -3047,18 +3279,25 @@ int closefrm(TABLE *table, bool free_share) {
   table->alias = 0;
   if (table->field) {
     for (Field **ptr = table->field; *ptr; ptr++) {
-      if ((*ptr)->gcol_info) free_items((*ptr)->gcol_info->item_free_list);
+      if ((*ptr)->gcol_info) free_items((*ptr)->gcol_info->item_list);
+      if ((*ptr)->m_default_val_expr)
+        free_items((*ptr)->m_default_val_expr->item_list);
       destroy(*ptr);
     }
     table->field = 0;
+  }
+  if (table->table_check_constraint_list != nullptr) {
+    for (auto &table_cc : *table->table_check_constraint_list) {
+      free_items(table_cc->value_generator()->item_list);
+    }
   }
   destroy(table->file);
   table->file = 0; /* For easier errorchecking */
   if (table->part_info) {
     /* Allocated through table->mem_root, freed below */
-    free_items(table->part_info->item_free_list);
-    table->part_info->item_free_list = 0;
-    table->part_info = 0;
+    free_items(table->part_info->item_list);
+    table->part_info->item_list = nullptr;
+    table->part_info = nullptr;
   }
   if (free_share) {
     if (table->s->tmp_table == NO_TMP_TABLE)
@@ -3249,6 +3488,7 @@ void update_create_info_from_table(HA_CREATE_INFO *create_info, TABLE *table) {
   create_info->tablespace = share->tablespace;
   create_info->compress = share->compress;
   create_info->encrypt_type = share->encrypt_type;
+  create_info->secondary_engine = share->secondary_engine;
 
   DBUG_VOID_RETURN;
 }
@@ -3646,7 +3886,7 @@ bool TABLE_SHARE::visit_subgraph(Wait_for_flush *wait_for_flush,
     over the same loop twice and shortcut the search.
     Do it after taking the lock to weed out unnecessary races.
   */
-  if (src_ctx->m_wait.get_status() != MDL_wait::EMPTY) {
+  if (src_ctx->m_wait.get_status() != MDL_wait::WS_EMPTY) {
     result = false;
     goto end;
   }
@@ -3733,7 +3973,7 @@ bool TABLE_SHARE::wait_for_old_version(THD *thd, struct timespec *abstime,
     up to date and the share is referenced. Otherwise our
     thread will never be woken up from wait.
   */
-  DBUG_ASSERT(version != refresh_version && ref_count != 0);
+  DBUG_ASSERT(has_old_version() && ref_count() != 0);
 
   m_flush_tickets.push_front(&ticket);
 
@@ -3756,7 +3996,7 @@ bool TABLE_SHARE::wait_for_old_version(THD *thd, struct timespec *abstime,
 
   m_flush_tickets.remove(&ticket);
 
-  if (m_flush_tickets.is_empty() && ref_count == 0) {
+  if (m_flush_tickets.is_empty() && ref_count() == 0) {
     /*
       If our thread was the last one using the share,
       we must destroy it here.
@@ -3823,7 +4063,13 @@ Blob_mem_storage::~Blob_mem_storage() { free_root(&storage, MYF(0)); }
 */
 
 void TABLE::init(THD *thd, TABLE_LIST *tl) {
-  DBUG_ASSERT(s->ref_count > 0 || s->tmp_table != NO_TMP_TABLE);
+#ifndef DBUG_OFF
+  if (s->tmp_table == NO_TMP_TABLE) {
+    mysql_mutex_lock(&LOCK_open);
+    DBUG_ASSERT(s->ref_count() > 0);
+    mysql_mutex_unlock(&LOCK_open);
+  }
+#endif
 
   if (thd->lex->need_correct_ident())
     alias_name_used =
@@ -3862,20 +4108,21 @@ void TABLE::init(THD *thd, TABLE_LIST *tl) {
   DBUG_ASSERT(!db_stat || !file->extra(HA_EXTRA_IS_ATTACHED_CHILDREN));
 
   /*
-    Do not call refix_gc_items() for tables which are not directly used by the
-    statement (i.e. used by the substatements of routines or triggers to be
-    invoked by the statement).
+    Do not call refix_value_generator_items() for tables which are not directly
+    used by the statement (i.e. used by the substatements of routines or
+    triggers to be invoked by the statement).
 
-    Firstly, there will be call to refix_gc_items() at the start of execution
-    of substatement which directly uses this table anyway.Secondly, cleanup of
-    generated column (call to cleanup_gc_items()) for the table will be done
-    only at the end of execution of substatement which uses it. Because of this
-    call to refix_gc_items() for prelocking placeholder will miss corresponding
-    call to cleanup_gc_items() if substatement which uses the table is not
-    executed for some reason.
+    Firstly, there will be call to refix_value_generator_items() at the start
+    of execution of substatement which directly uses this table anyway.
+    Secondly, cleanup of generated column (call to
+    cleanup_value_generator_items()) for the table will be done only at the
+    end of execution of substatement which uses it. Because of this call to
+    refix_value_generator_items() for prelocking
+    placeholder will miss corresponding call to cleanup_value_generator_items()
+    if substatement which uses the table is not executed for some reason.
   */
   if (!pos_in_table_list->prelocking_placeholder) {
-    bool error MY_ATTRIBUTE((unused)) = refix_gc_items(thd);
+    bool error MY_ATTRIBUTE((unused)) = refix_value_generator_items(thd);
     DBUG_ASSERT(!error);
   }
 }
@@ -3917,7 +4164,7 @@ bool TABLE::init_tmp_table(THD *thd, TABLE_SHARE *share, MEM_ROOT *m_root,
 
   share->blob_field = blob_fld;
   share->db_low_byte_first = 1;  // True for HEAP and MyISAM
-  share->ref_count++;
+  share->increment_ref_count();
   share->primary_key = MAX_KEY;
   share->visible_indexes.init();
   share->keys_for_keyread.init();
@@ -3944,76 +4191,117 @@ bool TABLE::init_tmp_table(THD *thd, TABLE_SHARE *share, MEM_ROOT *m_root,
   return false;
 }
 
-bool TABLE::refix_gc_items(THD *thd) {
+bool TABLE::refix_value_generator_items(THD *thd) {
   if (vfield) {
     for (Field **vfield_ptr = vfield; *vfield_ptr; vfield_ptr++) {
       Field *vfield = *vfield_ptr;
       DBUG_ASSERT(vfield->gcol_info && vfield->gcol_info->expr_item);
-      if (!vfield->gcol_info->expr_item->fixed) {
-        bool res = false;
-        /*
-          The call to fix_fields_gcol_func() may create new item objects in the
-          item tree for the generated column expression. If these are permanent
-          changes to the item tree, the new items must have the same life-span
-          as the ones created during parsing of the generated expression
-          string. We achieve this by temporarily switching to use the TABLE's
-          mem_root if the permanent changes to the item tree haven't been
-          completed (by checking the status of
-          gcol_info->permanent_changes_completed) and this call is not part of
-          context analysis (like prepare or show create table).
-        */
-        Query_arena *backup_stmt_arena_ptr = thd->stmt_arena;
-        Query_arena backup_arena;
-        Query_arena gcol_arena(&vfield->table->mem_root,
-                               Query_arena::STMT_CONVENTIONAL_EXECUTION);
-        if (!vfield->gcol_info->permanent_changes_completed &&
-            !thd->lex->is_ps_or_view_context_analysis()) {
-          thd->set_n_backup_active_arena(&gcol_arena, &backup_arena);
-          thd->stmt_arena = &gcol_arena;
-        }
-
-        /*
-          Temporarily disable privileges check; already done when first fixed,
-          and then based on definer's (owner's) rights: this thread has
-          invoker's rights
-        */
-        ulong sav_want_priv = thd->want_privilege;
-        thd->want_privilege = 0;
-
-        if (fix_fields_gcol_func(thd, vfield)) res = true;
-
-        if (!vfield->gcol_info->permanent_changes_completed &&
-            !thd->lex->is_ps_or_view_context_analysis()) {
-          // Switch back to the original stmt_arena.
-          thd->stmt_arena = backup_stmt_arena_ptr;
-          thd->restore_active_arena(&gcol_arena, &backup_arena);
-
-          // Append the new items to the original item_free_list.
-          Item *item = vfield->gcol_info->item_free_list;
-          while (item->next) item = item->next;
-          item->next = gcol_arena.free_list;
-
-          // Permanent changes to the item_tree are completed.
-          vfield->gcol_info->permanent_changes_completed = true;
-        }
-
-        // Restore any privileges check
-        thd->want_privilege = sav_want_priv;
-        get_fields_in_item_tree = false;
-
-        /* error occurs */
-        if (res) return res;
-      }
+      refix_inner_value_generator_items(thd, vfield->gcol_info, vfield,
+                                        vfield->table, VGS_GENERATED_COLUMN,
+                                        vfield->field_name);
     }
+  }
+
+  if (gen_def_fields_ptr)
+    for (Field **gen_def_col = gen_def_fields_ptr; *gen_def_col;
+         gen_def_col++) {
+      Value_generator *gen_def_expr = (*gen_def_col)->m_default_val_expr;
+      DBUG_ASSERT(gen_def_expr && gen_def_expr->expr_item);
+      refix_inner_value_generator_items(
+          thd, gen_def_expr, (*gen_def_col), (*gen_def_col)->table,
+          VGS_DEFAULT_EXPRESSION, (*gen_def_col)->field_name);
+    }
+
+  if (table_check_constraint_list != nullptr) {
+    for (auto &table_cc : *table_check_constraint_list) {
+      Value_generator *cc_expr = table_cc->value_generator();
+      DBUG_ASSERT(cc_expr != nullptr && cc_expr->expr_item != nullptr);
+      refix_inner_value_generator_items(thd, cc_expr, nullptr,
+                                        table_cc->table(), VGS_CHECK_CONSTRAINT,
+                                        table_cc->name().str);
+    }
+  }
+
+  return false;
+}
+
+bool TABLE::refix_inner_value_generator_items(THD *thd, Value_generator *g_expr,
+                                              Field *field, TABLE *table,
+                                              Value_generator_source source,
+                                              const char *source_name) {
+  if (!g_expr->expr_item->fixed) {
+    bool res = false;
+    /*
+      The call to fix_value_generators_fields() may create new item objects in
+      the item tree for the val generation expression. If these are permanent
+      changes to the item tree, the new items must have the same life-span
+      as the ones created during parsing of the generated expression
+      string. We achieve this by temporarily switching to use the TABLE's
+      mem_root if the permanent changes to the item tree haven't been
+      completed (by checking the status of
+      gcol_info->permanent_changes_completed) and this call is not part of
+      context analysis (like prepare or show create table).
+    */
+    Query_arena *backup_stmt_arena_ptr = thd->stmt_arena;
+    Query_arena backup_arena;
+    Query_arena gcol_arena(&mem_root, Query_arena::STMT_REGULAR_EXECUTION);
+    if (!g_expr->permanent_changes_completed &&
+        !thd->lex->is_ps_or_view_context_analysis()) {
+      thd->swap_query_arena(gcol_arena, &backup_arena);
+      thd->stmt_arena = &gcol_arena;
+    }
+
+    /*
+      Temporarily disable privileges check; already done when first fixed,
+      and then based on definer's (owner's) rights: this thread has
+      invoker's rights
+    */
+    ulong sav_want_priv = thd->want_privilege;
+    thd->want_privilege = 0;
+
+    if (fix_value_generators_fields(thd, table, g_expr, source, source_name,
+                                    field))
+      res = true;
+
+    if (!g_expr->permanent_changes_completed &&
+        !thd->lex->is_ps_or_view_context_analysis()) {
+      // Switch back to the original stmt_arena.
+      thd->stmt_arena = backup_stmt_arena_ptr;
+      thd->swap_query_arena(backup_arena, &gcol_arena);
+
+      // Append the new items to the original item_free_list.
+      Item *item = g_expr->item_list;
+      while (item->next_free) item = item->next_free;
+      item->next_free = gcol_arena.item_list();
+
+      // Permanent changes to the item_tree are completed.
+      g_expr->permanent_changes_completed = true;
+    }
+
+    // Restore any privileges check
+    thd->want_privilege = sav_want_priv;
+    get_fields_in_item_tree = false;
+
+    /* error occurs */
+    if (res) return res;
   }
   return false;
 }
 
-void TABLE::cleanup_gc_items() {
+void TABLE::cleanup_value_generator_items() {
+  if (gen_def_fields_ptr)
+    for (Field **vfield_ptr = gen_def_fields_ptr; *vfield_ptr; vfield_ptr++)
+      cleanup_items((*vfield_ptr)->m_default_val_expr->item_list);
+
+  if (table_check_constraint_list != nullptr) {
+    for (auto &table_cc : *table_check_constraint_list)
+      cleanup_items(table_cc->value_generator()->item_list);
+  }
+
   if (!has_gcol()) return;
 
   for (Field **vfield_ptr = vfield; *vfield_ptr; vfield_ptr++)
-    cleanup_items((*vfield_ptr)->gcol_info->item_free_list);
+    cleanup_items((*vfield_ptr)->gcol_info->item_list);
 }
 
 /**
@@ -4402,7 +4690,7 @@ void TABLE_LIST::cleanup_items() {
 
   for (Field_translator *transl = field_translation;
        transl < field_translation_end; transl++)
-    transl->item->walk(&Item::cleanup_processor, Item::WALK_POSTFIX, NULL);
+    transl->item->walk(&Item::cleanup_processor, enum_walk::POSTFIX, NULL);
 }
 
 /**
@@ -4954,14 +5242,16 @@ const char *Field_iterator_table_ref::get_db_name() {
   /*
     Test that TABLE_LIST::db is the same as TABLE_SHARE::db to
     ensure consistency. An exception are I_S schema tables, which
-    are inconsistent in this respect.
+    are inconsistent in this respect and any_db (used in the handler
+    interface to manage aliases).
   */
   DBUG_ASSERT(!strcmp(table_ref->db, table_ref->table->s->db.str) ||
+              table_ref->db == any_db ||
               (table_ref->schema_table &&
                is_infoschema_db(table_ref->table->s->db.str,
                                 table_ref->table->s->db.length)));
 
-  return table_ref->db;
+  return table_ref->db == any_db ? table_ref->table->s->db.str : table_ref->db;
 }
 
 GRANT_INFO *Field_iterator_table_ref::grant() {
@@ -5018,12 +5308,13 @@ Natural_join_column *Field_iterator_table_ref::get_or_create_column_ref(
     Item_field *tmp_item =
         new Item_field(thd, &thd->lex->current_select()->context, tmp_field);
     if (!tmp_item) return NULL;
-    nj_col = new (*THR_MALLOC) Natural_join_column(tmp_item, table_ref);
+    nj_col = new (thd->mem_root) Natural_join_column(tmp_item, table_ref);
     field_count = table_ref->table->s->fields;
   } else if (field_it == &view_field_it) {
     /* The field belongs to a merge view or information schema table. */
     Field_translator *translated_field = view_field_it.field_translator();
-    nj_col = new (*THR_MALLOC) Natural_join_column(translated_field, table_ref);
+    nj_col =
+        new (thd->mem_root) Natural_join_column(translated_field, table_ref);
     field_count =
         table_ref->field_translation_end - table_ref->field_translation;
   } else {
@@ -5051,7 +5342,7 @@ Natural_join_column *Field_iterator_table_ref::get_or_create_column_ref(
     if (!add_table_ref->join_columns) {
       /* Create a list of natural join columns on demand. */
       if (!(add_table_ref->join_columns =
-                new (*THR_MALLOC) List<Natural_join_column>))
+                new (thd->mem_root) List<Natural_join_column>))
         return NULL;
       add_table_ref->is_join_columns_complete = false;
     }
@@ -5156,7 +5447,6 @@ void TABLE::prepare_for_position() {
   @note If TABLE::get_fields_in_item_tree is set, set the flag bit
         GET_FIXED_FIELDS_FLAG for the field.
 
-  @param thd      Thread handler (only used for duplicate handling)
   @param field    The column to be marked as used
   @param mark      =MARK_COLUMNS_NONE: Only update flag field, if applicable
                    =MARK_COLUMNS_READ: Mark column as read
@@ -5165,8 +5455,7 @@ void TABLE::prepare_for_position() {
                                        and processing of generated columns
 */
 
-void TABLE::mark_column_used(THD *thd, Field *field,
-                             enum enum_mark_columns mark) {
+void TABLE::mark_column_used(Field *field, enum enum_mark_columns mark) {
   DBUG_ENTER("TABLE::mark_column_used");
 
   switch (mark) {
@@ -5187,14 +5476,7 @@ void TABLE::mark_column_used(THD *thd, Field *field,
       break;
     }
     case MARK_COLUMNS_WRITE:
-      if (bitmap_fast_test_and_set(write_set, field->field_index)) {
-        /*
-          This is relevant for INSERT only, but duplicate indication is set
-          for all fields that are updated.
-        */
-        DBUG_PRINT("warning", ("Found duplicated field"));
-        thd->dup_field = field;
-      }
+      bitmap_set_bit(write_set, field->field_index);
       DBUG_ASSERT(!get_fields_in_item_tree);
 
       if (field->is_gcol()) mark_gcol_in_maps(field);
@@ -5883,11 +6165,9 @@ void TABLE::mark_generated_columns(bool is_update) {
           bitmap_is_overlapping(write_set,
                                 &tmp_vfield->gcol_info->base_columns_map)) {
         // The GC needs to be updated
-        tmp_vfield->table->mark_column_used(in_use, tmp_vfield,
-                                            MARK_COLUMNS_WRITE);
+        tmp_vfield->table->mark_column_used(tmp_vfield, MARK_COLUMNS_WRITE);
         // In order to update the new value, we have to read the old value
-        tmp_vfield->table->mark_column_used(in_use, tmp_vfield,
-                                            MARK_COLUMNS_READ);
+        tmp_vfield->table->mark_column_used(tmp_vfield, MARK_COLUMNS_READ);
         bitmap_updated = true;
       }
     }
@@ -5896,8 +6176,7 @@ void TABLE::mark_generated_columns(bool is_update) {
     for (vfield_ptr = vfield; *vfield_ptr; vfield_ptr++) {
       tmp_vfield = *vfield_ptr;
       DBUG_ASSERT(tmp_vfield->gcol_info && tmp_vfield->gcol_info->expr_item);
-      tmp_vfield->table->mark_column_used(in_use, tmp_vfield,
-                                          MARK_COLUMNS_WRITE);
+      tmp_vfield->table->mark_column_used(tmp_vfield, MARK_COLUMNS_WRITE);
       bitmap_updated = true;
     }
   }
@@ -5912,22 +6191,34 @@ void TABLE::mark_generated_columns(bool is_update) {
     true     The field is dependent by some GC.
 
 */
-bool TABLE::is_field_used_by_generated_columns(uint field_index) {
+bool TABLE::is_field_used_by_generated_columns(uint field_index,
+                                               int *error_no) {
   MY_BITMAP dependent_fields;
   my_bitmap_map bitbuf[bitmap_buffer_size(MAX_FIELDS) / sizeof(my_bitmap_map)];
   bitmap_init(&dependent_fields, bitbuf, s->fields, 0);
   MY_BITMAP *save_old_read_set = read_set;
   read_set = &dependent_fields;
 
-  for (Field **vfield_ptr = vfield; *vfield_ptr; vfield_ptr++) {
+  for (Field **vfield_ptr = field; *vfield_ptr; vfield_ptr++) {
     Field *tmp_vfield = *vfield_ptr;
-    DBUG_ASSERT(tmp_vfield->gcol_info && tmp_vfield->gcol_info->expr_item);
-    Mark_field mark_fld(MARK_COLUMNS_TEMP);
-    tmp_vfield->gcol_info->expr_item->walk(
-        &Item::mark_field_in_map, Item::WALK_PREFIX, (uchar *)&mark_fld);
-    if (bitmap_is_set(read_set, field_index)) {
-      read_set = save_old_read_set;
-      return true;
+    if (tmp_vfield->is_gcol() ||
+        tmp_vfield->has_insert_default_general_value_expression()) {
+      DBUG_ASSERT((tmp_vfield->gcol_info && tmp_vfield->gcol_info->expr_item) ||
+                  (tmp_vfield->m_default_val_expr &&
+                   tmp_vfield->m_default_val_expr->expr_item));
+      Mark_field mark_fld(MARK_COLUMNS_TEMP);
+      Item *expr = tmp_vfield->is_gcol()
+                       ? tmp_vfield->gcol_info->expr_item
+                       : tmp_vfield->m_default_val_expr->expr_item;
+      expr->walk(&Item::mark_field_in_map, enum_walk::PREFIX,
+                 (uchar *)&mark_fld);
+      if (bitmap_is_set(read_set, field_index)) {
+        *error_no = tmp_vfield->is_gcol()
+                        ? ER_DEPENDENT_BY_GENERATED_COLUMN
+                        : ER_DEPENDENT_BY_DEFAULT_GENERATED_VALUE;
+        read_set = save_old_read_set;
+        return true;
+      }
     }
   }
   read_set = save_old_read_set;
@@ -6524,7 +6815,7 @@ bool TABLE_LIST::update_derived_keys(Field *field, Item **values,
   See TABLE_LIST::generate_keys.
 */
 
-static int Derived_key_comp(Derived_key *e1, Derived_key *e2, void *) {
+static int Derived_key_comp(Derived_key *e1, Derived_key *e2) {
   /* Move entries for tables with greater table bit to the end. */
   return ((e1->referenced_by < e2->referenced_by)
               ? -1
@@ -6581,7 +6872,7 @@ bool TABLE_LIST::generate_keys() {
       return true; /* purecov: inspected */
 
   /* Sort entries to make key numbers sequence deterministic. */
-  derived_key_list.sort((Node_cmp_func)Derived_key_comp, 0);
+  derived_key_list.sort(Derived_key_comp);
 
   List_iterator<Derived_key> it(derived_key_list);
   Derived_key *entry;
@@ -6818,39 +7109,40 @@ bool update_generated_read_fields(uchar *buf, TABLE *table, uint active_index) {
  */
 bool update_generated_write_fields(const MY_BITMAP *bitmap, TABLE *table) {
   DBUG_ENTER("update_generated_write_fields");
-  Field **vfield_ptr;
+  Field **field_ptr;
   int error = 0;
 
-  DBUG_ASSERT(table->vfield);
   if (table->in_use->is_error()) DBUG_RETURN(true);
 
-  /* Iterate over generated fields in the table */
-  for (vfield_ptr = table->vfield; *vfield_ptr; vfield_ptr++) {
-    Field *vfield;
-    vfield = (*vfield_ptr);
-    DBUG_ASSERT(vfield->gcol_info && vfield->gcol_info->expr_item);
+  if (table->vfield) {
+    /* Iterate over generated fields in the table */
+    for (field_ptr = table->vfield; *field_ptr; field_ptr++) {
+      Field *vfield;
+      vfield = (*field_ptr);
+      DBUG_ASSERT(vfield->gcol_info && vfield->gcol_info->expr_item);
 
-    /* Only update those fields that are marked in the bitmap */
-    if (bitmap_is_set(bitmap, vfield->field_index)) {
-      /*
-        For a virtual generated column based on the blob type, we have to keep
-        the current blob value since this might be needed by the
-        storage engine during updates.
-      */
-      if ((vfield->flags & BLOB_FLAG) != 0 && vfield->is_virtual_gcol()) {
-        (down_cast<Field_blob *>(vfield))->keep_old_value();
-        (down_cast<Field_blob *>(vfield))->set_keep_old_value(true);
+      /* Only update those fields that are marked in the bitmap */
+      if (bitmap_is_set(bitmap, vfield->field_index)) {
+        /*
+          For a virtual generated column of blob type, we have to keep
+          the current blob value since this might be needed by the
+          storage engine during updates.
+        */
+        if ((vfield->flags & BLOB_FLAG) != 0 && vfield->is_virtual_gcol()) {
+          (down_cast<Field_blob *>(vfield))->keep_old_value();
+          (down_cast<Field_blob *>(vfield))->set_keep_old_value(true);
+        }
+
+        /* Generate the actual value of the generated fields */
+        error = vfield->gcol_info->expr_item->save_in_field(vfield, 0);
+
+        DBUG_PRINT("info", ("field '%s' - updated", vfield->field_name));
+        if (error && !table->in_use->is_error()) error = 0;
+        if (table->fields_set_during_insert)
+          bitmap_set_bit(table->fields_set_during_insert, vfield->field_index);
+      } else {
+        DBUG_PRINT("info", ("field '%s' - skipped", vfield->field_name));
       }
-
-      /* Generate the actual value of the generated fields */
-      error = vfield->gcol_info->expr_item->save_in_field(vfield, 0);
-
-      DBUG_PRINT("info", ("field '%s' - updated", vfield->field_name));
-      if (error && !table->in_use->is_error()) error = 0;
-      if (table->fields_set_during_insert)
-        bitmap_set_bit(table->fields_set_during_insert, vfield->field_index);
-    } else {
-      DBUG_PRINT("info", ("field '%s' - skipped", vfield->field_name));
     }
   }
 
@@ -6912,6 +7204,9 @@ bool TABLE_LIST::set_recursive_reference() {
 /**
   Propagate table map of a table up by nested join tree. Used to check
   dependencies for LATERAL JOIN of table functions.
+  simplify_joins() calculates the same information but also does
+  transformations, and we need this semantic check to be earlier than
+  simplify_joins() and before transformations.
 
   @param map_arg  table map to propagate
 */
@@ -6943,9 +7238,13 @@ LEX_USER *LEX_USER::alloc(THD *thd, LEX_STRING *user_arg,
   ret->host.length = host_arg ? host_arg->length : 1;
   ret->plugin = EMPTY_CSTR;
   ret->auth = NULL_CSTR;
+  ret->current_auth = NULL_CSTR;
+  ret->uses_replace_clause = false;
   ret->uses_identified_by_clause = false;
   ret->uses_identified_with_clause = false;
   ret->uses_authentication_string_clause = false;
+  ret->retain_current_password = false;
+  ret->discard_old_password = false;
   ret->alter_status.account_locked = false;
   ret->alter_status.expire_after_days = 0;
   ret->alter_status.update_account_locked_column = false;
@@ -6953,6 +7252,8 @@ LEX_USER *LEX_USER::alloc(THD *thd, LEX_STRING *user_arg,
   ret->alter_status.update_password_expired_fields = false;
   ret->alter_status.use_default_password_lifetime = true;
   ret->alter_status.use_default_password_history = true;
+  ret->alter_status.update_password_require_current =
+      Lex_acl_attrib_udyn::UNCHANGED;
   ret->alter_status.password_history_length = 0;
   ret->alter_status.password_reuse_interval = 0;
   if (check_string_char_length(ret->user, ER_THD(thd, ER_USERNAME),
@@ -7505,6 +7806,18 @@ void TABLE::set_binlog_drop_if_temp(bool should_binlog) {
 
 bool TABLE::should_binlog_drop_if_temp(void) const {
   return should_binlog_drop_if_temp_flag;
+}
+
+bool TABLE::empty_result_table() {
+  materialized = false;
+  set_not_started();
+  if (!is_created()) return false;
+  if (file->ha_index_or_rnd_end() || file->extra(HA_EXTRA_RESET_STATE) ||
+      file->ha_delete_all_rows())
+    return true;
+  free_io_cache(this);
+  filesort_free_buffers(this, 0);
+  return false;
 }
 
 void TABLE::update_covering_prefix_keys(Field *field, uint16 key_read_length,

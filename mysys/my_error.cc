@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -45,11 +45,13 @@
 #include "my_inttypes.h"
 #include "my_loglevel.h"
 #include "my_sys.h"
+#include "my_thread_local.h"
 #include "mysql/service_mysql_alloc.h"
 #include "mysys/my_handler_errors.h"
 #include "mysys/mysys_priv.h"
 #include "mysys_err.h"
 #include "strings/mb_wc.h"
+#include "template_utils.h"
 
 /* Max length of a error message. Should be kept in sync with MYSQL_ERRMSG_SIZE.
  */
@@ -105,7 +107,7 @@ static struct my_err_head *my_errmsgs_list = &my_errmsgs_globerrs;
 */
 
 char *my_strerror(char *buf, size_t len, int nr) {
-  char *msg = NULL;
+  const char *msg = nullptr;
 
   buf[0] = '\0'; /* failsafe */
 
@@ -114,7 +116,7 @@ char *my_strerror(char *buf, size_t len, int nr) {
     by the principle of least surprise.
   */
   if ((nr >= HA_ERR_FIRST) && (nr <= HA_ERR_LAST))
-    msg = (char *)handler_error_messages[nr - HA_ERR_FIRST];
+    msg = handler_error_messages[nr - HA_ERR_FIRST];
 
   if (msg != NULL)
     strmake(buf, msg, len - 1);
@@ -188,7 +190,7 @@ const char *my_get_err_msg(int nr) {
 
   /*
     If we found the range this error number is in, get the format string.
-    If the string is empty, or a NULL pointer, or if we're out of return,
+    If the string is empty, or a NULL pointer, or if we're out of ranges,
     we return NULL.
   */
   if (!(format = (meh_p && (nr >= meh_p->meh_first)) ? meh_p->get_errmsg(nr)
@@ -438,20 +440,18 @@ void my_error_unregister_all(void) {
 
   @param ll      log level: (ERROR|WARNING|INFORMATION)_LEVEL
                  the printer may use these to filter for verbosity
-  @param format  a format string a la printf. Should not end in '\n'
-  @param args    parameters to go with that format string
+  @param ecode   Error code of a error message.
+  @param args    parameters to go with the error message.
 */
-void my_message_local_stderr(enum loglevel ll, const char *format,
-                             va_list args) {
+void my_message_local_stderr(enum loglevel ll, uint ecode, va_list args) {
   char buff[1024];
   size_t len;
-
   DBUG_ENTER("my_message_local_stderr");
 
   len = snprintf(
       buff, sizeof(buff), "[%s] ",
       (ll == ERROR_LEVEL ? "ERROR" : ll == WARNING_LEVEL ? "Warning" : "Note"));
-  vsnprintf(buff + len, sizeof(buff) - len, format, args);
+  vsnprintf(buff + len, sizeof(buff) - len, EE(ecode), args);
 
   my_message_stderr(0, buff, MYF(0));
 
@@ -471,16 +471,15 @@ void my_message_local_stderr(enum loglevel ll, const char *format,
 
   @param ll      log level: (ERROR|WARNING|INFORMATION)_LEVEL
                  the printer may use these to filter for verbosity
-  @param format  a format string a la printf. Should not end in '\n'.
-  @param ...     parameters to go with that format string
+  @param ecode   Error code of a error message.
+  @param ...     parameters to go with the error message.
 */
-
-void my_message_local(enum loglevel ll, const char *format, ...) {
+void my_message_local(enum loglevel ll, uint ecode, ...) {
   va_list args;
-  DBUG_ENTER("local_print_error");
+  DBUG_ENTER("my_message_local");
 
-  va_start(args, format);
-  (*local_message_hook)(ll, format, args);
+  va_start(args, ecode);
+  (*local_message_hook)(ll, ecode, args);
   va_end(args);
 
   DBUG_VOID_RETURN;

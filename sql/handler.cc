@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -23,7 +23,8 @@
 /** @file sql/handler.cc
 
     @brief
-  Handler-calling-functions
+    Implements functions in the handler interface that are shared between all
+    storage engines.
 */
 
 #include "sql/handler.h"
@@ -42,8 +43,8 @@
 #include <list>
 #include <random>  // std::uniform_real_distribution
 #include <string>
+#include <vector>
 
-#include "binary_log_types.h"
 #include "binlog_event.h"
 #include "keycache.h"
 #include "m_ctype.h"
@@ -687,6 +688,8 @@ int ha_init_errors(void) {
   SETMSG(HA_ERR_NOT_ALLOWED_COMMAND, ER_DEFAULT(ER_NOT_ALLOWED_COMMAND));
   SETMSG(HA_ERR_COMPUTE_FAILED, "Compute virtual column value failed");
   SETMSG(HA_ERR_DISK_FULL_NOWAIT, ER_DEFAULT(ER_DISK_FULL_NOWAIT));
+  SETMSG(HA_ERR_NO_SESSION_TEMP, ER_DEFAULT(ER_NO_SESSION_TEMP));
+  SETMSG(HA_ERR_WRONG_TABLE_NAME, ER_DEFAULT(ER_WRONG_TABLE_NAME));
   /* Register the error messages for use with my_error(). */
   return my_error_register(get_handler_errmsg, HA_ERR_FIRST, HA_ERR_LAST);
 }
@@ -1347,6 +1350,7 @@ int ha_prepare(THD *thd) {
 
     while (ha_info) {
       handlerton *ht = ha_info->ht();
+      DBUG_ASSERT(!thd->status_var_aggregated);
       thd->status_var.ha_prepare_count++;
       if (ht->prepare) {
         DBUG_EXECUTE_IF("simulate_xa_failure_prepare", {
@@ -1526,6 +1530,7 @@ int commit_owned_gtid_by_partial_command(THD *thd) {
 
 int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
   int error = 0;
+  THD_STAGE_INFO(thd, stage_waiting_for_handler_commit);
   bool need_clear_owned_gtid = false;
   bool run_slave_post_commit = false;
   /*
@@ -1575,10 +1580,18 @@ int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
   */
   if (is_real_trans && is_atomic_ddl_commit_on_slave(thd)) {
     /*
-      Failed atomic DDL statements should've been marked as
-      executed/committed during statement rollback.
+      Failed atomic DDL statements should've been marked as executed/committed
+      during statement rollback.
+      When applying a DDL statement on a slave and the statement is filtered
+      out by a table filter, we report an error "ER_SLAVE_IGNORED_TABLE" to
+      warn slave applier thread. We need to save the DDL statement's gtid
+      into mysql.gtid_executed system table if the binary log is disabled
+      on the slave and gtids are enabled. It is not necessary to assert that
+      there is no error when committing the DDL statement's gtid into table.
     */
-    DBUG_ASSERT(!thd->is_error());
+    DBUG_ASSERT(!thd->is_error() ||
+                (thd->is_operating_gtid_table_implicitly &&
+                 thd->get_stmt_da()->mysql_errno() == ER_SLAVE_IGNORED_TABLE));
 
     run_slave_post_commit = true;
     error = error || thd->rli_slave->pre_commit();
@@ -1809,6 +1822,7 @@ int ha_commit_low(THD *thd, bool all, bool run_after_commit) {
                  my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
         error = 1;
       }
+      DBUG_ASSERT(!thd->status_var_aggregated);
       thd->status_var.ha_commit_count++;
       ha_info_next = ha_info->next();
       if (restore_backup_ha_data) reattach_engine_ha_data_to_thd(thd, ht);
@@ -1869,6 +1883,7 @@ int ha_rollback_low(THD *thd, bool all) {
                  my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
         error = 1;
       }
+      DBUG_ASSERT(!thd->status_var_aggregated);
       thd->status_var.ha_rollback_count++;
       ha_info_next = ha_info->next();
       if (restore_backup_ha_data) reattach_engine_ha_data_to_thd(thd, ht);
@@ -2031,6 +2046,7 @@ int ha_commit_attachable(THD *thd) {
         DBUG_ASSERT(false);
         error = 1;
       }
+      DBUG_ASSERT(!thd->status_var_aggregated);
       thd->status_var.ha_commit_count++;
       ha_info_next = ha_info->next();
 
@@ -2119,6 +2135,7 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv) {
                my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
       error = 1;
     }
+    DBUG_ASSERT(!thd->status_var_aggregated);
     thd->status_var.ha_savepoint_rollback_count++;
     if (ht->prepare == 0) trn_ctx->set_no_2pc(trx_scope, true);
   }
@@ -2137,6 +2154,7 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv) {
                my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
       error = 1;
     }
+    DBUG_ASSERT(!thd->status_var_aggregated);
     thd->status_var.ha_rollback_count++;
     ha_info_next = ha_info->next();
     ha_info->reset(); /* keep it conveniently zero-filled */
@@ -2175,6 +2193,7 @@ int ha_prepare_low(THD *thd, bool all) {
                  my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
         error = 1;
       }
+      DBUG_ASSERT(!thd->status_var_aggregated);
       thd->status_var.ha_prepare_count++;
     }
     DBUG_EXECUTE_IF("crash_commit_after_prepare", DBUG_SUICIDE(););
@@ -2215,6 +2234,7 @@ int ha_savepoint(THD *thd, SAVEPOINT *sv) {
                my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
       error = 1;
     }
+    DBUG_ASSERT(!thd->status_var_aggregated);
     thd->status_var.ha_savepoint_count++;
   }
   /*
@@ -2251,6 +2271,10 @@ int ha_release_savepoint(THD *thd, SAVEPOINT *sv) {
       error = 1;
     }
   }
+  DBUG_EXECUTE_IF("fail_ha_release_savepoint", {
+    my_error(ER_UNKNOWN_ERROR, MYF(0));
+    error = 1;
+  });
 
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
   if (thd->m_transaction_psi != NULL)
@@ -2292,16 +2316,10 @@ static bool flush_handlerton(THD *, plugin_ref plugin, void *arg) {
   return false;
 }
 
-bool ha_flush_logs(handlerton *db_type, bool binlog_group_flush) {
-  if (db_type == NULL) {
-    if (plugin_foreach(NULL, flush_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
-                       static_cast<void *>(&binlog_group_flush)))
-      return true;
-  } else {
-    if (db_type->state != SHOW_OPTION_YES ||
-        (db_type->flush_logs &&
-         db_type->flush_logs(db_type, binlog_group_flush)))
-      return true;
+bool ha_flush_logs(bool binlog_group_flush) {
+  if (plugin_foreach(NULL, flush_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
+                     static_cast<void *>(&binlog_group_flush))) {
+    return true;
   }
   return false;
 }
@@ -2485,10 +2503,15 @@ void HA_CREATE_INFO::init_create_options_from_share(const TABLE_SHARE *share,
     compress = share->compress;
   }
 
-  if (!(used_fields & HA_CREATE_USED_ENCRYPT)) {
+  if (!(used_fields & (HA_CREATE_USED_ENCRYPT))) {
     // Assert to check that used_fields flag and encrypt_type are in sync
     DBUG_ASSERT(!encrypt_type.str);
     encrypt_type = share->encrypt_type;
+  }
+
+  if (!(used_fields & HA_CREATE_USED_SECONDARY_ENGINE)) {
+    DBUG_ASSERT(secondary_engine.str == nullptr);
+    secondary_engine = share->secondary_engine;
   }
 }
 
@@ -2529,7 +2552,7 @@ err:
 
 void handler::ha_statistic_increment(
     ulonglong System_status_var::*offset) const {
-  (table->in_use->status_var.*offset)++;
+  if (table && table->in_use) (table->in_use->status_var.*offset)++;
 }
 
 THD *handler::ha_thd(void) const {
@@ -2661,6 +2684,7 @@ int handler::ha_open(TABLE *table_arg, const char *name, int mode,
       dup_ref = ref + ALIGN_SIZE(ref_length);
     cached_table_flags = table_flags();
   }
+
   DBUG_RETURN(error);
 }
 
@@ -2912,6 +2936,109 @@ int handler::sample_next(uchar *buf) {
     res = rnd_next(buf);
 
   return res;
+}
+
+int handler::records(ha_rows *num_rows) {
+  if (MY_TEST((ha_table_flags() & HA_COUNT_ROWS_INSTANT))) {
+    *num_rows = stats.records;
+    return 0;
+  }
+
+  int error = 0;
+  ha_rows rows = 0;
+  start_psi_batch_mode();
+
+  if (!(error = ha_rnd_init(true))) {
+    while (!table->in_use->killed) {
+      DBUG_EXECUTE_IF("bug28079850", table->in_use->killed = THD::KILL_QUERY;);
+      if ((error = ha_rnd_next(table->record[0]))) {
+        if (error == HA_ERR_RECORD_DELETED)
+          continue;
+        else
+          break;
+      }
+      ++rows;
+    }
+  }
+
+  *num_rows = rows;
+  end_psi_batch_mode();
+  int ha_rnd_end_error = 0;
+  if (error != HA_ERR_END_OF_FILE) *num_rows = HA_POS_ERROR;
+
+  // Call ha_rnd_end() only if only if handler has been initialized.
+  if (inited && (ha_rnd_end_error = ha_rnd_end())) *num_rows = HA_POS_ERROR;
+
+  return (error != HA_ERR_END_OF_FILE) ? error : ha_rnd_end_error;
+}
+
+int handler::records_from_index(ha_rows *num_rows, uint index) {
+  if (MY_TEST((ha_table_flags() & HA_COUNT_ROWS_INSTANT))) {
+    *num_rows = stats.records;
+    return 0;
+  }
+
+  int error = 0;
+  ha_rows rows = 0;
+  uchar *buf = table->record[0];
+  start_psi_batch_mode();
+
+  if (!(error = ha_index_init(index, false))) {
+    if (!(error = ha_index_first(buf))) {
+      rows = 1;
+
+      while (!table->in_use->killed) {
+        DBUG_EXECUTE_IF("bug28079850",
+                        table->in_use->killed = THD::KILL_QUERY;);
+        if ((error = ha_index_next(buf))) {
+          if (error == HA_ERR_RECORD_DELETED)
+            continue;
+          else
+            break;
+        }
+        ++rows;
+      }
+    }
+  }
+
+  *num_rows = rows;
+  end_psi_batch_mode();
+  int ha_index_end_error = 0;
+  if (error != HA_ERR_END_OF_FILE) *num_rows = HA_POS_ERROR;
+
+  // Call ha_index_end() only if handler has been initialized.
+  if (inited && (ha_index_end_error = ha_index_end())) *num_rows = HA_POS_ERROR;
+
+  return (error != HA_ERR_END_OF_FILE) ? error : ha_index_end_error;
+}
+
+int handler::handle_records_error(int error, ha_rows *num_rows) {
+  // If query was killed set the error since not all storage engines do it.
+  if (table->in_use->killed) {
+    *num_rows = HA_POS_ERROR;
+    if (error == 0) error = HA_ERR_QUERY_INTERRUPTED;
+  }
+
+  if (error != 0) DBUG_ASSERT(*num_rows == HA_POS_ERROR);
+  if (*num_rows == HA_POS_ERROR) DBUG_ASSERT(error != 0);
+  if (error != 0) {
+    /*
+      ha_innobase::records may have rolled back internally.
+      In this case, thd_mark_transaction_to_rollback() will have been called.
+      For the errors below, we need to abort right away.
+    */
+    switch (error) {
+      case HA_ERR_LOCK_DEADLOCK:
+      case HA_ERR_LOCK_TABLE_FULL:
+      case HA_ERR_LOCK_WAIT_TIMEOUT:
+      case HA_ERR_QUERY_INTERRUPTED:
+        print_error(error, MYF(0));
+        return error;
+      default:
+        return error;
+    }
+  }
+  return 0;
 }
 
 /**
@@ -3825,6 +3952,9 @@ bool handler::is_fatal_error(int error) {
     - table->alias
 */
 void handler::print_error(int error, myf errflag) {
+  THD *thd = current_thd;
+  Foreign_key_error_handler foreign_key_error_handler(thd, this);
+
   DBUG_ENTER("handler::print_error");
   DBUG_PRINT("enter", ("error: %d", error));
 
@@ -3960,14 +4090,26 @@ void handler::print_error(int error, myf errflag) {
       break;
     case HA_ERR_ROW_IS_REFERENCED: {
       String str;
+      /*
+        Manipulate the error message while handling the error
+        condition based on the access check.
+      */
+      thd->push_internal_handler(&foreign_key_error_handler);
       get_error_message(error, &str);
       my_error(ER_ROW_IS_REFERENCED_2, errflag, str.c_ptr_safe());
+      thd->pop_internal_handler();
       DBUG_VOID_RETURN;
     }
     case HA_ERR_NO_REFERENCED_ROW: {
       String str;
+      /*
+        Manipulate the error message while handling the error
+        condition based on the access check.
+      */
+      thd->push_internal_handler(&foreign_key_error_handler);
       get_error_message(error, &str);
       my_error(ER_NO_REFERENCED_ROW_2, errflag, str.c_ptr_safe());
+      thd->pop_internal_handler();
       DBUG_VOID_RETURN;
     }
     case HA_ERR_TABLE_DEF_CHANGED:
@@ -4064,6 +4206,12 @@ void handler::print_error(int error, myf errflag) {
       DBUG_VOID_RETURN;
     case HA_ERR_NOT_ALLOWED_COMMAND:
       textno = ER_NOT_ALLOWED_COMMAND;
+      break;
+    case HA_ERR_NO_SESSION_TEMP:
+      textno = ER_NO_SESSION_TEMP;
+      break;
+    case HA_ERR_WRONG_TABLE_NAME:
+      textno = ER_WRONG_TABLE_NAME;
       break;
     default: {
       /* The error was "unknown" to this function.
@@ -4174,7 +4322,7 @@ int handler::ha_check_for_upgrade(HA_CHECK_OPT *check_opt) {
 }
 
 // Function identifies any old data type present in table.
-int check_table_for_old_types(const TABLE *table) {
+int check_table_for_old_types(const TABLE *table, bool check_temporal_upgrade) {
   Field **field;
 
   for (field = table->field; (*field); field++) {
@@ -4202,11 +4350,6 @@ int check_table_for_old_types(const TABLE *table) {
 
     if ((*field)->type() == MYSQL_TYPE_YEAR && (*field)->field_length == 2)
       return HA_ADMIN_NEEDS_ALTER;  // obsolete YEAR(2) type
-
-    // Check for old temporal format if avoid_temporal_upgrade is disabled.
-    mysql_mutex_lock(&LOCK_global_system_variables);
-    bool check_temporal_upgrade = !avoid_temporal_upgrade;
-    mysql_mutex_unlock(&LOCK_global_system_variables);
 
     if (check_temporal_upgrade) {
       if (((*field)->real_type() == MYSQL_TYPE_TIME) ||
@@ -4331,7 +4474,13 @@ int handler::ha_check(THD *thd, HA_CHECK_OPT *check_opt) {
     return 0;
 
   if (table->s->mysql_version < MYSQL_VERSION_ID) {
-    if ((error = check_table_for_old_types(table))) return error;
+    // Check for old temporal format if avoid_temporal_upgrade is disabled.
+    mysql_mutex_lock(&LOCK_global_system_variables);
+    const bool check_temporal_upgrade = !avoid_temporal_upgrade;
+    mysql_mutex_unlock(&LOCK_global_system_variables);
+
+    if ((error = check_table_for_old_types(table, check_temporal_upgrade)))
+      return error;
     error = ha_check_for_upgrade(check_opt);
     if (error && (error != HA_ADMIN_NEEDS_CHECK)) return error;
     if (!error && (check_opt->sql_flags & TT_FOR_UPGRADE)) return 0;
@@ -4684,6 +4833,37 @@ int handler::ha_create(const char *name, TABLE *form, HA_CREATE_INFO *info,
   mark_trx_read_write();
 
   return create(name, form, info, table_def);
+}
+
+/**
+ * Prepares the secondary engine for table load.
+ *
+ * @param table The table to load into the secondary engine. Its read_set tells
+ * which columns to load.
+ *
+ * @sa handler::prepare_load_table()
+ */
+int handler::ha_prepare_load_table(const TABLE &table) {
+  return prepare_load_table(table);
+}
+
+/**
+ * Loads a table into its defined secondary storage engine: public interface.
+ *
+ * @param table The table to load into the secondary engine. Its read_set tells
+ * which columns to load.
+ *
+ * @sa handler::load_table()
+ */
+int handler::ha_load_table(const TABLE &table) { return load_table(table); }
+
+/**
+ * Unloads a table from its defined secondary storage engine: public interface.
+ *
+ * @sa handler::unload_table()
+ */
+int handler::ha_unload_table(const char *db_name, const char *table_name) {
+  return unload_table(db_name, table_name);
 }
 
 /**
@@ -5302,7 +5482,10 @@ static int ha_discover(THD *thd, const char *db, const char *name,
                      &args))
     error = 0;
 
-  if (!error) thd->status_var.ha_discover_count++;
+  if (!error) {
+    DBUG_ASSERT(!thd->status_var_aggregated);
+    thd->status_var.ha_discover_count++;
+  }
   DBUG_RETURN(error);
 }
 
@@ -6136,7 +6319,10 @@ int DsMrr_impl::dsmrr_init(RANGE_SEQ_IF *seq_funcs, void *seq_init_param,
 
   is_mrr_assoc = !(mode & HA_MRR_NO_ASSOCIATION);
 
-  if (is_mrr_assoc) table->in_use->status_var.ha_multi_range_read_init_count++;
+  if (is_mrr_assoc) {
+    DBUG_ASSERT(!thd->status_var_aggregated);
+    table->in_use->status_var.ha_multi_range_read_init_count++;
+  }
 
   rowids_buf_end = buf->buffer_end;
   elem_size = h->ref_length + (int)is_mrr_assoc * sizeof(void *);
@@ -7384,6 +7570,7 @@ int binlog_log_row(TABLE *table, const uchar *before_record,
       error = (*log_func)(thd, table, has_trans, before_record, after_record);
     }
   }
+
   return error ? HA_ERR_RBR_LOGGING_FAILED : 0;
 }
 
@@ -8189,7 +8376,7 @@ std::string table_definition(const char *table_name, const TABLE *mysql_table) {
 }
 
 #ifndef DBUG_OFF
-/** Covert a binary buffer to a raw string, replacing non-printable characters
+/** Convert a binary buffer to a raw string, replacing non-printable characters
  * with a dot.
  * @param[in] buf buffer to convert
  * @param[in] buf_size_bytes length of the buffer in bytes
@@ -8204,7 +8391,7 @@ static std::string buf_to_raw(const uchar *buf, uint buf_size_bytes) {
   return r;
 }
 
-/** Covert a binary buffer to a hex string, replacing each character with its
+/** Convert a binary buffer to a hex string, replacing each character with its
  * hex number.
  * @param[in] buf buffer to convert
  * @param[in] buf_size_bytes length of the buffer in bytes
@@ -8354,6 +8541,10 @@ std::string indexed_cells_to_string(const uchar *indexed_cells,
     const KEY_PART_INFO &key_part = mysql_index.key_part[i];
     Field *field = key_part.field;
 
+    // Check if this field should be included
+    if (!bitmap_is_set(mysql_index.table->read_set, field->field_index)) {
+      continue;
+    }
     if (key_len_so_far == indexed_cells_len) {
       break;
     }
@@ -8460,4 +8651,41 @@ static bool post_recover_handlerton(THD *, plugin_ref plugin, void *) {
 void ha_post_recover(void) {
   (void)plugin_foreach(nullptr, post_recover_handlerton,
                        MYSQL_STORAGE_ENGINE_PLUGIN, nullptr);
+}
+
+void handler::ha_set_primary_handler(handler *primary_handler) {
+  DBUG_ASSERT((ht->flags & HTON_IS_SECONDARY_ENGINE) != 0);
+  DBUG_ASSERT(primary_handler->table->s->has_secondary_engine());
+  m_primary_handler = primary_handler;
+}
+
+/**
+  Checks if the database name is reserved word used by SE by invoking
+  the handlerton method.
+
+  @param  plugin        SE plugin.
+  @param  name          Database name.
+
+  @retval true          If the name is reserved word.
+  @retval false         If the name is not reserved word.
+*/
+static bool is_reserved_db_name_handlerton(THD *, plugin_ref plugin,
+                                           void *name) {
+  handlerton *hton = plugin_data<handlerton *>(plugin);
+  if (hton->state == SHOW_OPTION_YES && hton->is_reserved_db_name)
+    return (hton->is_reserved_db_name(hton, (const char *)name));
+  return false;
+}
+
+/**
+   Check if the database name is reserved word used by SE.
+
+   @param  name    Database name.
+
+   @retval true    If the name is a reserved word.
+   @retval false   If the name is not a reserved word.
+*/
+bool ha_check_reserved_db_name(const char *name) {
+  return (plugin_foreach(NULL, is_reserved_db_name_handlerton,
+                         MYSQL_STORAGE_ENGINE_PLUGIN, (char *)name));
 }

@@ -26,6 +26,7 @@
 #include "gcs_base_test.h"
 
 #include "gcs_message_stage_lz4.h"
+#include "gcs_message_stage_split.h"
 
 using std::vector;
 
@@ -33,7 +34,7 @@ namespace gcs_parameters_unittest {
 
 class GcsParametersTest : public GcsBaseTest {
  protected:
-  GcsParametersTest() : m_gcs(NULL){};
+  GcsParametersTest() : m_gcs(NULL) {}
 
   virtual void SetUp() {
     m_gcs = Gcs_xcom_interface::get_interface();
@@ -50,10 +51,13 @@ class GcsParametersTest : public GcsBaseTest {
     m_params.add_parameter("compression", "on");
     m_params.add_parameter("compression_threshold", "1024");
     m_params.add_parameter("ip_whitelist", "127.0.0.1,192.168.1.0/24");
-    m_params.add_parameter("suspicions_timeout", "5");
+    m_params.add_parameter("non_member_expel_timeout", "5");
     m_params.add_parameter("suspicions_processing_period", "25");
+    m_params.add_parameter("member_expel_timeout", "120");
     m_params.add_parameter("join_attempts", "3");
     m_params.add_parameter("join_sleep_time", "5");
+    m_params.add_parameter("fragmentation", "on");
+    m_params.add_parameter("fragmentation_threshold", "1024");
   }
 
   virtual void TearDown() {
@@ -159,6 +163,82 @@ TEST_F(GcsParametersTest, ParametersCompression) {
   ASSERT_EQ(err, GCS_OK);
 }
 
+/*
+ Checks default values for fragmentation, does sanity checks, etc.
+ */
+TEST_F(GcsParametersTest, ParametersFragmentation) {
+  enum_gcs_error err;
+
+  // --------------------------------------------------------
+  // Fragmentation default values
+  // --------------------------------------------------------
+  Gcs_interface_parameters implicit_values;
+  implicit_values.add_parameter("group_name", "ola");
+  implicit_values.add_parameter("peer_nodes",
+                                "127.0.0.1:24844,127.0.0.1:24845");
+  implicit_values.add_parameter("local_node", "127.0.0.1:24844");
+  implicit_values.add_parameter("bootstrap_group", "true");
+  implicit_values.add_parameter("poll_spin_loops", "100");
+
+  err = m_gcs->initialize(implicit_values);
+
+  ASSERT_EQ(err, GCS_OK);
+
+  const Gcs_interface_parameters &init_params =
+      m_xcs->get_initialization_parameters();
+
+  // fragmentation is ON by default
+  ASSERT_TRUE(init_params.get_parameter("fragmentation")->compare("on") == 0);
+
+  // fragmentation_threshold is set to the default
+  std::stringstream ss;
+  ss << Gcs_message_stage_split_v2::DEFAULT_THRESHOLD;
+  ASSERT_TRUE(
+      init_params.get_parameter("fragmentation_threshold")->compare(ss.str()) ==
+      0);
+
+  // finalize the interface
+  err = m_gcs->finalize();
+
+  ASSERT_EQ(err, GCS_OK);
+
+  // --------------------------------------------------------
+  // Fragmentation explicit values
+  // --------------------------------------------------------
+  std::string fragmentation = "off";
+  std::string fragmentation_threshold = "1";
+
+  Gcs_interface_parameters explicit_values;
+  explicit_values.add_parameter("group_name", "ola");
+  explicit_values.add_parameter("peer_nodes",
+                                "127.0.0.1:24844,127.0.0.1:24845");
+  explicit_values.add_parameter("local_node", "127.0.0.1:24844");
+  explicit_values.add_parameter("bootstrap_group", "true");
+  explicit_values.add_parameter("poll_spin_loops", "100");
+  explicit_values.add_parameter("fragmentation", fragmentation);
+  explicit_values.add_parameter("fragmentation_threshold",
+                                fragmentation_threshold);
+
+  err = m_gcs->initialize(explicit_values);
+
+  const Gcs_interface_parameters &init_params2 =
+      m_xcs->get_initialization_parameters();
+
+  ASSERT_EQ(err, GCS_OK);
+
+  // fragmentation is ON by default
+  ASSERT_TRUE(
+      init_params2.get_parameter("fragmentation")->compare(fragmentation) == 0);
+
+  // fragmentation is set to the value we explicitly configured
+  ASSERT_TRUE(init_params2.get_parameter("fragmentation_threshold")
+                  ->compare(fragmentation_threshold) == 0);
+
+  err = m_gcs->finalize();
+
+  ASSERT_EQ(err, GCS_OK);
+}
+
 TEST_F(GcsParametersTest, SanityParameters) {
   // initialize the interface
   enum_gcs_error err = m_gcs->initialize(m_params);
@@ -258,6 +338,16 @@ TEST_F(GcsParametersTest, InvalidCompressionThreshold) {
   *p = save;
 }
 
+TEST_F(GcsParametersTest, InvalidFragmentationThreshold) {
+  std::string *p =
+      (std::string *)m_params.get_parameter("fragmentation_threshold");
+  std::string save = *p;
+
+  *p = "Invalid";
+  do_check_params();
+  *p = save;
+}
+
 TEST_F(GcsParametersTest, InvalidLocalNodeAddress) {
   std::string *p = (std::string *)m_params.get_parameter("local_node");
   std::string save = *p;
@@ -319,13 +409,20 @@ TEST_F(GcsParametersTest, InvalidLocalNode_IP_not_found) {
   *p = save;
 }
 
-TEST_F(GcsParametersTest, InvalidSuspicionsTimeout) {
-  std::string *p =
-      const_cast<std::string *>(m_params.get_parameter("suspicions_timeout"));
+TEST_F(GcsParametersTest, InvalidNonMemberExpelTimeout) {
+  std::string *p = const_cast<std::string *>(
+      m_params.get_parameter("non_member_expel_timeout"));
   std::string save = *p;
 
   *p = "Invalid";
   do_check_params();
+
+  *p = "-1";
+  do_check_params();
+
+  *p = "3.5";
+  do_check_params();
+
   *p = save;
 }
 
@@ -336,6 +433,30 @@ TEST_F(GcsParametersTest, InvalidSuspicionsProcessingPeriod) {
 
   *p = "Invalid";
   do_check_params();
+
+  *p = "-1";
+  do_check_params();
+
+  *p = "3.5";
+  do_check_params();
+
+  *p = save;
+}
+
+TEST_F(GcsParametersTest, InvalidMemberExpelTimeout) {
+  std::string *p =
+      const_cast<std::string *>(m_params.get_parameter("member_expel_timeout"));
+  std::string save = *p;
+
+  *p = "Invalid";
+  do_check_params();
+
+  *p = "-1";
+  do_check_params();
+
+  *p = "3.5";
+  do_check_params();
+
   *p = save;
 }
 

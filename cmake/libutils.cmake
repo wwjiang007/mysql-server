@@ -38,9 +38,6 @@
 
 
 GET_FILENAME_COMPONENT(MYSQL_CMAKE_SCRIPT_DIR ${CMAKE_CURRENT_LIST_FILE} PATH)
-IF(WIN32 OR APPLE OR DISABLE_SHARED)
-  SET(_SKIP_PIC 1)
-ENDIF()
 
 INCLUDE(${MYSQL_CMAKE_SCRIPT_DIR}/cmake_parse_arguments.cmake)
 # CREATE_EXPORT_FILE (VAR target api_functions)
@@ -67,14 +64,28 @@ ENDMACRO()
 # ADD_CONVENIENCE_LIBRARY(name source1...sourceN)
 # Create static library that can be merged with other libraries.
 MACRO(ADD_CONVENIENCE_LIBRARY)
-  SET(TARGET ${ARGV0})
-  SET(SOURCES ${ARGN})
+  MYSQL_PARSE_ARGUMENTS(ARG
+    ""
+    "EXCLUDE_FROM_ALL"
+    ${ARGN}
+    )
+  LIST(GET ARG_DEFAULT_ARGS 0 TARGET)
+  SET(SOURCES ${ARG_DEFAULT_ARGS})
   LIST(REMOVE_AT SOURCES 0)
   ADD_LIBRARY(${TARGET} STATIC ${SOURCES})
 
   # Collect all static libraries in the same directory
   SET_TARGET_PROPERTIES(${TARGET} PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/archive_output_directory)
+
+  IF(ARG_EXCLUDE_FROM_ALL)
+#   MESSAGE(STATUS "EXCLUDE_FROM_ALL ${TARGET}")
+    SET_PROPERTY(TARGET ${TARGET} PROPERTY EXCLUDE_FROM_ALL TRUE)
+    IF(WIN32)
+      SET_PROPERTY(TARGET ${TARGET} PROPERTY EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+    ENDIF()
+  ENDIF()
+
 
   # Keep track of known convenience libraries, in a global scope.
   SET(KNOWN_CONVENIENCE_LIBRARIES
@@ -114,46 +125,26 @@ MACRO(ADD_IMPORTED_LIBRARY TARGET LOC)
     )
 ENDMACRO()
 
-# Write content to file, using CONFIGURE_FILE
-# The advantage compared to FILE(WRITE) is that timestamp
-# does not change if file already has the same content
-MACRO(CONFIGURE_FILE_CONTENT content file)
-  SET(CMAKE_CONFIGURABLE_FILE_CONTENT
-    "${content}\n")
-  CONFIGURE_FILE(
-    ${MYSQL_CMAKE_SCRIPT_DIR}/configurable_file_content.in
-    ${file}
-    @ONLY)
-ENDMACRO()
-
 # Create libs from libs.
 # Merge static libraries, creates shared libraries out of convenience libraries.
 MACRO(MERGE_LIBRARIES_SHARED)
   MYSQL_PARSE_ARGUMENTS(ARG
     "EXPORTS;OUTPUT_NAME;COMPONENT"
-    "SKIP_INSTALL"
+    "SKIP_INSTALL;EXCLUDE_FROM_ALL"
     ${ARGN}
     )
   LIST(GET ARG_DEFAULT_ARGS 0 TARGET)
   SET(LIBS ${ARG_DEFAULT_ARGS})
   LIST(REMOVE_AT LIBS 0)
 
-  SET(LIBTYPE SHARED)
-  # check for non-PIC libraries
-  IF(NOT _SKIP_PIC)
-    FOREACH(LIB ${LIBS})
-      GET_TARGET_PROPERTY(${LIB} TYPE LIBTYPE)
-      IF(LIBTYPE STREQUAL "STATIC_LIBRARY")
-        GET_TARGET_PROPERTY(LIB COMPILE_FLAGS LIB_COMPILE_FLAGS)
-        IF(NOT LIB_COMPILE_FLAGS MATCHES "<PIC_FLAG>")
-          MESSAGE(FATAL_ERROR
-            "Attempted to link non-PIC static library ${LIB} to shared library ${TARGET}\n"
-            "Please use ADD_CONVENIENCE_LIBRARY, instead of ADD_LIBRARY for ${LIB}"
-            )
-        ENDIF()
-      ENDIF()
-    ENDFOREACH()
-  ENDIF()
+  FOREACH(LIB ${LIBS})
+    LIST(FIND KNOWN_CONVENIENCE_LIBRARIES ${LIB} FOUNDIT)
+    IF(FOUNDIT LESS 0)
+      MESSAGE(STATUS "Known libs : ${KNOWN_CONVENIENCE_LIBRARIES}")
+      MESSAGE(FATAL_ERROR "Unknown static library ${LIB} FOUNDIT ${FOUNDIT}")
+    ENDIF()
+  ENDFOREACH()
+
   CREATE_EXPORT_FILE(SRC ${TARGET} "${ARG_EXPORTS}")
   IF(UNIX)
     # Mark every export as explicitly needed, so that ld won't remove the .a files
@@ -167,16 +158,28 @@ MACRO(MERGE_LIBRARIES_SHARED)
       ENDIF()
     ENDFOREACH()
   ENDIF()
+
   IF(NOT ARG_SKIP_INSTALL)
     ADD_VERSION_INFO(${TARGET} SHARED SRC)
   ENDIF()
-  ADD_LIBRARY(${TARGET} ${LIBTYPE} ${SRC})
+  ADD_LIBRARY(${TARGET} SHARED ${SRC})
+
+  IF(ARG_EXCLUDE_FROM_ALL)
+    IF(NOT ARG_SKIP_INSTALL)
+      MESSAGE(FATAL_ERROR "EXCLUDE_FROM_ALL requires SKIP_INSTALL")
+    ENDIF()
+#   MESSAGE(STATUS "EXCLUDE_FROM_ALL ${TARGET}")
+    SET_PROPERTY(TARGET ${TARGET} PROPERTY EXCLUDE_FROM_ALL TRUE)
+    IF(WIN32)
+      SET_PROPERTY(TARGET ${TARGET} PROPERTY EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+    ENDIF()
+  ENDIF()
 
   # Collect all dynamic libraries in the same directory
   SET_TARGET_PROPERTIES(${TARGET} PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/library_output_directory)
   IF(WIN32_CLANG AND WITH_ASAN)
-    TARGET_LINK_LIBRARIES(${TARGET} "${ASAN_LIB_DIR}/clang_rt.asan_dll_thunk-x86_64.lib")
+    TARGET_LINK_LIBRARIES(${TARGET} PRIVATE "${ASAN_LIB_DIR}/clang_rt.asan_dll_thunk-x86_64.lib")
   ENDIF()
 
   IF(WIN32)
@@ -186,7 +189,7 @@ MACRO(MERGE_LIBRARIES_SHARED)
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/library_output_directory)
   ENDIF()
 
-  TARGET_LINK_LIBRARIES(${TARGET} ${LIBS})
+  TARGET_LINK_LIBRARIES(${TARGET} PRIVATE ${LIBS})
   IF(ARG_OUTPUT_NAME)
     SET_TARGET_PROPERTIES(
       ${TARGET} PROPERTIES OUTPUT_NAME "${ARG_OUTPUT_NAME}")
@@ -250,7 +253,7 @@ ENDFUNCTION()
 MACRO(MERGE_CONVENIENCE_LIBRARIES)
   MYSQL_PARSE_ARGUMENTS(ARG
     "OUTPUT_NAME;COMPONENT"
-    "SKIP_INSTALL"
+    "SKIP_INSTALL;EXCLUDE_FROM_ALL"
     ${ARGN}
     )
   LIST(GET ARG_DEFAULT_ARGS 0 TARGET)
@@ -261,14 +264,23 @@ MACRO(MERGE_CONVENIENCE_LIBRARIES)
     ${CMAKE_BINARY_DIR}/archive_output_directory/${TARGET}_depends.c)
   ADD_LIBRARY(${TARGET} STATIC ${SOURCE_FILE})
 
+  IF(ARG_EXCLUDE_FROM_ALL)
+    IF(NOT ARG_SKIP_INSTALL)
+      MESSAGE(FATAL_ERROR "EXCLUDE_FROM_ALL requires SKIP_INSTALL")
+    ENDIF()
+#   MESSAGE(STATUS "EXCLUDE_FROM_ALL ${TARGET}")
+    SET_PROPERTY(TARGET ${TARGET} PROPERTY EXCLUDE_FROM_ALL TRUE)
+    IF(WIN32)
+      SET_PROPERTY(TARGET ${TARGET} PROPERTY EXCLUDE_FROM_DEFAULT_BUILD TRUE)
+    ENDIF()
+  ENDIF()
+
   # Collect all static libraries in the same directory
   SET_TARGET_PROPERTIES(${TARGET} PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/archive_output_directory)
 
   # Go though the list of libraries.
   # Known convenience libraries should have type "STATIC_LIBRARY"
-  # We assume that that unknown libraries (type "LIB_TYPE-NOTFOUND")
-  # are operating system libraries, to be linked with TARGET
   SET(OSLIBS)
   SET(MYLIBS)
   FOREACH(LIB ${LIBS})
@@ -276,8 +288,8 @@ MACRO(MERGE_CONVENIENCE_LIBRARIES)
     IF(LIB_TYPE STREQUAL "STATIC_LIBRARY")
       LIST(FIND KNOWN_CONVENIENCE_LIBRARIES ${LIB} FOUNDIT)
       IF(FOUNDIT LESS 0)
-        MESSAGE(FATAL_ERROR "Unknown static library ${LIB} FOUNDIT ${FOUNDIT}")
         MESSAGE(STATUS "Known libs : ${KNOWN_CONVENIENCE_LIBRARIES}")
+        MESSAGE(FATAL_ERROR "Unknown static library ${LIB} FOUNDIT ${FOUNDIT}")
       ELSE()
         ADD_DEPENDENCIES(${TARGET} ${LIB})
         GET_TARGET_PROPERTY(loc ${LIB} IMPORTED_LOCATION)
@@ -292,16 +304,15 @@ MACRO(MERGE_CONVENIENCE_LIBRARIES)
         ENDIF()
       ENDIF()
     ELSE()
-      # 3rd party library like libz.so. Make sure that everything
-      # that links to our library links to this one as well.
-      LIST(APPEND OSLIBS ${LIB})
+      # 3rd party library like libz.so. This is a usage error of this macro.
+      MESSAGE(FATAL_ERROR "Unknown 3rd party lib ${LIB}")
     ENDIF()
     # MESSAGE(STATUS "LIB ${LIB} LIB_TYPE ${LIB_TYPE}")
   ENDFOREACH()
 
   IF(OSLIBS)
     LIST(REMOVE_DUPLICATES OSLIBS)
-    TARGET_LINK_LIBRARIES(${TARGET} ${OSLIBS})
+    TARGET_LINK_LIBRARIES(${TARGET} PRIVATE ${OSLIBS})
     MESSAGE(STATUS "Library ${TARGET} depends on OSLIBS ${OSLIBS}")
   ENDIF()
 

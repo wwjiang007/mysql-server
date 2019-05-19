@@ -279,10 +279,12 @@ drop table t1;
 #
 create table t1(f1 date);
 insert into t1 values('01-01-01'),('02-02-02'),('01-01-01'),('02-02-02');
+--disable_ps_protocol  # See bug #27245598.
 set @bug28261='';
 select if(@bug28261 = f1, '', @bug28261:= f1) from t1;
 select if(@bug28261 = f1, '', @bug28261:= f1) from t1;
 select if(@bug28261 = f1, '', @bug28261:= f1) from t1;
+--enable_ps_protocol
 drop table t1;
 
 #
@@ -458,6 +460,7 @@ SELECT CAST(CAST('2008-07-29T10:42:51.1234567' AS DateTime) AS DECIMAL(30,7));
 --echo # 
 CREATE TABLE t1 (dt1 DATETIME);
 INSERT IGNORE INTO t1 (dt1) VALUES ('0000-00-01 00:00:01');
+--error ER_WRONG_VALUE
 DELETE IGNORE  FROM t1 WHERE dt1 = '0000-00-01 00:00:01';
 --echo # Should be empty
 SELECT * FROM t1;

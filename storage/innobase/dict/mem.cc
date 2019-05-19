@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2019, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -41,7 +41,6 @@ external tools. */
 #ifndef UNIV_HOTBACKUP
 #include "lock0lock.h"
 #endif /* !UNIV_HOTBACKUP */
-#include "my_inttypes.h"
 
 /** Append 'name' to 'col_names'.  @see dict_table_t::col_names
  @return new column names array */
@@ -155,8 +154,8 @@ dict_table_t *dict_mem_table_create(
     ulint n_cols,     /*!< in: total number of columns including
                       virtual and non-virtual columns */
     ulint n_v_cols,   /*!< in: number of virtual columns */
-    ulint flags,      /*!< in: table flags */
-    ulint flags2)     /*!< in: table flags2 */
+    uint32_t flags,   /*!< in: table flags */
+    uint32_t flags2)  /*!< in: table flags2 */
 {
   dict_table_t *table;
   mem_heap_t *heap;

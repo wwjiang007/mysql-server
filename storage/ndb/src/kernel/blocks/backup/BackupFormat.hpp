@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2017, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -39,8 +39,9 @@ struct BackupFormat {
   static const Uint32 NDB_MAX_LCP_PARTS_PER_ROUND =
     NDB_MAX_LCP_PARTS / NDB_MAX_FILES_PER_LCP;
   static const Uint32 NDB_MAX_LCP_FILES = 2064;
-  static const Uint32 NDB_LCP_CTL_FILE_SIZE = 4096;
+  static const Uint32 NDB_LCP_CTL_FILE_SIZE_SMALL = 4096;
   static const Uint32 NDB_LCP_CTL_FILE_SIZE_BIG = 8192;
+  static const Uint32 BYTES_PER_PART_ON_DISK = 3;
 
   enum RecordType
   {
@@ -164,6 +165,24 @@ struct BackupFormat {
      */
     struct PartPair partPairs[1];
   };
+
+  /**
+   * The convert_ctl_page_to_host is used by DBTUP and RESTORE as
+   * well, these blocks need to have a buffer with size
+   * LCP_CTL_FILE_DATA_SIZE to handle the conversion, this buffer
+   * is a bit bigger than the file size since we decompress the
+   * area.
+   */
+  static const Uint32 LCP_CTL_FILE_SIZE_ON_DISK =
+                   (BYTES_PER_PART_ON_DISK * NDB_MAX_LCP_PARTS) +
+                   sizeof(BackupFormat::LCPCtlFile);
+  static const Uint32 LCP_CTL_SIZE_IN_MEMORY =
+    (sizeof(struct PartPair) * NDB_MAX_LCP_PARTS) +
+      sizeof(BackupFormat::LCPCtlFile);
+  static const Uint32 LCP_CTL_FILE_BUFFER_SIZE_IN_WORDS =
+    (MAX(NDB_LCP_CTL_FILE_SIZE_BIG,
+        MAX(LCP_CTL_FILE_SIZE_ON_DISK, LCP_CTL_SIZE_IN_MEMORY))) / 4;
+
   /**
    * Data file formats
    */

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2019 Oracle and/or its affiliates. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2.0,
@@ -32,7 +32,7 @@
 #include "welcome_copyright_notice.h"
 
 #include "plugin/x/generated/mysqlx_version.h"
-#include "plugin/x/ngs/include/ngs_common/to_string.h"
+#include "plugin/x/src/helper/to_string.h"
 #include "plugin/x/tests/driver/processor/commands/command.h"
 #include "plugin/x/tests/driver/processor/commands/mysqlxtest_error_names.h"
 
@@ -154,13 +154,13 @@ Driver_command_line_options::Driver_command_line_options(const int argc,
     } else if (check_arg(argv, i, "--no-auth", "-n")) {
       m_run_without_auth = true;
     } else if (check_arg(argv, i, "--plain-auth", NULL)) {
-      m_auth_methods.push_back("PLAIN");
+      m_connection_options.auth_methods.push_back("PLAIN");
     } else if (check_arg(argv, i, "--cached-auth", NULL)) {
-      m_auth_methods.push_back("SHA256_MEMORY");
+      m_connection_options.auth_methods.push_back("SHA256_MEMORY");
     } else if (check_arg(argv, i, "--using-cap-auth", NULL)) {
-      m_auth_methods.push_back("FROM_CAPABILITIES");
+      m_connection_options.auth_methods.push_back("FROM_CAPABILITIES");
     } else if (check_arg(argv, i, "--mysql41-auth", NULL)) {
-      m_auth_methods.push_back("MYSQL41");
+      m_connection_options.auth_methods.push_back("MYSQL41");
     } else if (check_arg_with_value(argv, i, "--debug", NULL, value)) {
 #ifndef DBUG_OFF
       DBUG_PUSH(value);
@@ -189,6 +189,9 @@ Driver_command_line_options::Driver_command_line_options(const int argc,
       m_connection_options.allowed_tls = value;
     } else if (check_arg_with_value(argv, i, "--host", "-h", value)) {
       m_connection_options.host = value;
+    } else if (check_arg_with_value(argv, i, "--network-namespace", NULL,
+                                    value)) {
+      m_connection_options.network_namespace = value;
     } else if (check_arg_with_value(argv, i, "--user", "-u", value)) {
       m_connection_options.user = value;
     } else if (check_arg_with_value(argv, i, "--uri", NULL, value)) {
@@ -196,15 +199,16 @@ Driver_command_line_options::Driver_command_line_options(const int argc,
     } else if (check_arg_with_value(argv, i, "--schema", NULL, value)) {
       m_connection_options.schema = value;
     } else if (check_arg_with_value(argv, i, "--port", "-P", value)) {
-      m_connection_options.port = ngs::stoi(value);
+      m_connection_options.port = std::stoi(value);
     } else if (check_arg_with_value(argv, i, "--ipv", NULL, value)) {
-      m_connection_options.ip_mode = set_protocol(ngs::stoi(value));
+      m_connection_options.ip_mode = set_protocol(std::stoi(value));
     } else if (check_arg_with_value(argv, i, "--timeout", "-t", value)) {
-      m_connection_options.io_timeout = ngs::stoi(value);
+      m_connection_options.session_connect_timeout =
+          m_connection_options.io_timeout = std::stoi(value);
     } else if (check_arg_with_value(argv, i, "--expect-error", NULL, value)) {
       m_expected_error_code = mysqlxtest::get_error_code_by_text(value);
     } else if (check_arg_with_value(argv, i, "--fatal-errors", NULL, value)) {
-      m_context_options.m_fatal_errors = ngs::stoi(value);
+      m_context_options.m_fatal_errors = std::stoi(value);
     } else if (check_arg_with_value(argv, i, "--password", "-p", value)) {
       m_connection_options.password = value;
     } else if (check_arg_with_value(argv, i, "--socket", "-S", value)) {

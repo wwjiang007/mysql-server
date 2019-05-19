@@ -1,4 +1,5 @@
-/* Copyright (c) 2008, 2017, Oracle and/or its affiliates. All rights reserved.
+/*
+   Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -155,7 +156,7 @@ PgmanProxy::sendEND_LCPCONF(Signal* signal, Uint32 ssId)
     sendSignal(senderRef, GSN_END_LCPCONF,
                signal, EndLcpConf::SignalLength, JBB);
   } else {
-    ndbrequire(false);
+    ndbabort();
   }
 
   ssRelease<Ss_END_LCPREQ>(ssId);
@@ -284,6 +285,15 @@ PgmanProxy::send_data_file_ord(Signal* signal,
   ord->fd = fd;
   sendSignal(workerRef(i), GSN_DATA_FILE_ORD,
              signal, DataFileOrd::SignalLength, JBB);
+}
+
+bool
+PgmanProxy::extent_pages_available(Uint32 pages_needed,
+                                          Page_cache_client& caller)
+{
+  ndbrequire(blockToInstance(caller.m_block) == 0);
+  Pgman* worker = (Pgman*)workerBlock(c_workers - 1); // extraWorkerBlock();
+  return worker->extent_pages_available(pages_needed);
 }
 
 BLOCK_FUNCTIONS(PgmanProxy)

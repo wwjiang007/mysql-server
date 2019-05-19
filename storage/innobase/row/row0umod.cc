@@ -39,8 +39,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ha_prototypes.h"
 #include "log0log.h"
 #include "mach0data.h"
-#include "my_compiler.h"
-#include "my_inttypes.h"
 #include "que0que.h"
 #include "row0log.h"
 #include "row0row.h"
@@ -53,8 +51,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0trx.h"
 #include "trx0undo.h"
 
-#include <debug_sync.h>
 #include "current_thd.h"
+#include "debug_sync.h"
 
 /* Considerations on undoing a modify operation.
 (1) Undoing a delete marking: all index records should be found. Some of
@@ -215,6 +213,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t row_undo_mod_remove_clust_low(
   than the rolling-back one. */
   ut_ad(rec_get_deleted_flag(btr_cur_get_rec(btr_cur),
                              dict_table_is_comp(node->table)));
+
+  row_convert_impl_to_expl_if_needed(btr_cur, node);
 
   if (mode == BTR_MODIFY_LEAF) {
     err = btr_cur_optimistic_delete(btr_cur, 0, mtr) ? DB_SUCCESS : DB_FAIL;
@@ -480,6 +480,8 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
                                      " on rollback update.";
       }
     }
+
+    row_convert_impl_to_expl_if_needed(btr_cur, node);
 
     if (modify_leaf) {
       success = btr_cur_optimistic_delete(btr_cur, 0, &mtr);

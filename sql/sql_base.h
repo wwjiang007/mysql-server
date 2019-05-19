@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -33,11 +33,12 @@
 #include "my_base.h"  // ha_extra_function
 #include "my_inttypes.h"
 #include "mysql/components/services/mysql_mutex_bits.h"
-#include "sql/mdl.h"          // MDL_savepoint
-#include "sql/sql_array.h"    // Bounds_checked_array
-#include "sql/sql_const.h"    // enum_resolution_type
-#include "sql/trigger_def.h"  // enum_trigger_event_type
-#include "thr_lock.h"         // thr_lock_type
+#include "prealloced_array.h"  // Prealloced_array
+#include "sql/mdl.h"           // MDL_savepoint
+#include "sql/sql_array.h"     // Bounds_checked_array
+#include "sql/sql_const.h"     // enum_resolution_type
+#include "sql/trigger_def.h"   // enum_trigger_event_type
+#include "thr_lock.h"          // thr_lock_type
 
 class COPY_INFO;
 class Field;
@@ -77,30 +78,11 @@ class Table;
 #define EXTRA_RECORD 8    /* Reservera plats f|r extra record */
 #define DELAYED_OPEN 4096 /* Open table later */
 /**
-  This flag is used in function get_all_tables() which fills
-  I_S tables with data which are retrieved from frm files and storage engine
-  The flag means that we need to open FRM file only to get necessary data.
+  If set, open_table_from_share() will skip calling get_new_handler() to
+  create a new handler object for the table. Designed to be used when
+  opening a table from inside storage engines.
 */
-#define OPEN_FRM_FILE_ONLY 32768
-/**
-  This flag is used in function get_all_tables() which fills
-  I_S tables with data which are retrieved from frm files and storage engine
-  The flag means that we need to process tables only to get necessary data.
-  Views are not processed.
-*/
-#define OPEN_TABLE_ONLY OPEN_FRM_FILE_ONLY * 2
-/**
-  This flag is used in function get_all_tables() which fills
-  I_S tables with data which are retrieved from frm files and storage engine.
-  The flag means that I_S table uses optimization algorithm.
-*/
-#define OPTIMIZE_I_S_TABLE OPEN_TABLE_ONLY * 2
-/**
-  Avoid dd::Table lookup in open_table_from_share() call.
-  Temporary workaround used by upgrade code until we start
-  reading info from InnoDB SYS tables directly.
-*/
-#define OPEN_NO_DD_TABLE OPTIMIZE_I_S_TABLE * 2
+#define SKIP_NEW_HANDLER 32768
 
 enum find_item_error_report_type {
   REPORT_ALL_ERRORS,
@@ -125,8 +107,8 @@ void assign_new_table_id(TABLE_SHARE *share);
 uint cached_table_definitions(void);
 size_t get_table_def_key(const TABLE_LIST *table_list, const char **key);
 TABLE_SHARE *get_table_share(THD *thd, const char *db, const char *table_name,
-                             const char *key, size_t key_length,
-                             bool open_view);
+                             const char *key, size_t key_length, bool open_view,
+                             bool open_secondary = false);
 void release_table_share(TABLE_SHARE *share);
 
 TABLE *open_ltable(THD *thd, TABLE_LIST *table_list, thr_lock_type update,
@@ -184,6 +166,8 @@ TABLE *open_ltable(THD *thd, TABLE_LIST *table_list, thr_lock_type update,
   which represents table open in storage engines can still be used.
 */
 #define MYSQL_OPEN_NO_NEW_TABLE_IN_SE 0x8000
+/** Open a shadow copy of a table from a secondary storage engine. */
+#define MYSQL_OPEN_SECONDARY_ENGINE 0x10000
 
 /** Please refer to the internals manual. */
 #define MYSQL_OPEN_REOPEN                                           \
@@ -235,6 +219,17 @@ bool fill_record(THD *thd, TABLE *table, Field **field, List<Item> &values,
 
 bool check_record(THD *thd, Field **ptr);
 
+/**
+  Invoke check constraints defined on the table.
+
+  @param  thd                   Thread handle.
+  @param  table                 Instance of TABLE.
+
+  @retval  false  If all enforced check constraints are satisfied.
+  @retval  true   Otherwise. THD::is_error() may be "true" in this case.
+*/
+bool invoke_table_check_constraints(THD *thd, const TABLE *table);
+
 Field *find_field_in_tables(THD *thd, Item_ident *item, TABLE_LIST *first_table,
                             TABLE_LIST *last_table, Item **ref,
                             find_item_error_report_type report_error,
@@ -266,9 +261,10 @@ int run_before_dml_hook(THD *thd);
 bool get_and_lock_tablespace_names(THD *thd, TABLE_LIST *tables_start,
                                    TABLE_LIST *tables_end,
                                    ulong lock_wait_timeout, uint flags);
-bool lock_table_names(THD *thd, TABLE_LIST *table_list,
-                      TABLE_LIST *table_list_end, ulong lock_wait_timeout,
-                      uint flags);
+bool lock_table_names(
+    THD *thd, TABLE_LIST *table_list, TABLE_LIST *table_list_end,
+    ulong lock_wait_timeout, uint flags,
+    Prealloced_array<MDL_request *, 1> *schema_reqs = nullptr);
 bool open_tables(THD *thd, TABLE_LIST **tables, uint *counter, uint flags,
                  Prelocking_strategy *prelocking_strategy);
 /* open_and_lock_tables */

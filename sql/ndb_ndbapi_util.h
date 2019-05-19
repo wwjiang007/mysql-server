@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2011, 2017, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2011, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -26,6 +26,8 @@
 #define NDB_NDBAPI_UTIL_H
 
 #include <stddef.h>
+#include <string>
+#include <unordered_set>
 
 #include "storage/ndb/include/ndbapi/NdbBlob.hpp"
 #include "storage/ndb/include/ndbapi/NdbDictionary.hpp"
@@ -78,5 +80,73 @@ bool ndb_table_has_blobs(const NdbDictionary::Table* ndbtab);
  * @return true if the table has a hidden primary key
  */
 bool ndb_table_has_hidden_pk(const NdbDictionary::Table* ndbtab);
+
+
+/**
+ * @brief check if the NDB table has tablespace
+ * @param ndbtab
+ * @return true if the table has a tablespace
+ *
+ * @note This is indicated either by the table having a tablespace name
+ *       or id+version of the tablespace
+ */
+bool ndb_table_has_tablespace(const NdbDictionary::Table* ndbtab);
+
+
+/**
+ * @brief check if the NDB table has tablespace name indicating
+ *        that is has a tablespace
+ * @param ndbtab
+ * @return nullptr or tablespace name
+ *
+ * @note The NdbApi function getTablespaceName() is peculiar as it
+ *       returns the empty string to indicate that tablespace name
+ *       is not available, normally you'd expect NULL to be returned
+ *       from a function returning "const char*"
+ *
+ */
+const char* ndb_table_tablespace_name(const NdbDictionary::Table* ndbtab);
+
+
+/**
+ * @brief Checks if an error has occurred in a ndbapi call
+ * @param dict  NDB Dictionary
+ * @return true if error has occurred, false if not
+ */
+bool ndb_dict_check_NDB_error(NdbDictionary::Dictionary* dict);
+
+
+/**
+ * @brief Retrieves list of logfile group names from NDB Dictionary
+ * @param dict            NDB Dictionary
+ * @param lfg_names [out] List of logfile group names
+ * @return true on success, false on failure
+ */
+bool ndb_get_logfile_group_names(NdbDictionary::Dictionary* dict,
+                                 std::unordered_set<std::string>& lfg_names);
+
+
+/**
+ * @brief Retrieves list of tablespace names from NDB Dictionary
+ * @param dict                   NDB Dictionary
+ * @param tablespace_names [out] List of tablespace names
+ * @return true on success, false on failure
+ */
+bool
+ndb_get_tablespace_names(NdbDictionary::Dictionary* dict,
+                         std::unordered_set<std::string>& tablespace_names);
+
+
+/**
+ * @brief Retrieves list of table names in the given schema from NDB Dictionary
+ * @param dict              NDB Dictionary
+ * @param schema_name       Schema name
+ * @param table_names [out] List of table names
+ * @return true on success, false on failure
+ */
+bool
+ndb_get_table_names_in_schema(NdbDictionary::Dictionary* dict,
+                              const std::string &schema_name,
+                              std::unordered_set<std::string>& table_names);
 
 #endif
