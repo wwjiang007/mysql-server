@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -33,5 +33,5 @@ CREATE OR REPLACE
 VIEW memory_global_total (
   total_allocated
 ) AS
-SELECT sys.format_bytes(SUM(CURRENT_NUMBER_OF_BYTES_USED)) total_allocated
+SELECT format_bytes(SUM(CURRENT_NUMBER_OF_BYTES_USED)) total_allocated
   FROM performance_schema.memory_summary_global_by_event_name;

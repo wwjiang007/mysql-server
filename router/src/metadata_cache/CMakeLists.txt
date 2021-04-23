@@ -1,4 +1,4 @@
-# Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2016, 2021, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -23,7 +23,11 @@
 SET(METADATA_CACHE_SOURCES
   src/metadata_factory.cc
   src/cluster_metadata.cc
+  src/cluster_metadata_ar.cc
+  src/cluster_metadata_gr.cc
   src/metadata_cache.cc
+  src/metadata_cache_ar.cc
+  src/metadata_cache_gr.cc
   src/cache_api.cc
   src/group_replication_metadata.cc
   src/gr_notifications_listener.cc
@@ -35,7 +39,7 @@ SET(include_dirs
   src/
 )
 
-INCLUDE_DIRECTORIES(SYSTEM ${PROTOBUF_INCLUDE_DIR}
+INCLUDE_DIRECTORIES(SYSTEM
   ${MYSQLX_GENERATE_DIR}
   ${CMAKE_SOURCE_DIR}/plugin/x/client
 )
@@ -55,7 +59,7 @@ TARGET_LINK_LIBRARIES(metadata_cache PRIVATE
   ${PROTOBUF_LITE_LIBRARY}
   )
 
-ADD_DEPENDENCIES(${MYSQL_ROUTER_BUILD_ALL_TARGET} mysqlxclient_lite)
+ADD_DEPENDENCIES(mysqlrouter_all mysqlxclient_lite)
 
 IF(WIN32)
   INSTALL(TARGETS metadata_cache

@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -356,7 +356,7 @@ int runTestMaxOperations(NDBT_Context* ctx, NDBT_Step* step){
   }
 
   maxOpsLimit = 100;
-  Uint32 coolDownLoops = 25;
+  Uint32 coolDownLoops = 250;
   while (coolDownLoops-- > 0){
     int errors = 0;
     const int maxErrors = 5;
@@ -5374,7 +5374,7 @@ public:
     init();
   }
 
-  ~BasicSectionStore()
+  ~BasicSectionStore() override
   {
     freeStorage();
   }
@@ -5394,7 +5394,7 @@ public:
     free(ptrs[2].p);
   }
 
-  virtual int appendToSection(Uint32 secId, LinearSectionPtr ptr)
+  int appendToSection(Uint32 secId, LinearSectionPtr ptr) override
   {
     /* Potentially expensive re-alloc + copy */
     require(secId < 3);
@@ -6487,7 +6487,7 @@ testMgmdSendBufferExhaust(NDBT_Context* ctx, NDBT_Step* step)
   ndbout << "Reducing MGMD SB memory + blocking send to data node" << endl;
   const int leftSbBytes = 96 * 1024;
   const int dumpCodeConsumeSb [] = {9996, leftSbBytes};
-  const int dumpCodeBlockSend [] = {9994, dataNodeId};
+  const int dumpCodeBlockSend [] = {9988, dataNodeId};
   CHECK(restarter.dumpStateOneNode(mgmdNodeId, dumpCodeConsumeSb, 2) == 0);
   CHECK(restarter.dumpStateOneNode(mgmdNodeId, dumpCodeBlockSend, 2) == 0);
 
@@ -6515,7 +6515,7 @@ testMgmdSendBufferExhaust(NDBT_Context* ctx, NDBT_Step* step)
   }
 
   ndbout << "Cleaning up" << endl;
-  const int dumpCodeUnblockSend [] = {9995, dataNodeId};
+  const int dumpCodeUnblockSend [] = {9989, dataNodeId};
   const int dumpCodeReleaseSb [] = {9997};
   CHECK(restarter.dumpStateOneNode(mgmdNodeId, dumpCodeUnblockSend, 2) == 0);
   CHECK(restarter.dumpStateOneNode(mgmdNodeId, dumpCodeReleaseSb, 1) == 0);
@@ -7333,7 +7333,7 @@ runTestOldApiScanFinalise(NDBT_Context* ctx, NDBT_Step* step)
   }
 
 /* Test requires DBUG error injection */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   /**
    * Test behaviour of 'old api' scan finalisation
    * failure
@@ -7702,6 +7702,83 @@ int runPkRead2(NDBT_Context* ctx, NDBT_Step* step)
                              true) == 0);
   CHECK(hugoOps.execute_NoCommit(ndb) == 0);
   CHECK(hugoOps.closeTransaction(ndb) == 0);
+  return NDBT_OK;
+}
+
+int runDatabaseAndSchemaName(NDBT_Context* ctx, NDBT_Step*)
+{
+  Ndb_cluster_connection* con = &ctx->m_cluster_connection;
+
+  // Create new Ndb object
+  std::unique_ptr<Ndb> ndb(new Ndb(con));
+  C2(ndb->init() == 0);
+
+  // Check that default schema name is "def"
+  C2(strcmp(ndb->getSchemaName(), "def") == 0);
+
+  // Check that default database is empty string
+  C2(strcmp(ndb->getDatabaseName(), "") == 0);
+
+  // nullptr argument to database or catalog should return error
+  C2(ndb->setDatabaseName(nullptr) != 0);
+  C2(ndb->getNdbError().code == 4118);
+
+  C2(ndb->setSchemaName(nullptr) != 0);
+  C2(ndb->getNdbError().code == 4118);
+
+  // Database or catalog name containing slash (/) is illegal and should return
+  // error (the slash is protected as separator for the internal name format)
+  const char* illegal_name_with_slash = "illegal_name/with_slash";
+  C2(ndb->setDatabaseName(illegal_name_with_slash) != 0);
+  C2(ndb->getNdbError().code == 4118);
+
+  C2(ndb->setSchemaName(illegal_name_with_slash) != 0);
+  C2(ndb->getNdbError().code == 4118);
+
+  // Create, alter, drop or open table should return an error
+  // unless database and schema name is set. These functions
+  // depends on those values to properly generate the internal name
+  NdbDictionary::Dictionary* dict = ndb->getDictionary();
+
+  NdbDictionary::Table ndbtab(*ctx->getTab());
+  C2(dict->createTable(ndbtab) == -1);
+  C2(dict->getNdbError().code == 4377);
+
+  NdbDictionary::Table new_ndbtab = ndbtab;
+  new_ndbtab.setName("new_name");
+  C2(dict->alterTable(ndbtab, new_ndbtab) != 0);
+  C2(dict->getNdbError().code == 4377);
+
+  C2(dict->dropTable(ndbtab.getName()) != 0);
+  C2(dict->getNdbError().code == 4377);
+
+  C2(dict->getTable(ndbtab.getName()) == nullptr);
+  C2(dict->getNdbError().code == 4377);
+
+  C2(dict->getTableGlobal(ndbtab.getName()) == nullptr);
+  C2(dict->getNdbError().code == 4377);
+
+  // Check autoincrement functions which depend on database and schema
+  Uint64 value;
+  C2(ndb->getAutoIncrementValue("tablename", value, 32) != 0);
+  C2(dict->getNdbError().code == 4377);
+
+  C2(ndb->setAutoIncrementValue("tablename", value, true) != 0);
+  C2(dict->getNdbError().code == 4377);
+
+  C2(ndb->readAutoIncrementValue("tablename", value) != 0);
+  C2(dict->getNdbError().code == 4377);
+
+
+  // Check that it's possible to set both database and schema name
+  const char* new_schema_name = "new_schema";
+  C2(ndb->setSchemaName(new_schema_name) == 0);
+  C2(strcmp(ndb->getSchemaName(), new_schema_name) == 0);
+
+  const char* new_db_name = "new_database";
+  C2(ndb->setDatabaseName(new_db_name) == 0);
+  C2(strcmp(ndb->getDatabaseName(), new_db_name) == 0);
+
   return NDBT_OK;
 }
 
@@ -8126,6 +8203,11 @@ TESTCASE("PkLockingReadNoWait",
   STEP(runPkRead1);
   STEP(runPkRead2);
   FINALIZER(runClearTable);
+}
+TESTCASE("DatabaseAndSchemaName",
+         "Test functions depending on database and schema name")
+{
+  STEP(runDatabaseAndSchemaName);
 }
 
 

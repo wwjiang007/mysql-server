@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2008, 2021, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -27,9 +27,10 @@
 
 #include "storage/perfschema/table_threads.h"
 
+#include <assert.h>
 #include "lex_string.h"
 #include "my_compiler.h"
-#include "my_dbug.h"
+
 #include "my_thread.h"
 #include "sql/field.h"
 #include "sql/plugin_table.h"
@@ -81,8 +82,8 @@ Plugin_table table_threads::m_table_def(
 PFS_engine_table_share table_threads::m_share = {
     &pfs_updatable_acl,
     table_threads::create,
-    NULL, /* write_row */
-    NULL, /* delete_all_rows */
+    nullptr, /* write_row */
+    nullptr, /* delete_all_rows */
     cursor_by_thread::get_row_count,
     sizeof(PFS_simple_index), /* ref length */
     &m_table_lock,
@@ -176,7 +177,7 @@ bool PFS_index_threads_by_resource_group::match(PFS_thread *pfs) {
 }
 
 int table_threads::index_init(uint idx, bool) {
-  PFS_index_threads *result = NULL;
+  PFS_index_threads *result = nullptr;
 
   switch (idx) {
     case 0:
@@ -201,7 +202,7 @@ int table_threads::index_init(uint idx, bool) {
       result = PFS_NEW(PFS_index_threads_by_resource_group);
       break;
     default:
-      DBUG_ASSERT(false);
+      assert(false);
   }
 
   m_opened_index = result;
@@ -220,7 +221,7 @@ int table_threads::make_row(PFS_thread *pfs) {
   pfs->m_lock.begin_optimistic_lock(&lock);
 
   safe_class = sanitize_thread_class(pfs->m_class);
-  if (unlikely(safe_class == NULL)) {
+  if (unlikely(safe_class == nullptr)) {
     return HA_ERR_RECORD_DELETED;
   }
 
@@ -313,7 +314,7 @@ int table_threads::make_row(PFS_thread *pfs) {
   m_row.m_start_time = pfs->m_start_time;
 
   stage_class = find_stage_class(pfs->m_stage);
-  if (stage_class != NULL) {
+  if (stage_class != nullptr) {
     m_row.m_processlist_state_ptr =
         stage_class->m_name + stage_class->m_prefix_length;
     m_row.m_processlist_state_length =
@@ -348,17 +349,17 @@ int table_threads::make_row(PFS_thread *pfs) {
 int table_threads::read_row_values(TABLE *table, unsigned char *buf,
                                    Field **fields, bool read_all) {
   Field *f;
-  const char *str = NULL;
+  const char *str = nullptr;
   int len = 0;
 
   /* Set the null bits */
-  DBUG_ASSERT(table->s->null_bytes == 2);
+  assert(table->s->null_bytes == 2);
   buf[0] = 0;
   buf[1] = 0;
 
   for (; (f = *fields); fields++) {
-    if (read_all || bitmap_is_set(table->read_set, f->field_index)) {
-      switch (f->field_index) {
+    if (read_all || bitmap_is_set(table->read_set, f->field_index())) {
+      switch (f->field_index()) {
         case 0: /* THREAD_ID */
           set_field_ulonglong(f, m_row.m_thread_internal_id);
           break;
@@ -476,7 +477,7 @@ int table_threads::read_row_values(TABLE *table, unsigned char *buf,
           }
           break;
         default:
-          DBUG_ASSERT(false);
+          assert(false);
       }
     }
   }
@@ -489,8 +490,8 @@ int table_threads::update_row_values(TABLE *table, const unsigned char *,
   enum_yes_no value;
 
   for (; (f = *fields); fields++) {
-    if (bitmap_is_set(table->write_set, f->field_index)) {
-      switch (f->field_index) {
+    if (bitmap_is_set(table->write_set, f->field_index())) {
+      switch (f->field_index()) {
         case 0:  /* THREAD_ID */
         case 1:  /* NAME */
         case 2:  /* TYPE */
@@ -519,7 +520,7 @@ int table_threads::update_row_values(TABLE *table, const unsigned char *,
         case 17: /* RESOURCE_GROUP */
           return HA_ERR_WRONG_COMMAND;
         default:
-          DBUG_ASSERT(false);
+          assert(false);
       }
     }
   }

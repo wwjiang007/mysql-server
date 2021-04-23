@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -22,12 +22,22 @@
 
 #include <sstream>
 
+#include "plugin/group_replication/include/plugin.h"
 #include "plugin/group_replication/include/replication_threads_api.h"
 
 #include <mysql/components/services/log_builtins.h>
 #include "my_dbug.h"
+#include "mysqld_error.h"
 
 using std::string;
+
+Replication_thread_api::Replication_thread_api(const char *channel_interface)
+    : stop_wait_timeout(get_components_stop_timeout_var()),
+      interface_channel(channel_interface) {}
+
+Replication_thread_api::Replication_thread_api()
+    : stop_wait_timeout(get_components_stop_timeout_var()),
+      interface_channel(nullptr) {}
 
 int Replication_thread_api::initialize_channel(
     char *hostname, uint port, char *user, char *password, bool use_ssl,
@@ -35,7 +45,9 @@ int Replication_thread_api::initialize_channel(
     char *ssl_key, char *ssl_crl, char *ssl_crlpath,
     bool ssl_verify_server_cert, int priority, int retry_count,
     bool preserve_logs, char *public_key_path, bool get_public_key,
-    char *compression_algorithm, uint zstd_compression_level) {
+    char *compression_algorithm, uint zstd_compression_level, char *tls_version,
+    char *tls_ciphersuites, bool ignore_ws_mem_limit,
+    bool allow_drop_write_set) {
   DBUG_TRACE;
   int error = 0;
 
@@ -54,22 +66,27 @@ int Replication_thread_api::initialize_channel(
   if (priority == GROUP_REPLICATION_APPLIER_THREAD_PRIORITY) {
     info.thd_tx_priority = GROUP_REPLICATION_APPLIER_THREAD_PRIORITY;
   }
+
+  info.m_ignore_write_set_memory_limit = ignore_ws_mem_limit;
+  info.m_allow_drop_write_set = allow_drop_write_set;
+
   info.type = GROUP_REPLICATION_CHANNEL;
 
   info.retry_count = retry_count;
 
   info.preserve_relay_logs = preserve_logs;
 
-  if (public_key_path != NULL) info.public_key_path = public_key_path;
+  if (public_key_path != nullptr) info.public_key_path = public_key_path;
 
   info.get_public_key = get_public_key;
 
   info.compression_algorithm = compression_algorithm;
   info.zstd_compression_level = zstd_compression_level;
 
-  if (use_ssl || ssl_ca != NULL || ssl_capath != NULL || ssl_cert != NULL ||
-      ssl_cipher != NULL || ssl_key != NULL || ssl_crl != NULL ||
-      ssl_crlpath != NULL || ssl_verify_server_cert) {
+  if (use_ssl || ssl_ca != nullptr || ssl_capath != nullptr ||
+      ssl_cert != nullptr || ssl_cipher != nullptr || ssl_key != nullptr ||
+      ssl_crl != nullptr || ssl_crlpath != nullptr || ssl_verify_server_cert ||
+      tls_version != nullptr || tls_ciphersuites != nullptr) {
     ssl_info.use_ssl = use_ssl;
     ssl_info.ssl_ca_file_name = ssl_ca;
     ssl_info.ssl_ca_directory = ssl_capath;
@@ -79,6 +96,8 @@ int Replication_thread_api::initialize_channel(
     ssl_info.ssl_crl_file_name = ssl_crl;
     ssl_info.ssl_crl_directory = ssl_crlpath;
     ssl_info.ssl_verify_server_cert = ssl_verify_server_cert;
+    ssl_info.tls_version = tls_version;
+    ssl_info.tls_ciphersuites = tls_ciphersuites;
     info.ssl_info = &ssl_info;
   }
 
@@ -100,7 +119,7 @@ int Replication_thread_api::start_threads(bool start_receiver,
   Channel_connection_info info;
   initialize_channel_connection_info(&info);
 
-  char *cview_id = NULL;
+  char *cview_id = nullptr;
 
   if (view_id) {
     cview_id = new char[view_id->size() + 1];
@@ -235,7 +254,7 @@ bool Replication_thread_api::is_own_event_applier(my_thread_id id,
   DBUG_TRACE;
 
   bool result = false;
-  unsigned long *thread_ids = NULL;
+  unsigned long *thread_ids = nullptr;
   const char *name = channel_name ? channel_name : interface_channel;
 
   // Fetch all applier thread ids for this channel.
@@ -273,7 +292,7 @@ bool Replication_thread_api::is_own_event_receiver(my_thread_id id) {
   DBUG_TRACE;
 
   bool result = false;
-  unsigned long *thread_id = NULL;
+  unsigned long *thread_id = nullptr;
 
   // Fetch the receiver thread id for this channel
   int number_receivers = channel_get_thread_id(
@@ -294,7 +313,7 @@ bool Replication_thread_api::get_retrieved_gtid_set(std::string &retrieved_set,
   DBUG_TRACE;
 
   const char *name = channel_name ? channel_name : interface_channel;
-  char *receiver_retrieved_gtid_set = NULL;
+  char *receiver_retrieved_gtid_set = nullptr;
   int error;
 
   error = channel_get_retrieved_gtid_set(name, &receiver_retrieved_gtid_set);
@@ -308,23 +327,17 @@ bool Replication_thread_api::get_retrieved_gtid_set(std::string &retrieved_set,
 bool Replication_thread_api::get_channel_credentials(std::string &username,
                                                      std::string &password,
                                                      const char *channel_name) {
-  DBUG_ENTER("Replication_thread_api::get_channel_credentials");
-
+  DBUG_TRACE;
   const char *name = channel_name ? channel_name : interface_channel;
-  const char *user_arg = NULL;
-  char user_pass[MAX_PASSWORD_LENGTH + 1];
-  char *user_pass_pointer = user_pass;
-  size_t password_size = sizeof(user_pass);
 
   int error;
-  error = channel_get_credentials(name, &user_arg, &user_pass_pointer,
-                                  &password_size);
-  if (!error) {
-    username.assign(user_arg);
-    password.assign(user_pass, password_size);
+  error = channel_get_credentials(name, username, password);
+  if (error) {
+    username.clear();
+    password.clear();
   }
 
-  DBUG_RETURN((error != 0));
+  return (error != 0);
 }
 
 bool Replication_thread_api::is_partial_transaction_on_relay_log() {
@@ -348,4 +361,21 @@ int Replication_thread_api::rpl_channel_stop_all(int threads_to_stop,
     }
   }
   return error;
+}
+
+int Replication_thread_api::rpl_binlog_dump_thread_kill() {
+  DBUG_TRACE;
+  return binlog_dump_thread_kill();
+}
+
+int Replication_thread_api::delete_credential(const char *channel_name) {
+  DBUG_TRACE;
+  return channel_delete_credentials(channel_name);
+}
+
+bool Replication_thread_api::
+    is_any_channel_using_uuid_for_assign_gtids_to_anonymous_transaction(
+        const char *group_name) {
+  DBUG_TRACE;
+  return channel_has_same_uuid_as_group_name(group_name);
 }

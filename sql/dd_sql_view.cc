@@ -1,4 +1,4 @@
-/* Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2016, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "lex_string.h"
+#include "m_ctype.h"  // my_casedn_str
 #include "my_dbug.h"
 #include "my_inttypes.h"
 #include "my_sqlcommand.h"
@@ -48,12 +49,14 @@
 #include "sql/error_handler.h"  // Internal_error_handler
 #include "sql/handler.h"        // HA_LEX_CREATE_TMP_TABLE
 #include "sql/mdl.h"
+#include "sql/mysqld.h"  // lower_case_table_names
 #include "sql/set_var.h"
 #include "sql/sp_head.h"    // sp_name
 #include "sql/sql_alter.h"  // Alter_info
 #include "sql/sql_base.h"   // open_tables
 #include "sql/sql_class.h"
 #include "sql/sql_const.h"
+#include "sql/sql_db.h"  // check_schema_readonly
 #include "sql/sql_error.h"
 #include "sql/sql_lex.h"   // LEX
 #include "sql/sql_view.h"  // mysql_register_view
@@ -103,7 +106,8 @@ class View_metadata_updater_context {
     m_thd->set_open_tables_state(&m_open_tables_state_backup);
 
     // Restore lex.
-    m_thd->lex->unit->cleanup(m_thd, true);
+    m_thd->lex->cleanup(m_thd, true);
+    m_thd->lex->destroy();
     lex_end(m_thd->lex);
     delete static_cast<st_lex_local *>(m_thd->lex);
     m_thd->lex = m_saved_lex;
@@ -138,9 +142,9 @@ class View_metadata_updater_context {
 class View_metadata_updater_error_handler final
     : public Internal_error_handler {
  public:
-  virtual bool handle_condition(THD *, uint sql_errno, const char *,
-                                Sql_condition::enum_severity_level *,
-                                const char *msg) override {
+  bool handle_condition(THD *, uint sql_errno, const char *,
+                        Sql_condition::enum_severity_level *,
+                        const char *msg) override {
     switch (sql_errno) {
       case ER_LOCK_WAIT_TIMEOUT:
       case ER_LOCK_DEADLOCK:
@@ -192,7 +196,7 @@ class View_metadata_updater_error_handler final
   }
 
  private:
-  void (*m_old_error_handler_hook)(uint, const char *, myf);
+  ErrorHandlerFunctionPointer m_old_error_handler_hook;
 
  private:
   uint m_sql_errno = 0;
@@ -263,13 +267,26 @@ static bool prepare_view_tables_list(THD *thd, const char *db,
     if (prepared_view_ids.find(view_ids.at(idx)) == prepared_view_ids.end()) {
       // Prepare TABLE_LIST object for the view and push_back
 
-      const char *db_name = strmake_root(thd->mem_root, schema_name.c_str(),
-                                         schema_name.length());
+      char *db_name = strmake_root(thd->mem_root, schema_name.c_str(),
+                                   schema_name.length());
       if (db_name == nullptr) return true;
 
-      const char *vw_name =
+      char *vw_name =
           strmake_root(thd->mem_root, view_name.c_str(), view_name.length());
       if (vw_name == nullptr) return true;
+
+      /*
+        With l_c_t_n == 2, the original lettercase is stored in the DD, so we
+        need to convert to lowercase to make sure we always lock with the same
+        lettercase. Note that there is an exception for information schema
+        view names, where the convention is to use capital letters, as stored
+        in the DD.
+      */
+      if (lower_case_table_names == 2) {
+        my_casedn_str(system_charset_info, db_name);
+        if (!is_infoschema_db(db_name))
+          my_casedn_str(system_charset_info, vw_name);
+      }
 
       auto vw = new (thd->mem_root)
           TABLE_LIST(db_name, schema_name.length(), vw_name, view_name.length(),
@@ -317,7 +334,7 @@ static bool mark_all_views_invalid(THD *thd, const char *db,
                                    std::vector<TABLE_LIST *> *views_list,
                                    bool commit_dd_changes) {
   DBUG_TRACE;
-  DBUG_ASSERT(!views_list->empty());
+  assert(!views_list->empty());
 
   // Acquire lock on all the views.
   MDL_request_list mdl_requests;
@@ -332,6 +349,11 @@ static bool mark_all_views_invalid(THD *thd, const char *db,
   if (thd->mdl_context.acquire_locks(&mdl_requests,
                                      thd->variables.lock_wait_timeout))
     return true;
+
+  // Check schema read only for all views.
+  for (auto view : *views_list) {
+    if (check_schema_readonly(thd, view->db)) return true;
+  }
 
   /*
     In the time gap of listing referencing views and acquiring MDL lock on them
@@ -416,6 +438,11 @@ static bool open_views_and_update_metadata(
     }
   }
 
+  // Check schema read only for all views.
+  for (auto view : *views) {
+    if (check_schema_readonly(thd, view->db)) return true;
+  }
+
   for (auto view : *views) {
     View_metadata_updater_context vw_metadata_update_context(thd);
 
@@ -440,13 +467,26 @@ static bool open_views_and_update_metadata(
     */
     uint counter = 0;
     DML_prelocking_strategy prelocking_strategy;
-    view->select_lex = thd->lex->select_lex;
+    view->query_block = thd->lex->query_block;
+    /*
+      open_tables() will normally switch the current memory allocation context
+      from the execution context to the prepared statement context, if
+      such context is active. However, open_views_and_update_metadata() should
+      be done only as part of a single execution, and will be fully cleaned up
+      as part of that execution.
+      The following code forces the preparation code in open_tables() to
+      be performed on the execution mem_root, regardless of the current
+      embedding memory allocation context.
+    */
+    MEM_ROOT *saved_arena_mem_root = thd->stmt_arena->mem_root;
+    thd->stmt_arena->mem_root = thd->mem_root;
     if (open_tables(thd, &view, &counter, MYSQL_OPEN_NO_NEW_TABLE_IN_SE,
                     &prelocking_strategy)) {
+      thd->stmt_arena->mem_root = saved_arena_mem_root;
       thd->pop_internal_handler();
 
       if (error_handler.is_view_invalid()) {
-        if (view->mdl_request.ticket != NULL) {
+        if (view->mdl_request.ticket != nullptr) {
           // Update view status in tables.options.view_valid.
           if (dd::update_view_status(thd, view->get_db_name(),
                                      view->get_table_name(), false,
@@ -462,6 +502,7 @@ static bool open_views_and_update_metadata(
       }
       continue;
     }
+    thd->stmt_arena->mem_root = saved_arena_mem_root;
     if (view->is_view() == false) {
       // In between listing views and locking(opening), if view is dropped and
       // created as table then skip it.
@@ -474,7 +515,7 @@ static bool open_views_and_update_metadata(
     LEX *org_lex = thd->lex;
     thd->lex = view_lex;
     view_lex->context_analysis_only |= CONTEXT_ANALYSIS_ONLY_VIEW;
-    if (view_lex->unit->prepare(thd, 0, 0, 0)) {
+    if (view_lex->unit->prepare(thd, nullptr, nullptr, 0, 0)) {
       thd->lex = org_lex;
       thd->pop_internal_handler();
       // Please refer comments in the view open error handling block above.
@@ -508,7 +549,7 @@ static bool open_views_and_update_metadata(
 
     if (thd->lex->unit->is_mergeable() &&
         view->algorithm != VIEW_ALGORITHM_TEMPTABLE) {
-      for (ORDER *order = thd->lex->select_lex->order_list.first; order;
+      for (ORDER *order = thd->lex->query_block->order_list.first; order;
            order = order->next)
         order->used_alias = false;  /// @see Item::print_for_order()
     }
@@ -524,11 +565,11 @@ static bool open_views_and_update_metadata(
     if (thd->dd_client()->acquire_for_modification(view->db, view->table_name,
                                                    &new_view))
       return true;
-    DBUG_ASSERT(new_view != nullptr);
+    assert(new_view != nullptr);
     bool res = dd::update_view(thd, new_view, view);
 
     if (commit_dd_changes) {
-      Disable_gtid_state_update_guard disabler(thd);
+      Implicit_substatement_state_guard substatement_guard(thd);
       if (res) {
         trans_rollback_stmt(thd);
         // Full rollback in case we have THD::transaction_rollback_request.
@@ -537,16 +578,12 @@ static bool open_views_and_update_metadata(
         res = trans_commit_stmt(thd) || trans_commit(thd);
     }
     if (res) {
-      view_lex->unit->cleanup(thd, true);
-      lex_end(view_lex);
       thd->lex = org_lex;
       return true;
     }
     tdc_remove_table(thd, TDC_RT_REMOVE_ALL, view->get_db_name(),
                      view->get_table_name(), false);
 
-    view_lex->unit->cleanup(thd, true);
-    lex_end(view_lex);
     thd->lex = org_lex;
   }
   DEBUG_SYNC(thd, "after_updating_view_metadata");
@@ -588,7 +625,7 @@ static bool is_view_metadata_update_needed(THD *thd, const char *db,
       retval = is_non_dictionary_or_temp_table();
       break;
     case SQLCOM_ALTER_TABLE: {
-      DBUG_ASSERT(thd->lex->alter_info);
+      assert(thd->lex->alter_info);
 
       // Alter operations which affects view column metadata.
       const uint alter_operations =
@@ -711,7 +748,7 @@ bool update_referencing_views_metadata(
     const char *new_table_name, bool commit_dd_changes,
     Uncommitted_tables_guard *uncommitted_tables) {
   DBUG_TRACE;
-  DBUG_ASSERT(table != nullptr);
+  assert(table != nullptr);
 
   bool error = update_referencing_views_metadata(
       thd, table->get_db_name(), table->get_table_name(), new_db,
@@ -730,7 +767,7 @@ bool update_referencing_views_metadata(
     THD *thd, const char *db_name, const char *table_name,
     bool commit_dd_changes, Uncommitted_tables_guard *uncommitted_tables) {
   DBUG_TRACE;
-  DBUG_ASSERT(db_name && table_name);
+  assert(db_name && table_name);
 
   bool error = update_referencing_views_metadata(
       thd, db_name, table_name, nullptr, nullptr, commit_dd_changes,
@@ -740,7 +777,7 @@ bool update_referencing_views_metadata(
 
 bool update_referencing_views_metadata(THD *thd, const sp_name *spname) {
   DBUG_TRACE;
-  DBUG_ASSERT(spname);
+  assert(spname);
 
   /*
     Updates to view metatdata for DDL on stored routines does not include

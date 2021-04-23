@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2011, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2011, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -40,8 +40,8 @@ Ndb_event_data::Ndb_event_data(NDB_SHARE *the_share, size_t num_columns)
   ndb_value[1] = nullptr;
 
   // Initialize bitmaps, using dynamically allocated bitbuf
-  bitmap_init(&stored_columns, nullptr, num_columns, false);
-  bitmap_init(&pk_bitmap, nullptr, num_columns, false);
+  bitmap_init(&stored_columns, nullptr, num_columns);
+  bitmap_init(&pk_bitmap, nullptr, num_columns);
 
   // Initialize mem_root where the shadow_table will be allocated
   init_sql_alloc(PSI_INSTRUMENT_ME, &mem_root, 1024, 0);
@@ -137,7 +137,7 @@ TABLE *Ndb_event_data::open_shadow_table(THD *thd, const char *db,
                                          const dd::Table *table_def,
                                          THD *owner_thd) {
   DBUG_TRACE;
-  DBUG_ASSERT(table_def);
+  assert(table_def);
 
   // Allocate memory for shadow table from MEM_ROOT
   TABLE_SHARE *shadow_table_share =
@@ -189,7 +189,7 @@ Ndb_event_data *Ndb_event_data::create_event_data(
     THD *thd, NDB_SHARE *share, const char *db, const char *table_name,
     const char *key, THD *owner_thd, const dd::Table *table_def) {
   DBUG_TRACE;
-  DBUG_ASSERT(table_def);
+  assert(table_def);
 
   const size_t num_columns = ndb_dd_table_get_num_columns(table_def);
 
@@ -213,7 +213,7 @@ Ndb_event_data *Ndb_event_data::create_event_data(
 
   // Check that number of columns from table_def match the
   // number in shadow_table
-  DBUG_ASSERT(num_columns == shadow_table->s->fields);
+  assert(num_columns == shadow_table->s->fields);
 
   event_data->shadow_table = shadow_table;
 

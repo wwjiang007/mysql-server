@@ -19,8 +19,17 @@ typedef int myf;
 #include "my_psi_config.h"
 #include "my_sharedlib.h"
 #include "mysql/components/services/psi_rwlock_bits.h"
+#include <mysql/components/services/bits/psi_bits.h>
+static constexpr unsigned PSI_INSTRUMENT_ME = 0;
+static constexpr unsigned PSI_NOT_INSTRUMENTED = 0;
+struct PSI_placeholder {
+  int m_placeholder;
+};
+struct PSI_instr {
+  bool m_enabled;
+};
 typedef unsigned int PSI_rwlock_key;
-struct PSI_rwlock;
+struct PSI_rwlock : PSI_instr {};
 typedef struct PSI_rwlock PSI_rwlock;
 struct PSI_rwlock_locker;
 typedef struct PSI_rwlock_locker PSI_rwlock_locker;
@@ -54,9 +63,9 @@ struct PSI_rwlock_locker_state_v1 {
   enum PSI_rwlock_operation m_operation;
   struct PSI_rwlock *m_rwlock;
   struct PSI_thread *m_thread;
-  unsigned long long m_timer_start;
+  unsigned long long m_timer_start{0};
   unsigned long long (*m_timer)(void);
-  void *m_wait;
+  void *m_wait{nullptr};
 };
 typedef struct PSI_rwlock_locker_state_v1 PSI_rwlock_locker_state_v1;
 typedef void (*register_rwlock_v1_t)(const char *category,
@@ -80,11 +89,6 @@ typedef void (*unlock_rwlock_v2_t)(struct PSI_rwlock *rwlock,
                                    enum PSI_rwlock_operation op);
 typedef struct PSI_rwlock_info_v1 PSI_rwlock_info;
 typedef struct PSI_rwlock_locker_state_v1 PSI_rwlock_locker_state;
-#include "psi_base.h"
-#include "my_psi_config.h"
-struct PSI_placeholder {
-  int m_placeholder;
-};
 struct PSI_rwlock_bootstrap {
   void *(*get_interface)(int version);
 };

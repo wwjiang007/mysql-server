@@ -1,6 +1,6 @@
 #ifndef SET_VAR_INCLUDED
 #define SET_VAR_INCLUDED
-/* Copyright (c) 2002, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2002, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -138,6 +138,7 @@ class sys_var {
 
  protected:
   typedef bool (*on_check_function)(sys_var *self, THD *thd, set_var *var);
+  typedef bool (*pre_update_function)(sys_var *self, THD *thd, set_var *var);
   typedef bool (*on_update_function)(sys_var *self, THD *thd,
                                      enum_var_type type);
 
@@ -148,6 +149,11 @@ class sys_var {
   PolyLock *guard;                ///< *second* lock that protects the variable
   ptrdiff_t offset;  ///< offset to the value from global_system_variables
   on_check_function on_check;
+  /**
+    Pointer to function to be invoked before updating system variable (but
+    after calling on_check hook), while we do not hold any locks yet.
+  */
+  pre_update_function pre_update;
   on_update_function on_update;
   const char *const deprecation_substitute;
   bool is_os_charset;  ///< true if the value is in character_set_filesystem
@@ -175,7 +181,7 @@ class sys_var {
     downcast for sys_var_pluginvar. Returns this if it's an instance
     of sys_var_pluginvar, and 0 otherwise.
   */
-  virtual sys_var_pluginvar *cast_pluginvar() { return 0; }
+  virtual sys_var_pluginvar *cast_pluginvar() { return nullptr; }
 
   bool check(THD *thd, set_var *var);
   const uchar *value_ptr(THD *running_thd, THD *target_thd, enum_var_type type,
@@ -185,7 +191,6 @@ class sys_var {
     option.def_value = new_def_value;
   }
   longlong get_default() { return option.def_value; }
-  virtual bool is_default(THD *thd, set_var *var);
   virtual longlong get_min_value() { return option.min_value; }
   virtual ulonglong get_max_value() { return option.max_value; }
   /**
@@ -259,6 +264,14 @@ class sys_var {
     that support the syntax @@keycache_name.variable_name
   */
   bool is_struct() { return option.var_type & GET_ASK_ADDR; }
+  /*
+    Indicates whether this system variable is written to the binlog or not.
+
+    Variables are written to the binlog as part of "status_vars" in
+    Query_log_event, as an Intvar_log_event, or a Rand_log_event.
+
+    @return true if the variable is written to the binlog, false otherwise.
+  */
   bool is_written_to_binlog(enum_var_type type) {
     return type != OPT_GLOBAL && binlog_status == SESSION_VARIABLE_IN_BINLOG;
   }
@@ -350,6 +363,27 @@ class sys_var {
   uchar *global_var_ptr();
 };
 
+class Sys_var_tracker {
+ public:
+  Sys_var_tracker(sys_var *var);
+
+  sys_var *bind_system_variable(THD *thd);
+
+  bool operator==(const Sys_var_tracker &x) const {
+    return m_var && m_var == x.m_var;
+  }
+
+  LEX_CSTRING get_var_name() const { return m_name; }
+  bool is_sys_var(sys_var *x) const { return m_var == x; }
+  bool is_plugin_var() const { return m_is_dynamic; }
+
+ private:
+  const bool m_is_dynamic;   ///< true if dynamic variable
+  const LEX_CSTRING m_name;  ///< variable name
+
+  sys_var *m_var;  ///< variable pointer
+};
+
 /****************************************************************************
   Classes for parsing of the SET command
 ****************************************************************************/
@@ -372,6 +406,7 @@ class set_var_base {
     @returns whether this variable is @@@@optimizer_trace.
   */
   virtual bool is_var_optimizer_trace() const { return false; }
+  virtual void cleanup() {}
 
   /**
     Used only by prepared statements to resolve and check. No locking of tables
@@ -400,14 +435,18 @@ class set_var : public set_var_base {
   LEX_CSTRING
   base; /**< for structured variables, like keycache_name.variable_name */
 
+ private:
+  Sys_var_tracker var_tracker;
+
+ public:
   set_var(enum_var_type type_arg, sys_var *var_arg, LEX_CSTRING base_name_arg,
           Item *value_arg);
 
-  int resolve(THD *thd);
-  int check(THD *thd);
-  int update(THD *thd);
+  int resolve(THD *thd) override;
+  int check(THD *thd) override;
+  int update(THD *thd) override;
   void update_source_user_host_timestamp(THD *thd);
-  int light_check(THD *thd);
+  int light_check(THD *thd) override;
   /**
     Print variable in short form.
 
@@ -415,15 +454,16 @@ class set_var : public set_var_base {
     @param str String buffer to append the partial assignment to.
   */
   void print_short(const THD *thd, String *str);
-  void print(const THD *, String *str); /* To self-print */
+  void print(const THD *, String *str) override; /* To self-print */
   bool is_global_persist() {
     return (type == OPT_GLOBAL || type == OPT_PERSIST ||
             type == OPT_PERSIST_ONLY);
   }
-  virtual bool is_var_optimizer_trace() const {
+  bool is_var_optimizer_trace() const override {
     extern sys_var *Sys_optimizer_trace_ptr;
-    return var == Sys_optimizer_trace_ptr;
+    return var_tracker.is_sys_var(Sys_optimizer_trace_ptr);
   }
+  void cleanup() override { var = nullptr; }
 };
 
 /* User variables like @my_own_variable */
@@ -432,11 +472,11 @@ class set_var_user : public set_var_base {
 
  public:
   set_var_user(Item_func_set_user_var *item) : user_var_item(item) {}
-  int resolve(THD *thd);
-  int check(THD *thd);
-  int update(THD *thd);
-  int light_check(THD *thd);
-  void print(const THD *thd, String *str); /* To self-print */
+  int resolve(THD *thd) override;
+  int check(THD *thd) override;
+  int update(THD *thd) override;
+  int light_check(THD *thd) override;
+  void print(const THD *thd, String *str) override; /* To self-print */
 };
 
 class set_var_password : public set_var_base {
@@ -455,11 +495,11 @@ class set_var_password : public set_var_base {
   const LEX_USER *get_user(void) { return user; }
   bool has_generated_password(void) { return generate_password; }
   const char *get_generated_password(void) { return str_generated_password; }
-  int resolve(THD *) { return 0; }
-  int check(THD *thd);
-  int update(THD *thd);
-  void print(const THD *thd, String *str); /* To self-print */
-  virtual ~set_var_password();
+  int resolve(THD *) override { return 0; }
+  int check(THD *thd) override;
+  int update(THD *thd) override;
+  void print(const THD *thd, String *str) override; /* To self-print */
+  ~set_var_password() override;
 };
 
 /* For SET NAMES and SET CHARACTER SET */
@@ -484,10 +524,10 @@ class set_var_collation_client : public set_var_base {
         character_set_client(client_coll_arg),
         character_set_results(result_coll_arg),
         collation_connection(connection_coll_arg) {}
-  int resolve(THD *) { return 0; }
-  int check(THD *thd);
-  int update(THD *thd);
-  void print(const THD *thd, String *str); /* To self-print */
+  int resolve(THD *) override { return 0; }
+  int check(THD *thd) override;
+  int update(THD *thd) override;
+  void print(const THD *thd, String *str) override; /* To self-print */
 };
 
 /* optional things, have_* variables */

@@ -2013,6 +2013,8 @@ ERROR HY000: Incorrect arguments to point
 SELECT ST_ASTEXT(POINT(HEX(POINT(0,0)),HEX(LINESTRING(POINT(0, 0), POINT(1, 1)))));
 ST_ASTEXT(POINT(HEX(POINT(0,0)),HEX(LINESTRING(POINT(0, 0), POINT(1, 1)))))
 POINT(1.01e40 1.0200000002e60)
+Warnings:
+Warning	1292	Truncated incorrect DOUBLE value: '0000000001020000000200000000000000000000000000000000000000000000000000F03F000000000000F03F'
 SELECT ST_AsText(Point('123', '456'));
 ST_AsText(Point('123', '456'))
 POINT(123 456)
@@ -2259,7 +2261,7 @@ dist	buffer	buf_area
 -----
 LineString(9 9,8 1,1 5,0 0)
 dist	buffer	buf_area
-1	POLYGON	44.60
+1	POLYGON	44.6
 -----
 Polygon((2 2,2 8,8 8,8 2,2 2))
 dist	buffer	buf_area
@@ -2271,7 +2273,7 @@ dist	buffer	buf_area
 -----
 Polygon((0 0, 0 8, 8 8, 8 10, -10 10, -10 0, 0 0))
 dist	buffer	buf_area
-1	POLYGON	174.90
+1	POLYGON	174.9
 -----
 MultiPoint(9 9,8 1,1 5)
 dist	buffer	buf_area
@@ -2342,34 +2344,34 @@ dist	buffer	buf_area
 -----
 Polygon((2 2,2 8,8 8,8 2,2 2))
 dist	buffer	buf_area
-0	POLYGON	36.00
+0	POLYGON	36
 -----
 Polygon((0 0,0 8,8 8,8 0,0 0),(2 2,6 2,6 6,2 6,2 2))
 dist	buffer	buf_area
-0	POLYGON	48.00
+0	POLYGON	48
 -----
 Polygon((0 0, 0 8, 8 8, 8 10, -10 10, -10 0, 0 0))
 dist	buffer	buf_area
-0	POLYGON	116.00
+0	POLYGON	116
 # Invalid geometry in input
 -----
 MultiPolygon(((2 2,2 8,8 8,8 2,2 2)), ((9 9,8 1,1 5,9 9)))
 dist	buffer	buf_area
-0	MULTIPOLYGON	66.00
+0	MULTIPOLYGON	66
 # Invalid geometry in input
 -----
 MultiPolygon(((2 2,2 8,8 8,8 2,2 2), (4 4,4 6,6 6,6 4,4 4)),((9 9,8 1,1 5,9 9)))
 dist	buffer	buf_area
-0	MULTIPOLYGON	62.00
+0	MULTIPOLYGON	62
 ERROR 22023: Invalid GIS data provided to function st_geomfromtext.
 -----
 GeometryCollection(Polygon((2 2,2 8,8 8,8 2,2 2)))
 dist	buffer	buf_area
-0	POLYGON	36.00
+0	POLYGON	36
 -----
 GeometryCollection(MultiPolygon(((0 0, 3 0, 3 3, 0 3, 0 0)),((6 6,6 9,9 9,9 6,6 6))))
 dist	buffer	buf_area
-0	MULTIPOLYGON	18.00
+0	MULTIPOLYGON	18
 #
 # Testing ST_BUFFER with negative distance
 #
@@ -2385,7 +2387,7 @@ ERROR HY000: Incorrect arguments to st_buffer
 -----
 Polygon((2 2,2 8,8 8,8 2,2 2))
 dist	buffer	buf_area
--1	POLYGON	16.00
+-1	POLYGON	16
 -----
 Polygon((0 0,0 8,8 8,8 0,0 0),(2 2,6 2,6 6,2 6,2 2))
 dist	buffer	buf_area
@@ -2430,7 +2432,7 @@ ERROR 22023: Invalid GIS data provided to function st_geomfromtext.
 -----
 GeometryCollection(Polygon((2 2,2 8,8 8,8 2,2 2)))
 dist	buffer	buf_area
--1	POLYGON	16.00
+-1	POLYGON	16
 -----
 GeometryCollection(MultiPoint(9 9,8 1,1 5))
 ERROR HY000: Incorrect arguments to st_buffer

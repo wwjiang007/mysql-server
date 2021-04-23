@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -71,8 +71,8 @@ struct PropertyImpl{
  * PropertiesImpl
  */
 class PropertiesImpl {
-  PropertiesImpl(const PropertiesImpl &);           // Not implemented
-  PropertiesImpl& operator=(const PropertiesImpl&); // Not implemented
+  PropertiesImpl(const PropertiesImpl &) = delete;
+  PropertiesImpl& operator=(const PropertiesImpl&) = delete;
 public:
   PropertiesImpl(Properties *, bool case_insensitive);
   PropertiesImpl(Properties *, const PropertiesImpl &);
@@ -155,6 +155,20 @@ Properties::Properties(const Property * anArray, int arrayLen){
   impl = new PropertiesImpl(this, false);
 
   put(anArray, arrayLen);
+}
+
+Properties& Properties::operator=(const Properties & org){
+  if (this == &org) {
+    return *this;
+  }
+  delete impl;
+
+  propErrno = 0;
+  osErrno = 0;
+  impl = new PropertiesImpl(this, * org.impl);
+  parent = nullptr;
+
+  return *this;
 }
 
 Properties::~Properties(){

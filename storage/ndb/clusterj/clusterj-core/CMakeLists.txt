@@ -1,4 +1,4 @@
-# Copyright (c) 2010, 2019, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2021, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -104,7 +104,7 @@ SET(JAVA_SOURCES
   ${CLUSTERJ_CORE_PREFIX}/util/LoggerFactoryService.java
   )
 
-SET ( CLASSPATH 
+SET(CLASSPATH
   target/classes
   ${CMAKE_BINARY_DIR}/storage/ndb/clusterj/clusterj-api/target/classes)
 

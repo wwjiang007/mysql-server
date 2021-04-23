@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -51,11 +51,7 @@
 #define MAX_KEY MAX_INDEXES  /* Max used keys */
 #define MAX_REF_PARTS 16U    /* Max parts used as ref */
 #define MAX_KEY_LENGTH 3072U /* max possible key */
-#if SIZEOF_OFF_T > 4
-#define MAX_REFLENGTH 8 /* Max length for record ref */
-#else
-#define MAX_REFLENGTH 4 /* Max length for record ref */
-#endif
+#define MAX_REFLENGTH 8      /* Max length for record ref */
 
 #define MAX_MBWIDTH 3 /* Max multibyte sequence */
 #define MAX_FIELD_CHARLENGTH 255
@@ -313,7 +309,7 @@ static const ulong EVENT_DEF_CACHE_MIN = 256;
 */
 #define CONTEXT_ANALYSIS_ONLY_PREPARE 1
 /*
-  Special SELECT_LEX::prepare mode: changing of query is prohibited.
+  Special Query_block::prepare mode: changing of query is prohibited.
   When creating a view, we need to just check its syntax omitting
   any optimizations: afterwards definition of the view will be
   reconstructed by means of ::print() methods and written to
@@ -357,8 +353,13 @@ static const ulong EVENT_DEF_CACHE_MIN = 256;
 #define OPTIMIZER_SWITCH_USE_INVISIBLE_INDEXES (1ULL << 19)
 #define OPTIMIZER_SKIP_SCAN (1ULL << 20)
 #define OPTIMIZER_SWITCH_HASH_JOIN (1ULL << 21)
-#define OPTIMIZER_SWITCH_LAST (1ULL << 22)
+#define OPTIMIZER_SWITCH_SUBQUERY_TO_DERIVED (1ULL << 22)
+#define OPTIMIZER_SWITCH_PREFER_ORDERING_INDEX (1ULL << 23)
+#define OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER (1ULL << 24)
+#define OPTIMIZER_SWITCH_DERIVED_CONDITION_PUSHDOWN (1ULL << 25)
+#define OPTIMIZER_SWITCH_LAST (1ULL << 26)
 
+// Including the switch in this set, makes its default 'on'
 #define OPTIMIZER_SWITCH_DEFAULT                                          \
   (OPTIMIZER_SWITCH_INDEX_MERGE | OPTIMIZER_SWITCH_INDEX_MERGE_UNION |    \
    OPTIMIZER_SWITCH_INDEX_MERGE_SORT_UNION |                              \
@@ -371,7 +372,9 @@ static const ulong EVENT_DEF_CACHE_MIN = 256;
    OPTIMIZER_SWITCH_DUPSWEEDOUT | OPTIMIZER_SWITCH_SUBQ_MAT_COST_BASED |  \
    OPTIMIZER_SWITCH_USE_INDEX_EXTENSIONS |                                \
    OPTIMIZER_SWITCH_COND_FANOUT_FILTER | OPTIMIZER_SWITCH_DERIVED_MERGE | \
-   OPTIMIZER_SKIP_SCAN | OPTIMIZER_SWITCH_HASH_JOIN)
+   OPTIMIZER_SKIP_SCAN | OPTIMIZER_SWITCH_HASH_JOIN |                     \
+   OPTIMIZER_SWITCH_PREFER_ORDERING_INDEX |                               \
+   OPTIMIZER_SWITCH_DERIVED_CONDITION_PUSHDOWN)
 
 enum SHOW_COMP_OPTION { SHOW_OPTION_YES, SHOW_OPTION_NO, SHOW_OPTION_DISABLED };
 
@@ -431,7 +434,7 @@ enum enum_resolution_type {
   RESOLVED_IGNORING_ALIAS
 };
 
-/// Enumeration for {Item,SELECT_LEX[_UNIT],Table_function}::walk
+/// Enumeration for {Item,Query_block[_UNIT],Table_function}::walk
 enum class enum_walk {
   PREFIX = 0x01,
   POSTFIX = 0x02,
@@ -449,7 +452,19 @@ inline bool operator&(enum_walk lhs, enum_walk rhs) {
 }
 
 class Item;
-/// Processor type for {Item,SELECT_LEX[_UNIT],Table_function}::walk
+/// Processor type for {Item,Query_block[_UNIT],Table_function}::walk
 typedef bool (Item::*Item_processor)(uchar *arg);
 
+/// Enumeration for Query_block::condition_context.
+/// If the expression being resolved belongs to a condition clause (WHERE, etc),
+/// it is connected to the clause's root through a chain of Items; tells if this
+/// chain matches ^(AND)*$ ("is top-level"), ^(AND|OR)*$, or neither.
+enum class enum_condition_context {
+  NEITHER,
+  ANDS,
+  ANDS_ORS,
+};
+
+/// Used to uniquely name expressions in derived tables
+#define SYNTHETIC_FIELD_NAME "Name_exp_"
 #endif /* SQL_CONST_INCLUDED */

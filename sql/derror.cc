@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -33,7 +33,6 @@
 #include "my_inttypes.h"
 #include "my_io.h"
 #include "my_loglevel.h"
-#include "my_macros.h"
 #include "my_sys.h"
 #include "mysql/components/services/log_builtins.h"
 #include "mysql/psi/mysql_file.h"
@@ -139,8 +138,6 @@ static const char *error_message_fetch(int mysql_errno) {
   return nullptr;
 }
 
-C_MODE_START
-
 /**
   Get the error-message corresponding to the given MySQL error-code,
   or nullptr if no message is available for that code (this may indicate
@@ -179,7 +176,6 @@ const char *error_message_for_client(int mysql_errno) {
 
   return error_message_fetch(mysql_errno);
 }
-C_MODE_END
 
 bool init_errmessage() {
   DBUG_TRACE;
@@ -220,14 +216,12 @@ void deinit_errmessage() {
 */
 
 bool MY_LOCALE_ERRMSGS::read_texts() {
-  uint i;
   uint no_of_errmsgs;
   size_t length;
   File file;
   char name[FN_REFLEN];
   char lang_path[FN_REFLEN];
   uchar *start_of_errmsgs = nullptr;
-  uchar *pos = nullptr;
   uchar head[32];
   uint error_messages = 0;
 
@@ -277,9 +271,9 @@ bool MY_LOCALE_ERRMSGS::read_texts() {
 
   // Free old language and allocate for the new one
   my_free(errmsgs);
-  if (!(errmsgs = (const char **)my_malloc(
-            key_memory_errmsgs, length + no_of_errmsgs * sizeof(char *),
-            MYF(0)))) {
+  if (!(errmsgs = static_cast<const char **>(
+            my_malloc(key_memory_errmsgs_server,
+                      length + no_of_errmsgs * sizeof(char *), MYF(0))))) {
     LogErr(ERROR_LEVEL, ER_ERRMSG_OOM, name);
     (void)mysql_file_close(file, MYF(MY_WME));
     return true;
@@ -298,9 +292,12 @@ bool MY_LOCALE_ERRMSGS::read_texts() {
     goto read_err_init;
 
   // Copy the message offsets to Section1.
-  for (i = 0, pos = start_of_errmsgs; i < no_of_errmsgs; i++) {
-    errmsgs[i] = (char *)start_of_errmsgs + uint4korr(pos);
-    pos += 4;
+  {
+    const uchar *pos = start_of_errmsgs;
+    for (uint i = 0; i < no_of_errmsgs; i++) {
+      errmsgs[i] = pointer_cast<char *>(start_of_errmsgs) + uint4korr(pos);
+      pos += 4;
+    }
   }
 
   // Copy all the error text messages into Section2.
@@ -335,8 +332,9 @@ open_err:
       as one contiguous memory block, this will still be released correctly
       at shutdown.
     */
-    if ((errmsgs = (const char **)my_malloc(
-             key_memory_errmsgs, error_messages * sizeof(char *), MYF(0)))) {
+    if ((errmsgs = static_cast<const char **>(
+             my_malloc(key_memory_errmsgs_server,
+                       error_messages * sizeof(char *), MYF(0))))) {
       server_error *sqlstate_map = &error_names_array[1];
 
       for (uint i = 0; i < error_messages; ++i)

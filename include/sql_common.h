@@ -1,7 +1,7 @@
 #ifndef SQL_COMMON_INCLUDED
 #define SQL_COMMON_INCLUDED
 
-/* Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -102,11 +102,18 @@ struct MYSQL_EXTENSION {
   // Used by replication to pass around compression context data.
   NET_SERVER *server_extn;
 #endif
+  struct {
+    uint n_params;
+    char **names;
+    MYSQL_BIND *bind;
+  } bind_info;
 };
 
 /* "Constructor/destructor" for MYSQL extension structure. */
 MYSQL_EXTENSION *mysql_extension_init(MYSQL *);
 void mysql_extension_free(MYSQL_EXTENSION *);
+/* cleanup for the MYSQL extension bind structure */
+void mysql_extension_bind_free(MYSQL_EXTENSION *ext);
 /*
   Note: Allocated extension structure is freed in mysql_close_free()
   called by mysql_close().
@@ -144,6 +151,7 @@ struct st_mysql_options_extention {
   unsigned int total_configured_compression_algorithms;
   unsigned int zstd_compression_level;
   bool connection_compressed;
+  char *load_data_dir;
 };
 
 struct MYSQL_METHODS {
@@ -159,7 +167,7 @@ struct MYSQL_METHODS {
                         unsigned int field_count);
   void (*flush_use_result)(MYSQL *mysql, bool flush_all_results);
   int (*read_change_user_result)(MYSQL *mysql);
-#if !defined(MYSQL_SERVER)
+#if !defined(MYSQL_SERVER) && !defined(MYSQL_COMPONENT)
   MYSQL_FIELD *(*list_fields)(MYSQL *mysql);
   bool (*read_prepare_result)(MYSQL *mysql, MYSQL_STMT *stmt);
   int (*stmt_execute)(MYSQL_STMT *stmt);
@@ -255,6 +263,15 @@ uchar *send_client_connect_attrs(MYSQL *mysql, uchar *buf);
 extern bool libmysql_cleartext_plugin_enabled;
 int is_file_or_dir_world_writable(const char *filepath);
 void read_ok_ex(MYSQL *mysql, unsigned long len);
+
+bool fix_param_bind(MYSQL_BIND *param, uint idx);
+bool mysql_int_serialize_param_data(NET *net, unsigned int param_count,
+                                    MYSQL_BIND *params, const char **names,
+                                    unsigned long n_param_sets,
+                                    uchar **ret_data, ulong *ret_length,
+                                    uchar send_types_to_server,
+                                    bool send_named_params,
+                                    bool send_parameter_set_count);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2017, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2017, 2021, Oracle and/or its affiliates.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -68,6 +68,7 @@ Data dictionary interface */
 #include "ha_prototypes.h"
 #include "mysql/plugin.h"
 #include "query_options.h"
+#include "sql/mysqld.h"  // lower_case_file_system
 #include "sql_base.h"
 #include "sql_table.h"
 #endif /* !UNIV_HOTBACKUP */
@@ -89,7 +90,7 @@ const char *DD_instant_col_val_coder::encode(const byte *stream, size_t in_len,
 
   *out_len = in_len * 2;
 
-  return (result);
+  return result;
 }
 
 const byte *DD_instant_col_val_coder::decode(const char *stream, size_t in_len,
@@ -113,7 +114,7 @@ const byte *DD_instant_col_val_coder::decode(const char *stream, size_t in_len,
 
   *out_len = in_len / 2;
 
-  return (m_result);
+  return m_result;
 }
 
 #ifndef UNIV_HOTBACKUP
@@ -138,9 +139,9 @@ static bool dd_index_match(const dict_index_t *index, const Index *dd_index) {
   }
 
   const dd::Properties &p = dd_index->se_private_data();
-  uint64 id;
-  uint32 root;
-  uint64 trx_id;
+  uint64 id = 0;
+  uint32 root = 0;
+  uint64 trx_id = 0;
   ut_ad(p.exists(dd_index_key_strings[DD_INDEX_ID]));
   p.get(dd_index_key_strings[DD_INDEX_ID], &id);
   if (id != index->id) {
@@ -170,10 +171,11 @@ static bool dd_index_match(const dict_index_t *index, const Index *dd_index) {
     match = false;
   }
 
-  return (match);
+  return match;
 }
 
 /** Check if the InnoDB table is consistent with dd::Table
+@tparam		Table		dd::Table or dd::Partition
 @param[in]	table			InnoDB table
 @param[in]	dd_table		dd::Table or dd::Partition
 @return	true	if match
@@ -182,7 +184,7 @@ template <typename Table>
 bool dd_table_match(const dict_table_t *table, const Table *dd_table) {
   /* Temporary table has no metadata written */
   if (dd_table == nullptr || table->is_temporary()) {
-    return (true);
+    return true;
   }
 
   bool match = true;
@@ -196,7 +198,7 @@ bool dd_table_match(const dict_table_t *table, const Table *dd_table) {
 
   /* If tablespace is discarded, no need to check indexes */
   if (dict_table_is_discarded(table)) {
-    return (match);
+    return match;
   }
 
   for (const auto dd_index : dd_table->indexes()) {
@@ -217,7 +219,7 @@ bool dd_table_match(const dict_table_t *table, const Table *dd_table) {
   }
 
   /* Tablespace and options can be checked here too */
-  return (match);
+  return match;
 }
 
 template bool dd_table_match<dd::Table>(const dict_table_t *,
@@ -262,20 +264,52 @@ bool dd_mdl_for_undo(const trx_t *trx) {
           ((trx->in_innodb & TRX_FORCE_ROLLBACK) == 0));
 }
 
-/** Instantiate an InnoDB in-memory table metadata (dict_table_t)
-based on a Global DD object.
-@param[in,out]	client		data dictionary client
-@param[in]	dd_table	Global DD table object
-@param[in]	dd_part		Global DD partition or subpartition, or NULL
-@param[in]	tbl_name	table name, or NULL if not known
-@param[out]	table		InnoDB table (NULL if not found or loadable)
-@param[in]	thd		Thread THD
-@return error code
-@retval 0 on success (DD_SUCCESS) */
-int dd_table_open_on_dd_obj(dd::cache::Dictionary_client *client,
+int acquire_uncached_table(THD *thd, dd::cache::Dictionary_client *client,
+                           const dd::Table *dd_table, const char *name,
+                           TABLE_SHARE *ts, TABLE *td) {
+  int error = 0;
+  dd::Schema *schema;
+  const char *table_cache_key;
+  size_t table_cache_key_len;
+
+  if (name != nullptr) {
+    schema = nullptr;
+    table_cache_key = name;
+    table_cache_key_len = dict_get_db_name_len(name);
+  } else {
+    error =
+        client->acquire_uncached<dd::Schema>(dd_table->schema_id(), &schema);
+    if (error != 0) {
+      return (error);
+    }
+    table_cache_key = schema->name().c_str();
+    table_cache_key_len = schema->name().size();
+  }
+
+  init_tmp_table_share(thd, ts, table_cache_key, table_cache_key_len,
+                       dd_table->name().c_str(), "" /* file name */, nullptr);
+
+  error = open_table_def_suppress_invalid_meta_data(thd, ts, dd_table->table());
+
+  if (error == 0) {
+    error = open_table_from_share(thd, ts, (dd_table->table()).name().c_str(),
+                                  0, SKIP_NEW_HANDLER, 0, td, false, dd_table);
+  }
+  if (error != 0) {
+    free_table_share(ts);
+  }
+  return error;
+}
+
+void release_uncached_table(TABLE_SHARE *ts, TABLE *td) {
+  closefrm(td, false);
+  free_table_share(ts);
+}
+
+int dd_table_open_on_dd_obj(THD *thd, dd::cache::Dictionary_client *client,
                             const dd::Table &dd_table,
                             const dd::Partition *dd_part, const char *tbl_name,
-                            dict_table_t *&table, THD *thd) {
+                            dict_table_t *&table, const TABLE *td) {
 #ifdef UNIV_DEBUG
   if (dd_part != nullptr) {
     ut_ad(&dd_part->table() == &dd_table);
@@ -309,7 +343,7 @@ int dd_table_open_on_dd_obj(dd::cache::Dictionary_client *client,
   mutex_exit(&dict_sys->mutex);
 
   if (table != nullptr) {
-    return (0);
+    return 0;
   }
 
 #ifdef UNIV_DEBUG
@@ -317,80 +351,63 @@ int dd_table_open_on_dd_obj(dd::cache::Dictionary_client *client,
   to verify the MDL against the table name, because both the
   database name and table name may be invalid for MDL */
   if (tbl_name && !row_is_mysql_tmp_table_name(tbl_name)) {
-    char db_buf[MAX_DATABASE_NAME_LEN + 1];
-    char tbl_buf[MAX_TABLE_NAME_LEN + 1];
+    std::string db_str;
+    std::string tbl_str;
+    dict_name::get_table(tbl_name, db_str, tbl_str);
 
-    dd_parse_tbl_name(tbl_name, db_buf, tbl_buf, nullptr, nullptr, nullptr);
-    if (dd_table_is_partitioned(dd_table)) {
-      /* If partitioned table, only double check the prefix of table name.
-      No need to check the partition separator because the '#' would be
-      converted to '?' by dd_parse_tbl_name(). */
-      tbl_buf[strlen(dd_table.name().c_str())] = '\0';
-    }
-    ut_ad(innobase_strcasecmp(dd_table.name().c_str(), tbl_buf) == 0);
+    ut_ad(innobase_strcasecmp(dd_table.name().c_str(), tbl_str.c_str()) == 0);
   }
 #endif /* UNIV_DEBUG */
 
+  if (td != nullptr) {
+    ut_ad(tbl_name != nullptr);
+
+    if (dd_part) {
+      table = dd_open_table(client, td, tbl_name, dd_part, thd);
+    } else {
+      table = dd_open_table(client, td, tbl_name, &dd_table, thd);
+    }
+    return 0;
+  }
+
   TABLE_SHARE ts;
+  TABLE table_def;
   dd::Schema *schema;
-  const char *table_cache_key;
-  size_t table_cache_key_len;
 
-  if (tbl_name != nullptr) {
-    schema = nullptr;
-    table_cache_key = tbl_name;
-    table_cache_key_len = dict_get_db_name_len(tbl_name);
+  error =
+      acquire_uncached_table(thd, client, &dd_table, tbl_name, &ts, &table_def);
+  if (error != 0) {
+    return (error);
+  }
+
+  char tmp_name[MAX_FULL_NAME_LEN + 1];
+  const char *tab_namep;
+  if (tbl_name) {
+    tab_namep = tbl_name;
   } else {
+    char tmp_schema[MAX_DATABASE_NAME_LEN + 1];
+    char tmp_tablename[MAX_TABLE_NAME_LEN + 1];
     error = client->acquire_uncached<dd::Schema>(dd_table.schema_id(), &schema);
-
     if (error != 0) {
-      return (error);
+      return error;
     }
-
-    table_cache_key = schema->name().c_str();
-    table_cache_key_len = schema->name().size();
+    tablename_to_filename(schema->name().c_str(), tmp_schema,
+                          MAX_DATABASE_NAME_LEN + 1);
+    tablename_to_filename(dd_table.name().c_str(), tmp_tablename,
+                          MAX_TABLE_NAME_LEN + 1);
+    snprintf(tmp_name, sizeof tmp_name, "%s/%s", tmp_schema, tmp_tablename);
+    tab_namep = tmp_name;
   }
-
-  init_tmp_table_share(thd, &ts, table_cache_key, table_cache_key_len,
-                       dd_table.name().c_str(), "" /* file name */, nullptr);
-
-  error = open_table_def_suppress_invalid_meta_data(thd, &ts, dd_table);
-
-  if (error == 0) {
-    TABLE td;
-
-    error = open_table_from_share(thd, &ts, dd_table.name().c_str(), 0,
-                                  SKIP_NEW_HANDLER, 0, &td, false, &dd_table);
-    if (error == 0) {
-      char tmp_name[MAX_FULL_NAME_LEN + 1];
-      const char *tab_namep;
-
-      if (tbl_name) {
-        tab_namep = tbl_name;
-      } else {
-        char tmp_schema[MAX_DATABASE_NAME_LEN + 1];
-        char tmp_tablename[MAX_TABLE_NAME_LEN + 1];
-        tablename_to_filename(schema->name().c_str(), tmp_schema,
-                              MAX_DATABASE_NAME_LEN + 1);
-        tablename_to_filename(dd_table.name().c_str(), tmp_tablename,
-                              MAX_TABLE_NAME_LEN + 1);
-        snprintf(tmp_name, sizeof tmp_name, "%s/%s", tmp_schema, tmp_tablename);
-        tab_namep = tmp_name;
-      }
-
-      if (dd_part == nullptr) {
-        table = dd_open_table(client, &td, tab_namep, &dd_table, thd);
-      } else {
-        table = dd_open_table(client, &td, tab_namep, dd_part, thd);
-      }
-
-      closefrm(&td, false);
+  if (dd_part == nullptr) {
+    table = dd_open_table(client, &table_def, tab_namep, &dd_table, thd);
+    if (table == nullptr) {
+      error = HA_ERR_GENERIC;
     }
+  } else {
+    table = dd_open_table(client, &table_def, tab_namep, dd_part, thd);
   }
-
-  free_table_share(&ts);
-
-  return (error);
+  release_uncached_table(&ts, &table_def);
+  return error;
 }
 
 /** Load an InnoDB table definition by InnoDB table ID.
@@ -402,7 +419,7 @@ nullptr if we are resurrecting table IX locks in recovery
 @retval	nullptr	if the table is not found, or there was an error */
 static dict_table_t *dd_table_open_on_id_low(THD *thd, MDL_ticket **mdl,
                                              table_id_t table_id) {
-  char part_name[FN_REFLEN * 2];
+  std::string part_table;
   const char *name_to_open = nullptr;
 
   ut_ad(thd == nullptr || thd == current_thd);
@@ -410,7 +427,7 @@ static dict_table_t *dd_table_open_on_id_low(THD *thd, MDL_ticket **mdl,
   btrsea_sync_check check(false);
   ut_ad(!sync_check_iterate(check));
 #endif
-  ut_ad(!srv_is_being_shutdown);
+  ut_ad(srv_shutdown_state.load() < SRV_SHUTDOWN_DD);
 
   if (thd == nullptr) {
     ut_ad(mdl == nullptr);
@@ -422,123 +439,119 @@ static dict_table_t *dd_table_open_on_id_low(THD *thd, MDL_ticket **mdl,
   resurrecting transaction. We assume the table is not in DD and return. We
   cannot continue anyway here with NULL THD. */
   if (thd == nullptr) {
-    return (nullptr);
+    return nullptr;
   }
-
-  const dd::Table *dd_table;
-  const dd::Partition *dd_part = nullptr;
-  dd::cache::Dictionary_client *dc = dd::get_dd_client(thd);
-  dd::cache::Dictionary_client::Auto_releaser releaser(dc);
-
-  /* Since we start with table se_private_id, and we do not have
-  table name, so we cannot MDL lock the table(name). So we will
-  try to get the table name without MDL protection, and verify later,
-  after we got the table name and MDL lock it. Thus a loop is needed
-  in case the verification failed, and another attempt is made until
-  all things matches */
-  for (;;) {
-    dd::String_type schema;
-    dd::String_type tablename;
-    if (dc->get_table_name_by_se_private_id(handler_name, table_id, &schema,
-                                            &tablename)) {
-      return (nullptr);
-    }
-
-    const bool not_table = schema.empty();
-
-    if (not_table) {
-      if (dc->get_table_name_by_partition_se_private_id(handler_name, table_id,
-                                                        &schema, &tablename) ||
-          schema.empty()) {
-        return (nullptr);
-      }
-    }
-
-    /* Now we have tablename, and MDL locked it if necessary. */
-    if (mdl != nullptr) {
-      if (*mdl == nullptr &&
-          dd_mdl_acquire(thd, mdl, schema.c_str(), tablename.c_str())) {
-        return (nullptr);
-      }
-
-      ut_ad(*mdl != nullptr);
-    }
-
-    if (dc->acquire(schema, tablename, &dd_table) || dd_table == nullptr) {
-      if (mdl != nullptr) {
-        dd_mdl_release(thd, mdl);
-      }
-      return (nullptr);
-    }
-
-    const bool is_part = dd_table_is_partitioned(*dd_table);
-
-    /* Verify facts between dd_table and facts we know
-    1) Partiton table or not
-    2) Table ID matches or not
-    3) Table in InnoDB */
-    bool same_name = not_table == is_part &&
-                     (not_table || dd_table->se_private_id() == table_id) &&
-                     dd_table->engine() == handler_name;
-
-    /* Do more verification for partition table */
-    if (same_name && is_part) {
-      auto end = dd_table->leaf_partitions().end();
-      auto i =
-          std::search_n(dd_table->leaf_partitions().begin(), end, 1, table_id,
-                        [](const dd::Partition *p, table_id_t id) {
-                          return (p->se_private_id() == id);
-                        });
-
-      if (i == end) {
-        same_name = false;
-      } else {
-        size_t name_len;
-
-        dd_part = *i;
-        ut_ad(dd_part_is_stored(dd_part));
-        /* For partition, we need to compose the
-        name. */
-        char tmp_schema[MAX_DATABASE_NAME_LEN + 1];
-        char tmp_tablename[MAX_TABLE_NAME_LEN + 1];
-        tablename_to_filename(schema.c_str(), tmp_schema,
-                              MAX_DATABASE_NAME_LEN + 1);
-        tablename_to_filename(tablename.c_str(), tmp_tablename,
-                              MAX_TABLE_NAME_LEN + 1);
-        snprintf(part_name, sizeof part_name, "%s/%s", tmp_schema,
-                 tmp_tablename);
-        name_len = strlen(part_name);
-        Ha_innopart_share::create_partition_postfix(
-            part_name + name_len, FN_REFLEN - name_len, dd_part);
-        name_to_open = part_name;
-      }
-    }
-
-    /* facts do not match, retry */
-    if (!same_name) {
-      if (mdl != nullptr) {
-        dd_mdl_release(thd, mdl);
-      }
-      continue;
-    }
-
-    ut_ad(same_name);
-    break;
-  }
-
-  ut_ad(dd_part != nullptr || dd_table->se_private_id() == table_id);
-  ut_ad(dd_part == nullptr || dd_table == &dd_part->table());
-  ut_ad(dd_part == nullptr || dd_part->se_private_id() == table_id);
 
   dict_table_t *ib_table = nullptr;
 
-  dd_table_open_on_dd_obj(dc, *dd_table, dd_part, name_to_open, ib_table, thd);
+  {
+    const dd::Table *dd_table;
+    const dd::Partition *dd_part = nullptr;
+    dd::cache::Dictionary_client *dc = dd::get_dd_client(thd);
+    dd::cache::Dictionary_client::Auto_releaser releaser(dc);
+
+    /* Since we start with table se_private_id, and we do not have
+    table name, so we cannot MDL lock the table(name). So we will
+    try to get the table name without MDL protection, and verify later,
+    after we got the table name and MDL lock it. Thus a loop is needed
+    in case the verification failed, and another attempt is made until
+    all things matches */
+    for (;;) {
+      dd::String_type schema;
+      dd::String_type tablename;
+      if (dc->get_table_name_by_se_private_id(handler_name, table_id, &schema,
+                                              &tablename)) {
+        return nullptr;
+      }
+
+      const bool not_table = schema.empty();
+
+      if (not_table) {
+        if (dc->get_table_name_by_partition_se_private_id(
+                handler_name, table_id, &schema, &tablename) ||
+            schema.empty()) {
+          return nullptr;
+        }
+      }
+
+      /* Now we have tablename, and MDL locked it if necessary. */
+      if (mdl != nullptr) {
+        if (*mdl == nullptr &&
+            dd_mdl_acquire(thd, mdl, schema.c_str(), tablename.c_str())) {
+          return nullptr;
+        }
+
+        ut_ad(*mdl != nullptr);
+      }
+
+      if (dc->acquire(schema, tablename, &dd_table) || dd_table == nullptr) {
+        if (mdl != nullptr) {
+          dd_mdl_release(thd, mdl);
+        }
+        return nullptr;
+      }
+
+      const bool is_part = dd_table_is_partitioned(*dd_table);
+
+      /* Verify facts between dd_table and facts we know
+      1) Partiton table or not
+      2) Table ID matches or not
+      3) Table in InnoDB */
+      bool same_name = not_table == is_part &&
+                       (not_table || dd_table->se_private_id() == table_id) &&
+                       dd_table->engine() == handler_name;
+
+      /* Do more verification for partition table */
+      if (same_name && is_part) {
+        auto end = dd_table->leaf_partitions().end();
+        auto i =
+            std::search_n(dd_table->leaf_partitions().begin(), end, 1, table_id,
+                          [](const dd::Partition *p, table_id_t id) {
+                            return (p->se_private_id() == id);
+                          });
+
+        if (i == end) {
+          same_name = false;
+        } else {
+          dd_part = *i;
+          ut_ad(dd_part_is_stored(dd_part));
+
+          std::string partition;
+          /* Build the partition name. */
+          dict_name::build_partition(dd_part, partition);
+
+          /* Build the partitioned table name. */
+          dict_name::build_table(schema.c_str(), tablename.c_str(), partition,
+                                 false, true, part_table);
+          name_to_open = part_table.c_str();
+        }
+      }
+
+      /* facts do not match, retry */
+      if (!same_name) {
+        if (mdl != nullptr) {
+          dd_mdl_release(thd, mdl);
+        }
+        continue;
+      }
+
+      ut_ad(same_name);
+      break;
+    }
+
+    ut_ad(dd_part != nullptr || dd_table->se_private_id() == table_id);
+    ut_ad(dd_part == nullptr || dd_table == &dd_part->table());
+    ut_ad(dd_part == nullptr || dd_part->se_private_id() == table_id);
+
+    dd_table_open_on_dd_obj(thd, dc, *dd_table, dd_part, name_to_open, ib_table,
+                            nullptr);
+  }
 
   if (mdl && ib_table == nullptr) {
     dd_mdl_release(thd, mdl);
   }
 
-  return (ib_table);
+  return ib_table;
 }
 #endif /* !UNIV_HOTBACKUP */
 
@@ -560,19 +573,18 @@ static MY_ATTRIBUTE((warn_unused_result)) int dd_check_corrupted(
       ib::fatal(ER_IB_MSG_168) << "table is corrupt: " << table->name.m_name;
 #endif /* !UNIV_HOTBACKUP */
     } else {
-      char db_buf[MAX_DATABASE_NAME_LEN + 1];
-      char tbl_buf[MAX_TABLE_NAME_LEN + 1];
-
 #ifndef UNIV_HOTBACKUP
-      dd_parse_tbl_name(table->name.m_name, db_buf, tbl_buf, nullptr, nullptr,
-                        nullptr);
-      my_error(ER_TABLE_CORRUPT, MYF(0), db_buf, tbl_buf);
+      std::string db_str;
+      std::string tbl_str;
+      dict_name::get_table(table->name.m_name, db_str, tbl_str);
+
+      my_error(ER_TABLE_CORRUPT, MYF(0), db_str.c_str(), tbl_str.c_str());
 #else  /* !UNIV_HOTBACKUP */
       ib::fatal(ER_IB_MSG_169) << "table is corrupt: " << table->name.m_name;
 #endif /* !UNIV_HOTBACKUP */
     }
     table = nullptr;
-    return (HA_ERR_TABLE_CORRUPT);
+    return HA_ERR_TABLE_CORRUPT;
   }
 
   dict_index_t *index = table->first_index();
@@ -584,7 +596,7 @@ static MY_ATTRIBUTE((warn_unused_result)) int dd_check_corrupted(
         << "table space is missing: " << table->name.m_name;
 #endif /* !UNIV_HOTBACKUP */
     table = nullptr;
-    return (HA_ERR_TABLESPACE_MISSING);
+    return HA_ERR_TABLESPACE_MISSING;
   }
 
   /* Ignore missing tablespaces for secondary indexes. */
@@ -594,7 +606,7 @@ static MY_ATTRIBUTE((warn_unused_result)) int dd_check_corrupted(
     }
   }
 
-  return (0);
+  return 0;
 }
 
 /** Open a persistent InnoDB table based on InnoDB table id, and
@@ -602,10 +614,9 @@ hold Shared MDL lock on it.
 @param[in]	table_id		table identifier
 @param[in,out]	thd			current MySQL connection (for mdl)
 @param[in,out]	mdl			metadata lock (*mdl set if
-table_id was found)
+table_id was found) mdl=NULL if we are resurrecting table IX locks in recovery
 @param[in]	dict_locked		dict_sys mutex is held
 @param[in]	check_corruption	check if the table is corrupted or not.
-mdl=NULL if we are resurrecting table IX locks in recovery
 @return table
 @retval NULL if the table does not exist or cannot be opened */
 dict_table_t *dd_table_open_on_id(table_id_t table_id, THD *thd,
@@ -613,8 +624,6 @@ dict_table_t *dd_table_open_on_id(table_id_t table_id, THD *thd,
                                   bool check_corruption) {
   dict_table_t *ib_table;
   const ulint fold = ut_fold_ull(table_id);
-  char db_buf[MAX_DATABASE_NAME_LEN + 1];
-  char tbl_buf[MAX_TABLE_NAME_LEN + 1];
   char full_name[MAX_FULL_NAME_LEN + 1];
 
   if (!dict_locked) {
@@ -639,7 +648,7 @@ reopen:
         if (!dict_locked) {
           mutex_exit(&dict_sys->mutex);
         }
-        return (nullptr);
+        return nullptr;
       }
 
       ib_table = sdi_index->table;
@@ -678,8 +687,9 @@ reopen:
   } else {
     for (;;) {
 #ifndef UNIV_HOTBACKUP
-      bool ret = dd_parse_tbl_name(ib_table->name.m_name, db_buf, tbl_buf,
-                                   nullptr, nullptr, nullptr);
+      std::string db_str;
+      std::string tbl_str;
+      dict_name::get_table(ib_table->name.m_name, db_str, tbl_str);
 #endif /* !UNIV_HOTBACKUP */
 
       memset(full_name, 0, MAX_FULL_NAME_LEN + 1);
@@ -691,18 +701,18 @@ reopen:
       mutex_exit(&dict_sys->mutex);
 
 #ifndef UNIV_HOTBACKUP
-      if (ret == false) {
+      if (db_str.empty() || tbl_str.empty()) {
         if (dict_locked) {
           mutex_enter(&dict_sys->mutex);
         }
-        return (nullptr);
+        return nullptr;
       }
 
-      if (dd_mdl_acquire(thd, mdl, db_buf, tbl_buf)) {
+      if (dd_mdl_acquire(thd, mdl, db_str.c_str(), tbl_str.c_str())) {
         if (dict_locked) {
           mutex_enter(&dict_sys->mutex);
         }
-        return (nullptr);
+        return nullptr;
       }
 #endif /* !UNIV_HOTBACKUP */
 
@@ -773,7 +783,7 @@ reopen:
 
   ut_ad(dict_locked == mutex_own(&dict_sys->mutex));
 
-  return (ib_table);
+  return ib_table;
 }
 
 #ifndef UNIV_HOTBACKUP
@@ -796,7 +806,7 @@ bool dd_table_discard_tablespace(THD *thd, const dict_table_t *table,
   ut_ad(!sync_check_iterate(check));
 #endif /* UNIV_DEBUG */
 
-  ut_ad(!srv_is_being_shutdown);
+  ut_ad(srv_shutdown_state.load() < SRV_SHUTDOWN_DD);
 
   if (table_def->se_private_id() != dd::INVALID_OBJECT_ID) {
     ut_ad(table_def->table().leaf_partitions()->empty());
@@ -829,8 +839,7 @@ bool dd_table_discard_tablespace(THD *thd, const dict_table_t *table,
     }
 
     /* Set discard flag. */
-    dd::Properties &p = table_def->se_private_data();
-    p.set(dd_table_key_strings[DD_TABLE_DISCARD], discard);
+    dd_set_discarded(*table_def, discard);
 
     using Client = dd::cache::Dictionary_client;
     using Releaser = dd::cache::Dictionary_client::Auto_releaser;
@@ -843,9 +852,9 @@ bool dd_table_discard_tablespace(THD *thd, const dict_table_t *table,
     dd::Object_id dd_space_id =
         (*table_def->indexes()->begin())->tablespace_id();
 
-    std::string space_name;
+    std::string space_name(table->name.m_name);
 
-    dd_filename_to_spacename(table->name.m_name, &space_name);
+    dict_name::convert_to_space(space_name);
 
     if (dd_tablespace_get_mdl(space_name.c_str())) {
       ut_a(false);
@@ -855,7 +864,7 @@ bool dd_table_discard_tablespace(THD *thd, const dict_table_t *table,
       ut_a(false);
     }
 
-    ut_a(dd_space != NULL);
+    ut_a(dd_space != nullptr);
 
     dd_tablespace_set_state(
         dd_space, discard ? DD_SPACE_STATE_DISCARDED : DD_SPACE_STATE_NORMAL);
@@ -877,24 +886,20 @@ bool dd_table_discard_tablespace(THD *thd, const dict_table_t *table,
 @param[in]	name		InnoDB table name
 @param[in]	dict_locked	has dict_sys mutex locked
 @param[in]	ignore_err	whether to ignore err
+@param[out]	error		pointer to error
 @return handle to non-partitioned table
 @retval NULL if the table does not exist */
 dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
                                     const char *name, bool dict_locked,
-                                    ulint ignore_err) {
+                                    ulint ignore_err, int *error) {
   DBUG_TRACE;
 
 #ifdef UNIV_DEBUG
   btrsea_sync_check check(false);
   ut_ad(!sync_check_iterate(check));
 #endif
-  ut_ad(!srv_is_being_shutdown);
+  ut_ad(srv_shutdown_state.load() < SRV_SHUTDOWN_DD);
 
-  char db_buf[MAX_DATABASE_NAME_LEN + 1];
-  char tbl_buf[MAX_TABLE_NAME_LEN + 1];
-  char part_buf[MAX_TABLE_NAME_LEN + 1];
-  char sub_buf[MAX_TABLE_NAME_LEN + 1];
-  bool skip_mdl = !(thd && mdl);
   dict_table_t *table = nullptr;
 
   /* Get pointer to a table object in InnoDB dictionary cache.
@@ -908,13 +913,35 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
     return table;
   }
 
-  db_buf[0] = tbl_buf[0] = part_buf[0] = sub_buf[0] = '\0';
-  if (!dd_parse_tbl_name(name, db_buf, tbl_buf, part_buf, sub_buf, nullptr)) {
+  std::string db_name;
+  std::string tbl_name;
+  dict_name::get_table(name, db_name, tbl_name);
+
+  if (db_name.empty() || tbl_name.empty()) {
     return nullptr;
   }
 
-  if (!skip_mdl && dd_mdl_acquire(thd, mdl, db_buf, tbl_buf)) {
-    return nullptr;
+  bool skip_mdl = !(thd && mdl);
+
+  if (!skip_mdl) {
+    if (dict_locked) {
+      /* We cannot acquire MDL while holding dict_sys->mutex. The reason that
+      the caller has already locked this mutex is so that the dict_table_t
+      that we will find and return to it will not be dropped while the caller
+      is using it. So it is safe to exit, get the mdl and enter again before
+      finding this dict_table_t. */
+      mutex_exit(&dict_sys->mutex);
+    }
+
+    bool got_mdl = dd_mdl_acquire(thd, mdl, db_name.c_str(), tbl_name.c_str());
+
+    if (dict_locked) {
+      mutex_enter(&dict_sys->mutex);
+    }
+
+    if (got_mdl) {
+      return nullptr;
+    }
   }
 
   if (!dict_locked) {
@@ -937,8 +964,8 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
   dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
-  if (client->acquire(db_buf, tbl_buf, &dd_table) || dd_table == nullptr ||
-      dd_table->engine() != innobase_hton_name) {
+  if (client->acquire(db_name.c_str(), tbl_name.c_str(), &dd_table) ||
+      dd_table == nullptr || dd_table->engine() != innobase_hton_name) {
     /* The checking for engine should be only useful(valid)
     for getting table statistics for IS. Two relevant API
     functions are:
@@ -948,23 +975,26 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
   } else {
     if (dd_table->se_private_id() == dd::INVALID_OBJECT_ID) {
       ut_ad(!dd_table->leaf_partitions().empty());
-      if (strlen(part_buf) != 0) {
+
+      if (dict_name::is_partition(name)) {
         const dd::Partition *dd_part = nullptr;
+
         for (auto part : dd_table->leaf_partitions()) {
-          if (part->parent() != nullptr) {
-            ut_ad(strlen(sub_buf) != 0);
-            if (part->name() == sub_buf && part->parent()->name() == part_buf) {
-              dd_part = part;
-              break;
-            }
-          } else if (part->name() == part_buf) {
+          if (dict_name::match_partition(name, part)) {
             dd_part = part;
             break;
           }
         }
 
-        ut_ad(dd_part != nullptr);
-        dd_table_open_on_dd_obj(client, *dd_table, dd_part, name, table, thd);
+        /* Safe check for release mode. */
+        if (dd_part == nullptr) {
+          ut_ad(false);
+          table = nullptr;
+        } else {
+          dd_table_open_on_dd_obj(thd, client, *dd_table, dd_part, name, table,
+                                  nullptr);
+        }
+
       } else {
         /* FIXME: Once FK functions will not open
         partitioned table in current improper way,
@@ -973,7 +1003,11 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
       }
     } else {
       ut_ad(dd_table->leaf_partitions().empty());
-      dd_table_open_on_dd_obj(client, *dd_table, nullptr, name, table, thd);
+      int err = dd_table_open_on_dd_obj(thd, client, *dd_table, nullptr, name,
+                                        table, nullptr);
+      if (error) {
+        *error = err;
+      }
     }
   }
 
@@ -1025,8 +1059,7 @@ void dd_table_close(dict_table_t *table, THD *thd, MDL_ticket **mdl,
                              `d1/d2\d3`.`t3\t4/t5`
                             should look like:
                             d1@002fd2@005cd3/t3@005ct4@002ft5
-                            both on Windows and on Linux.
-@return None. */
+                            both on Windows and on Linux. */
 static void replace_space_name_in_file_name(dd::Tablespace_file *dd_file,
                                             dd::String_type new_space_name) {
   ut_ad(std::count(new_space_name.begin(), new_space_name.end(),
@@ -1062,22 +1095,16 @@ static void replace_space_name_in_file_name(dd::Tablespace_file *dd_file,
   dd_file->set_filename(old_file_name);
 }
 
-/** Update filename of dd::Tablespace
-@param[in]	dd_space_id	DD tablespace id
-@param[in]	new_space_name	New tablespace name
-@param[in]	new_path	New data file path
-@retval DB_SUCCESS on success. */
-dberr_t dd_tablespace_rename(dd::Object_id dd_space_id,
+dberr_t dd_tablespace_rename(dd::Object_id dd_space_id, bool is_system_cs,
                              const char *new_space_name, const char *new_path) {
   THD *thd = current_thd;
-  std::string tablespace_name;
 
   DBUG_TRACE;
 #ifdef UNIV_DEBUG
   btrsea_sync_check check(false);
   ut_ad(!sync_check_iterate(check));
 #endif /* UNIV_DEBUG */
-  ut_ad(!srv_is_being_shutdown);
+  ut_ad(srv_shutdown_state.load() < SRV_SHUTDOWN_DD);
 
   dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
@@ -1098,7 +1125,11 @@ dberr_t dd_tablespace_rename(dd::Object_id dd_space_id,
     return DB_ERROR;
   }
 
-  dd_filename_to_spacename(new_space_name, &tablespace_name);
+  std::string tablespace_name(new_space_name);
+  /* Convert if not in system character set. */
+  if (!is_system_cs) {
+    dict_name::convert_to_space(tablespace_name);
+  }
 
   MDL_ticket *dst_ticket = nullptr;
   if (dd_tablespace_get_mdl(tablespace_name.c_str(), &dst_ticket)) {
@@ -1347,8 +1378,14 @@ static bool format_validate(THD *thd, const TABLE *form, row_type real_type,
     dberr_t err = Compression::check(algorithm, &compression);
 
     if (err == DB_UNSUPPORTED) {
-      my_error(ER_WRONG_VALUE, MYF(0), "COMPRESSION", algorithm);
-      invalid = true;
+      if (strict) {
+        my_error(ER_WRONG_VALUE, MYF(0), "COMPRESSION", algorithm);
+        invalid = true;
+      } else {
+        push_warning_printf(thd, Sql_condition::SL_WARNING, ER_WRONG_VALUE,
+                            ER_DEFAULT(ER_WRONG_VALUE), "COMPRESSION",
+                            algorithm);
+      }
     } else if (compression.m_type != Compression::NONE) {
       if (*zip_ssize != 0) {
         if (strict) {
@@ -1380,7 +1417,7 @@ static bool format_validate(THD *thd, const TABLE *form, row_type real_type,
       /* We don't support FTS indexes in temporary
       tables. */
       my_error(ER_INNODB_NO_FT_TEMP_TABLE, MYF(0));
-      return (true);
+      return true;
     }
   }
 
@@ -1404,7 +1441,7 @@ static bool format_validate(THD *thd, const TABLE *form, row_type real_type,
       break;
   }
 
-  return (invalid);
+  return invalid;
 }
 
 /** Set the AUTO_INCREMENT attribute.
@@ -1491,12 +1528,6 @@ void dd_copy_instant_n_cols(dd::Table &new_table, const dd::Table &old_table) {
 #endif /* UNIV_DEBUG */
 }
 
-/** Copy the engine-private parts of a table or partition definition
-when the change does not affect InnoDB. This mainly copies the common
-private data between dd::Table and dd::Partition
-@tparam		Table		dd::Table or dd::Partition
-@param[in,out]	new_table	Copy of old table or partition definition
-@param[in]	old_table	Old table or partition definition */
 template <typename Table>
 void dd_copy_private(Table &new_table, const Table &old_table) {
   uint64 autoinc = 0;
@@ -1755,7 +1786,7 @@ void dd_add_instant_columns(const TABLE *old_table, const TABLE *altered_table,
     ulint charset_no;
     ulint mtype = get_innobase_type_from_mysql_type(&unsigned_type, field);
 
-    nulls_allowed = field->real_maybe_null() ? 0 : DATA_NOT_NULL;
+    nulls_allowed = field->is_nullable() ? 0 : DATA_NOT_NULL;
 
     binary_type = field->binary() ? DATA_BINARY_TYPE : 0;
 
@@ -1766,9 +1797,9 @@ void dd_add_instant_columns(const TABLE *old_table, const TABLE *altered_table,
 
     long_true_varchar = 0;
     if (field->type() == MYSQL_TYPE_VARCHAR) {
-      col_len -= ((Field_varstring *)field)->length_bytes;
+      col_len -= field->get_length_bytes();
 
-      if (((Field_varstring *)field)->length_bytes == 2) {
+      if (field->get_length_bytes() == 2) {
         long_true_varchar = DATA_LONG_TRUE_VARCHAR;
       }
     }
@@ -1781,13 +1812,13 @@ void dd_add_instant_columns(const TABLE *old_table, const TABLE *altered_table,
     dict_col_t col;
     memset(&col, 0, sizeof(dict_col_t));
     /* Set a fake col_pos, since this should be useless */
-    dict_mem_fill_column_struct(&col, 0, mtype, prtype, col_len);
+    dict_mem_fill_column_struct(&col, 0, mtype, prtype, col_len, true);
     dfield_t dfield;
     col.copy_type(dfield_get_type(&dfield));
 
     ulint size = field->pack_length();
     uint64_t buf;
-    const byte *mysql_data = field->ptr;
+    const byte *mysql_data = field->field_ptr();
 
     row_mysql_store_col_in_innobase_format(
         &dfield, reinterpret_cast<byte *>(&buf), true, mysql_data, size,
@@ -1831,14 +1862,14 @@ bool dd_match_default_value(const dd::Column *dd_col, const dict_col_t *col) {
     match = col->instant_default->len == len &&
             memcmp(col->instant_default->value, default_value, len) == 0;
 
-    return (match);
+    return match;
 
   } else if (private_data.exists(
                  dd_column_key_strings[DD_INSTANT_COLUMN_DEFAULT_NULL])) {
     return (col->instant_default->len == UNIV_SQL_NULL);
   }
 
-  return (true);
+  return true;
 }
 
 /** Write default value of a column to dd::Column
@@ -1913,14 +1944,9 @@ void dd_import_instant_add_columns(const dict_table_t *table,
           table->get_instant_cols());
     }
 
-    char postfix_name[FN_REFLEN];
     dd::Partition *partition = nullptr;
     for (const auto dd_part : *dd_table->leaf_partitions()) {
-      ut_d(size_t len =) Ha_innopart_share::create_partition_postfix(
-          postfix_name, FN_REFLEN, dd_part);
-      ut_ad(len < FN_REFLEN);
-
-      if (strstr(table->name.m_name, postfix_name) != 0) {
+      if (dict_name::match_partition(table->name.m_name, dd_part)) {
         partition = dd_part;
         break;
       }
@@ -1985,11 +2011,6 @@ template void dd_write_index<dd::Partition_index>(dd::Object_id,
                                                   dd::Partition_index *,
                                                   const dict_index_t *);
 
-/** Write metadata of a table to dd::Table
-@tparam		Table		dd::Table or dd::Partition
-@param[in]	dd_space_id	Tablespace id, which server allocates
-@param[in,out]	dd_table	dd::Table or dd::Partition
-@param[in]	table		InnoDB table object */
 template <typename Table>
 void dd_write_table(dd::Object_id dd_space_id, Table *dd_table,
                     const dict_table_t *table) {
@@ -2030,10 +2051,6 @@ template void dd_write_table<dd::Table>(dd::Object_id, dd::Table *,
 template void dd_write_table<dd::Partition>(dd::Object_id, dd::Partition *,
                                             const dict_table_t *);
 
-/** Set options of dd::Table according to InnoDB table object
-@tparam		Table		dd::Table or dd::Partition
-@param[in,out]	dd_table	dd::Table or dd::Partition
-@param[in]	table		InnoDB table object */
 template <typename Table>
 void dd_set_table_options(Table *dd_table, const dict_table_t *table) {
   dd::Table *dd_table_def = &(dd_table->table());
@@ -2177,7 +2194,7 @@ const dict_index_t *dd_find_index(const dict_table_t *table, Index *dd_index) {
   because it's an implicitly upgraded unique index. We have to
   search all the indexes */
   if (dd_index->name() == "PRIMARY") {
-    return (table->first_index());
+    return table->first_index();
   }
 
   /* The order could be different because all unique dd::Index(es)
@@ -2201,7 +2218,7 @@ const dict_index_t *dd_find_index(const dict_table_t *table, Index *dd_index) {
   ut_ad(next_index == nullptr);
 #endif /* UNIV_DEBUG */
 
-  return (index);
+  return index;
 }
 
 template const dict_index_t *dd_find_index<dd::Index>(const dict_table_t *,
@@ -2263,14 +2280,14 @@ static MY_ATTRIBUTE((warn_unused_result)) int dd_fill_one_dict_index(
   DBUG_EXECUTE_IF("ib_create_table_fail_at_create_index",
                   dict_mem_index_free(index);
                   my_error(ER_INDEX_COLUMN_TOO_LONG, MYF(0), max_len);
-                  return (HA_ERR_TOO_BIG_ROW););
+                  return HA_ERR_TOO_BIG_ROW;);
 
   for (unsigned i = 0; i < key.user_defined_key_parts; i++) {
     const KEY_PART_INFO *key_part = &key.key_part[i];
     unsigned prefix_len = 0;
     const Field *field = key_part->field;
     ut_ad(field == form->field[key_part->fieldnr - 1]);
-    ut_ad(field == form->field[field->field_index]);
+    ut_ad(field == form->field[field->field_index()]);
 
     if (field->is_virtual_gcol()) {
       index->type |= DICT_VIRTUAL;
@@ -2313,26 +2330,27 @@ static MY_ATTRIBUTE((warn_unused_result)) int dd_fill_one_dict_index(
         !(key.flags & (HA_FULLTEXT))) {
       dict_mem_index_free(index);
       my_error(ER_INDEX_COLUMN_TOO_LONG, MYF(0), max_len);
-      return (HA_ERR_INDEX_COL_TOO_LONG);
+      return HA_ERR_INDEX_COL_TOO_LONG;
     }
 
     dict_col_t *col = nullptr;
 
     if (innobase_is_v_fld(field)) {
       dict_v_col_t *v_col =
-          dict_table_get_nth_v_col_mysql(table, field->field_index);
+          dict_table_get_nth_v_col_mysql(table, field->field_index());
       col = reinterpret_cast<dict_col_t *>(v_col);
     } else {
       ulint t_num_v = 0;
-      for (ulint z = 0; z < field->field_index; z++) {
+      for (ulint z = 0; z < field->field_index(); z++) {
         if (innobase_is_v_fld(form->field[z])) {
           t_num_v++;
         }
       }
 
-      col = &table->cols[field->field_index - t_num_v];
+      col = &table->cols[field->field_index() - t_num_v];
     }
 
+    col->is_visible = !field->is_hidden_by_system();
     dict_index_add_col(index, table, col, prefix_len, is_asc);
   }
 
@@ -2343,7 +2361,7 @@ static MY_ATTRIBUTE((warn_unused_result)) int dd_fill_one_dict_index(
 
   if (dict_index_add_to_cache(table, index, 0, FALSE) != DB_SUCCESS) {
     ut_ad(0);
-    return (HA_ERR_GENERIC);
+    return HA_ERR_GENERIC;
   }
 
   index = UT_LIST_GET_LAST(table->indexes);
@@ -2382,7 +2400,7 @@ static MY_ATTRIBUTE((warn_unused_result)) int dd_fill_one_dict_index(
                            srid_has_value);
   }
 
-  return (0);
+  return 0;
 }
 
 /** Parse MERGE_THRESHOLD value from a comment string.
@@ -2400,14 +2418,14 @@ static ulint dd_parse_merge_threshold(THD *thd, const char *str) {
     int ret = atoi(pos);
 
     if (ret > 0 && unsigned(ret) <= DICT_INDEX_MERGE_THRESHOLD_DEFAULT) {
-      return (static_cast<ulint>(ret));
+      return static_cast<ulint>(ret);
     }
 
     push_warning_printf(thd, Sql_condition::SL_WARNING, WARN_OPTION_IGNORED,
                         ER_DEFAULT(WARN_OPTION_IGNORED), "MERGE_THRESHOLD");
   }
 
-  return (DICT_INDEX_MERGE_THRESHOLD_DEFAULT);
+  return DICT_INDEX_MERGE_THRESHOLD_DEFAULT;
 }
 
 /** Copy attributes from MySQL TABLE_SHARE into an InnoDB table object.
@@ -2570,7 +2588,7 @@ inline int dd_fill_dict_index(const dd::Table &dd_table, const TABLE *m_form,
         }
 
         my_error(ER_WRONG_NAME_FOR_INDEX, MYF(0), FTS_DOC_ID_INDEX_NAME);
-        return (HA_ERR_GENERIC);
+        return HA_ERR_GENERIC;
       case FTS_EXIST_DOC_ID_INDEX:
         break;
       case FTS_NOT_EXIST_DOC_ID_INDEX:
@@ -2635,7 +2653,7 @@ inline int dd_fill_dict_index(const dd::Table &dd_table, const TABLE *m_form,
     dict_mem_table_free(m_table);
   }
 
-  return (error);
+  return error;
 }
 
 /** Determine if a table contains a fulltext index.
@@ -2644,10 +2662,10 @@ inline int dd_fill_dict_index(const dd::Table &dd_table, const TABLE *m_form,
 inline bool dd_table_contains_fulltext(const dd::Table &table) {
   for (const dd::Index *index : table.indexes()) {
     if (index->type() == dd::Index::IT_FULLTEXT) {
-      return (true);
+      return true;
     }
   }
-  return (false);
+  return false;
 }
 
 /** Read the metadata of default values for all columns added instantly
@@ -2761,7 +2779,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
 
   if (m_form->s->fields > REC_MAX_N_USER_FIELDS) {
     my_error(ER_TOO_MANY_FIELDS, MYF(0));
-    return (nullptr);
+    return nullptr;
   }
 
   /* Set encryption option for file-per-table tablespace. */
@@ -2775,10 +2793,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
   }
 
   /* Check discard flag. */
-  const dd::Properties &table_private = dd_tab->table().se_private_data();
-  if (table_private.exists(dd_table_key_strings[DD_TABLE_DISCARD])) {
-    table_private.get(dd_table_key_strings[DD_TABLE_DISCARD], &is_discard);
-  }
+  is_discard = dd_is_discarded(*dd_tab);
 
   const unsigned n_mysql_cols = m_form->s->fields;
 
@@ -2850,7 +2865,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
   /* Validate the table format options */
   if (format_validate(m_thd, m_form, real_type, zip_allowed, strict,
                       &is_redundant, &blob_prefix, &zip_ssize, is_implicit)) {
-    return (nullptr);
+    return nullptr;
   }
 
   ulint n_v_cols = 0;
@@ -2893,6 +2908,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
     uint32_t instant_cols;
 
     if (!dd_table_is_partitioned(dd_tab->table())) {
+      const dd::Properties &table_private = dd_tab->table().se_private_data();
       table_private.get(dd_table_key_strings[DD_TABLE_INSTANT_COLS],
                         &instant_cols);
       m_table->set_instant_cols(instant_cols);
@@ -2961,7 +2977,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
   if (is_encrypted) {
     /* We don't support encrypt intrinsic and temporary table.  */
     ut_ad(!m_table->is_intrinsic() && !m_table->is_temporary());
-    /* This flag will be used to set file-per-table tablesapce
+    /* This flag will be used to set file-per-table tablespace
     encryption flag */
     DICT_TF2_FLAG_SET(m_table, DICT_TF2_ENCRYPTION_FILE_PER_TABLE);
   }
@@ -2987,7 +3003,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
     ulint charset_no;
     ulint mtype = get_innobase_type_from_mysql_type(&unsigned_type, field);
 
-    nulls_allowed = field->real_maybe_null() ? 0 : DATA_NOT_NULL;
+    nulls_allowed = field->is_nullable() ? 0 : DATA_NOT_NULL;
 
     /* Convert non nullable fields in FTS AUX tables as nullable.
     This is because in 5.7, we created FTS AUX tables clustered
@@ -3042,7 +3058,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
                                 unsigned_type | binary_type | long_true_varchar,
                             charset_no);
       dict_mem_table_add_col(m_table, heap, field->field_name, mtype, prtype,
-                             col_len);
+                             col_len, !field->is_hidden_by_system());
     } else {
       prtype = dtype_form_prtype(
           (ulint)field->type() | nulls_allowed | unsigned_type | binary_type |
@@ -3050,7 +3066,8 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
           charset_no);
       dict_mem_table_add_v_col(m_table, heap, field->field_name, mtype, prtype,
                                col_len, i,
-                               field->gcol_info->non_virtual_base_columns());
+                               field->gcol_info->non_virtual_base_columns(),
+                               !field->is_hidden_by_system());
     }
 
     if (is_stored) {
@@ -3097,53 +3114,7 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
 
   mem_heap_free(heap);
 
-  return (m_table);
-}
-
-/** Parse the tablespace file name from filename charset to table name charset
-@param[in]      file_name      tablespace file name
-@param[in,out]	tablespace_name	tablespace name which is in table name
-                                charset. */
-void dd_filename_to_spacename(const char *file_name,
-                              std::string *tablespace_name) {
-  char db_buf[NAME_LEN + 1];
-  char tbl_buf[NAME_LEN + 1];
-  char part_buf[NAME_LEN + 1];
-  char sub_buf[NAME_LEN + 1];
-  char orig_tablespace[NAME_LEN + 1];
-  bool is_tmp = false;
-
-  db_buf[0] = tbl_buf[0] = part_buf[0] = sub_buf[0] = '\0';
-
-  dd_parse_tbl_name(file_name, db_buf, tbl_buf, part_buf, sub_buf, &is_tmp);
-
-  if (db_buf[0] == '\0') {
-    filename_to_tablename((char *)file_name, orig_tablespace, (NAME_LEN + 1));
-    tablespace_name->append(orig_tablespace);
-
-    return;
-  }
-
-  tablespace_name->append(db_buf);
-  tablespace_name->append("/");
-  tablespace_name->append(tbl_buf);
-
-  if (part_buf[0] != '\0') {
-    tablespace_name->append(PART_SEPARATOR);
-    tablespace_name->append(part_buf);
-  }
-
-  if (sub_buf[0] != '\0') {
-    tablespace_name->append(SUB_PART_SEPARATOR);
-    tablespace_name->append(sub_buf);
-  }
-
-  if (is_tmp) {
-    tablespace_name->append(TMP_POSTFIX);
-  }
-
-  /* Name should not exceed schema/table#P#partition#SP#subpartition. */
-  ut_ad(tablespace_name->size() < MAX_SPACE_NAME_LEN);
+  return m_table;
 }
 
 /* Create metadata for specified tablespace, acquiring exlcusive MDL first
@@ -3161,6 +3132,10 @@ bool dd_create_tablespace(dd::cache::Dictionary_client *dd_client, THD *thd,
                           const char *dd_space_name, space_id_t space_id,
                           uint32_t flags, const char *filename, bool discarded,
                           dd::Object_id &dd_space_id) {
+  /* Get the autoextend_size attribute for the tablespace */
+  fil_space_t *space = fil_space_get(space_id);
+  ut_ad(space != nullptr);
+
   std::unique_ptr<dd::Tablespace> dd_space(dd::create_object<dd::Tablespace>());
 
   if (dd_space_name != nullptr) {
@@ -3168,7 +3143,7 @@ bool dd_create_tablespace(dd::cache::Dictionary_client *dd_client, THD *thd,
   }
 
   if (dd_tablespace_get_mdl(dd_space->name().c_str())) {
-    return (true);
+    return true;
   }
 
   dd_space->set_engine(innobase_hton_name);
@@ -3200,13 +3175,15 @@ bool dd_create_tablespace(dd::cache::Dictionary_client *dd_client, THD *thd,
     toptions.set("encryption", "Y");
   }
 
+  toptions.set(autoextend_size_str, space->autoextend_size_in_bytes);
+
   if (dd_client->store(dd_space.get())) {
-    return (true);
+    return true;
   }
 
   dd_space_id = dd_space.get()->id();
 
-  return (false);
+  return false;
 }
 
 /** Create metadata for implicit tablespace
@@ -3224,16 +3201,16 @@ bool dd_create_implicit_tablespace(dd::cache::Dictionary_client *dd_client,
                                    THD *thd, space_id_t space_id,
                                    const char *space_name, const char *filename,
                                    bool discarded, dd::Object_id &dd_space_id) {
-  std::string tsn;
   fil_space_t *space = fil_space_get(space_id);
   uint32_t flags = space->flags;
 
-  dd_filename_to_spacename(space_name, &tsn);
+  std::string tsn(space_name);
+  dict_name::convert_to_space(tsn);
 
   bool fail = dd_create_tablespace(dd_client, thd, tsn.c_str(), space_id, flags,
                                    filename, discarded, dd_space_id);
 
-  return (fail);
+  return fail;
 }
 
 /** Drop a tablespace
@@ -3253,7 +3230,7 @@ bool dd_drop_tablespace(dd::cache::Dictionary_client *dd_client, THD *thd,
              " for space ",
              dd_space_id);
 
-    return (true);
+    return true;
   }
 
   ut_a(dd_space != nullptr);
@@ -3264,7 +3241,7 @@ bool dd_drop_tablespace(dd::cache::Dictionary_client *dd_client, THD *thd,
              " tablespace ",
              dd_space->name().c_str());
 
-    return (true);
+    return true;
   }
 
   bool error = dd_client->drop(dd_space);
@@ -3275,7 +3252,7 @@ bool dd_drop_tablespace(dd::cache::Dictionary_client *dd_client, THD *thd,
              dd_space->name().c_str());
   }
 
-  return (error);
+  return error;
 }
 
 /** Determine if a tablespace is implicit.
@@ -3303,7 +3280,130 @@ bool dd_tablespace_is_implicit(dd::cache::Dictionary_client *client,
     *implicit = fsp_is_file_per_table(id, flags);
   }
 
-  return (fail);
+  return fail;
+}
+
+bool dd_get_tablespace_size_option(dd::cache::Dictionary_client *dd_client,
+                                   const dd::Object_id dd_space_id,
+                                   uint64_t *autoextend_size) {
+  /* Get the tablespace object. */
+  dd::Tablespace *dd_space = nullptr;
+
+  if (dd_client->acquire_uncached_uncommitted<dd::Tablespace>(dd_space_id,
+                                                              &dd_space)) {
+    /* purecov: begin inspected */
+    my_error(ER_INTERNAL_ERROR, MYF(0),
+             " InnoDB: Can't get tablespace object for space ", dd_space_id);
+    return true;
+    /* purecov: end */
+  }
+
+  ut_a(dd_space != nullptr);
+
+  const dd::Properties &p = dd_space->options();
+
+  if (p.exists(autoextend_size_str)) {
+    p.get(autoextend_size_str, autoextend_size);
+  } else {
+    *autoextend_size = 0;
+  }
+
+  return false;
+}
+
+bool dd_implicit_alter_tablespace(dd::cache::Dictionary_client *dd_client,
+                                  THD *thd, dd::Object_id dd_space_id,
+                                  HA_CREATE_INFO *create_info) {
+  ut_a(create_info->m_implicit_tablespace_autoextend_size_change);
+
+  dd::Tablespace *dd_space = nullptr;
+  bool is_implicit{};
+
+  if (dd_tablespace_is_implicit(dd_client, dd_space_id, &is_implicit,
+                                &dd_space) ||
+      !is_implicit) {
+    /* purecov: begin inspected */
+    my_error(ER_INTERNAL_ERROR, MYF(0),
+             " InnoDB: Can't get tablespace object for space ", dd_space_id);
+    return true;
+    /* purecov: end */
+  }
+
+  ut_a(dd_space != nullptr);
+
+  if (dd_tablespace_get_mdl(dd_space->name().c_str())) {
+    /* purecov: begin inspected */
+    my_error(ER_INTERNAL_ERROR, MYF(0),
+             " InnoDB can't set exclusive MDL on"
+             " tablespace ",
+             dd_space->name().c_str());
+    return true;
+    /* purecov: end */
+  }
+
+  /* Get the space id from the tablespace properties. */
+  const dd::Properties &pd = dd_space->se_private_data();
+  uint32 id;
+  pd.get(dd_space_key_strings[DD_SPACE_ID], &id);
+
+  /* Get the tablespace options. */
+  dd::Properties &p = dd_space->options();
+
+  /* Find out if the tablespace is discarded. */
+  bool is_discarded = dd_tablespace_is_discarded(dd_space);
+
+  ut_ad(fil_space_get(id) != nullptr || is_discarded);
+
+  if (create_info->m_implicit_tablespace_autoextend_size_change &&
+      create_info->m_implicit_tablespace_autoextend_size > 0 &&
+      validate_autoextend_size_value(
+          create_info->m_implicit_tablespace_autoextend_size) != DB_SUCCESS) {
+    return true;
+  }
+
+  /* Set the autoextend_size attribute if changed. */
+  if (create_info->m_implicit_tablespace_autoextend_size_change) {
+    p.set(autoextend_size_str,
+          create_info->m_implicit_tablespace_autoextend_size);
+  }
+
+  if (dd_client->update(dd_space)) {
+    return true;
+  }
+
+  /* Set the autoextend_size value in the cached space object. */
+
+  /* Space could be invalid in case of a discarded tablespaces. The
+  autoextend_size attribute will be set in the fil_space_t when it
+  is re-initialized during import. */
+  if (!is_discarded) {
+    if (create_info->m_implicit_tablespace_autoextend_size_change) {
+      fil_set_autoextend_size(
+          id, create_info->m_implicit_tablespace_autoextend_size);
+    }
+  }
+
+  return false;
+}
+
+bool dd_set_tablespace_compression(dd::cache::Dictionary_client *client,
+                                   const char *algorithm,
+                                   dd::Object_id dd_space_id) {
+  dd::Tablespace *dd_space{};
+  auto fail = client->acquire_uncached_uncommitted<dd::Tablespace>(dd_space_id,
+                                                                   &dd_space);
+
+  if (fail || dd_space == nullptr) {
+    return true;
+  }
+
+  space_id_t space_id = 0;
+
+  dd_space->se_private_data().get(dd_space_key_strings[DD_SPACE_ID], &space_id);
+
+  auto err = fil_set_compression(space_id, algorithm);
+
+  return err != DB_SUCCESS;
 }
 
 /** Load foreign key constraint info for the dd::Table object.
@@ -3334,10 +3434,16 @@ dberr_t dd_table_load_fk_from_dd(dict_table_t *m_table,
 
     bool truncated;
     build_table_filename(buf, sizeof(buf), db_name.c_str(), tb_name.c_str(),
-                         NULL, 0, &truncated);
-    ut_ad(!truncated);
+                         nullptr, 0, &truncated);
+
     char norm_name[FN_REFLEN * 2];
-    normalize_table_name(norm_name, buf);
+
+    if (truncated || !normalize_table_name(norm_name, buf)) {
+      /* purecov: begin inspected */
+      ut_ad(false);
+      return DB_TOO_LONG_PATH;
+      /* purecov: end */
+    }
 
     dict_foreign_t *foreign = dict_mem_foreign_create();
     foreign->foreign_table_name =
@@ -3461,7 +3567,7 @@ dberr_t dd_table_load_fk_from_dd(dict_table_t *m_table,
     dict_mem_table_free_foreign_vcol_set(m_table);
     dict_mem_table_fill_foreign_vcol_set(m_table);
   }
-  return (err);
+  return err;
 }
 
 /** Load foreign key constraint for the table. Note, it could also open
@@ -3496,7 +3602,7 @@ dberr_t dd_table_load_fk(dd::cache::Dictionary_client *client,
                                  dict_locked);
 
   if (err != DB_SUCCESS) {
-    return (err);
+    return err;
   }
 
   if (dict_locked) {
@@ -3514,7 +3620,7 @@ dberr_t dd_table_load_fk(dd::cache::Dictionary_client *client,
     mutex_enter(&dict_sys->mutex);
   }
 
-  return (err);
+  return err;
 }
 
 /** Load foreign key constraint for the table. Note, it could also open
@@ -3543,28 +3649,34 @@ dberr_t dd_table_check_for_child(dd::cache::Dictionary_client *client,
   if (!dict_sys_t::is_dd_table_id(m_table->id) && fk_tables != nullptr) {
     std::vector<dd::String_type> child_schema;
     std::vector<dd::String_type> child_name;
+    std::string db_str;
+    std::string tbl_str;
 
-    char name_buf1[MAX_DATABASE_NAME_LEN + 1];
-    char name_buf2[MAX_TABLE_NAME_LEN + 1];
+    dict_name::get_table(m_table->name.m_name, db_str, tbl_str);
 
-    dd_parse_tbl_name(m_table->name.m_name, name_buf1, name_buf2, nullptr,
-                      nullptr, nullptr);
-
-    if (client->fetch_fk_children_uncached(name_buf1, name_buf2, "InnoDB",
-                                           false, &child_schema, &child_name)) {
-      return (DB_ERROR);
+    if (client->fetch_fk_children_uncached(db_str.c_str(), tbl_str.c_str(),
+                                           "InnoDB", false, &child_schema,
+                                           &child_name)) {
+      return DB_ERROR;
     }
 
     std::vector<dd::String_type>::iterator it = child_name.begin();
     for (auto &db_name : child_schema) {
       dd::String_type tb_name = *it;
+
       char buf[2 * NAME_CHAR_LEN * 5 + 2 + 1];
       bool truncated;
       build_table_filename(buf, sizeof(buf), db_name.c_str(), tb_name.c_str(),
-                           NULL, 0, &truncated);
-      ut_ad(!truncated);
+                           nullptr, 0, &truncated);
+
       char full_name[FN_REFLEN];
-      normalize_table_name(full_name, buf);
+
+      if (truncated || !normalize_table_name(full_name, buf)) {
+        /* purecov: begin inspected */
+        ut_ad(false);
+        return DB_TOO_LONG_PATH;
+        /* purecov: end */
+      }
 
       if (innobase_get_lower_case_table_names() == 2) {
         innobase_casedn_str(full_name);
@@ -3596,7 +3708,7 @@ dberr_t dd_table_check_for_child(dd::cache::Dictionary_client *client,
             if (err != DB_SUCCESS) {
               foreign_table->release();
               mutex_exit(&dict_sys->mutex);
-              return (err);
+              return err;
             }
           }
         }
@@ -3623,7 +3735,7 @@ dberr_t dd_table_check_for_child(dd::cache::Dictionary_client *client,
     }
   }
 
-  return (err);
+  return err;
 }
 
 /** Get tablespace name of dd::Table
@@ -3637,7 +3749,7 @@ const char *dd_table_get_space_name(const Table *dd_table) {
   const char *space_name;
 
   DBUG_TRACE;
-  ut_ad(!srv_is_being_shutdown);
+  ut_ad(srv_shutdown_state.load() < SRV_SHUTDOWN_DD);
 
   dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
@@ -3673,26 +3785,27 @@ char *dd_get_first_path(mem_heap_t *heap, dict_table_t *table,
   MDL_ticket *mdl = nullptr;
   dd::Object_id dd_space_id;
 
-  ut_ad(!srv_is_being_shutdown);
+  ut_ad(srv_shutdown_state.load() < SRV_SHUTDOWN_DD);
   ut_ad(!mutex_own(&dict_sys->mutex));
 
   dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
   if (dd_table == nullptr) {
-    char db_buf[MAX_DATABASE_NAME_LEN + 1];
-    char tbl_buf[MAX_TABLE_NAME_LEN + 1];
-    const dd::Table *table_def = nullptr;
+    std::string db_str;
+    std::string tbl_str;
+    dict_name::get_table(table->name.m_name, db_str, tbl_str);
 
-    if (!dd_parse_tbl_name(table->name.m_name, db_buf, tbl_buf, nullptr,
-                           nullptr, nullptr) ||
-        dd_mdl_acquire(thd, &mdl, db_buf, tbl_buf)) {
-      return (nullptr);
+    if (db_str.empty() || tbl_str.empty() ||
+        dd_mdl_acquire(thd, &mdl, db_str.c_str(), tbl_str.c_str())) {
+      return nullptr;
     }
 
-    if (client->acquire(db_buf, tbl_buf, &table_def) || table_def == nullptr) {
+    const dd::Table *table_def = nullptr;
+    if (client->acquire(db_str.c_str(), tbl_str.c_str(), &table_def) ||
+        table_def == nullptr) {
       dd_mdl_release(thd, &mdl);
-      return (nullptr);
+      return nullptr;
     }
 
     dd_space_id = dd_first_index(table_def)->tablespace_id();
@@ -3705,7 +3818,7 @@ char *dd_get_first_path(mem_heap_t *heap, dict_table_t *table,
   if (client->acquire_uncached_uncommitted<dd::Tablespace>(dd_space_id,
                                                            &dd_space)) {
     ut_ad(false);
-    return (nullptr);
+    return nullptr;
   }
 
   if (dd_space != nullptr) {
@@ -3714,24 +3827,16 @@ char *dd_get_first_path(mem_heap_t *heap, dict_table_t *table,
 
     filepath = mem_heap_strdup(heap, dd_file->filename().c_str());
 
-    return (filepath);
+    return filepath;
   }
 
-  return (nullptr);
+  return nullptr;
 }
 
-/** Make sure the data_dir_path is saved in dict_table_t if this is a
-remote single file tablespace. This allows DATA DIRECTORY to be
-displayed correctly for SHOW CREATE TABLE. Try to read the filepath
-from the fil_system first, then from the DD.
-@tparam		Table		dd::Table or dd::Partition
-@param[in,out]	table		Table object
-@param[in]	dd_table	DD table object
-@param[in]	dict_mutex_own	true if dict_sys->mutex is owned already */
 template <typename Table>
 void dd_get_and_save_data_dir_path(dict_table_t *table, const Table *dd_table,
                                    bool dict_mutex_own) {
-  mem_heap_t *heap = NULL;
+  mem_heap_t *heap = nullptr;
 
   if (!DICT_TF_HAS_DATA_DIR(table->flags) || table->data_dir_path != nullptr) {
     return;
@@ -3809,9 +3914,7 @@ void dd_get_meta_data_filename(dict_table_t *table, dd::Table *dd_table,
 template <typename Table>
 void dd_load_tablespace(const Table *dd_table, dict_table_t *table,
                         mem_heap_t *heap, dict_err_ignore_t ignore_err,
-                        ulint expected_fsp_flags) {
-  bool alloc_from_heap = false;
-
+                        uint32_t expected_fsp_flags) {
   ut_ad(!table->is_temporary());
   ut_ad(mutex_own(&dict_sys->mutex));
 
@@ -3858,17 +3961,23 @@ void dd_load_tablespace(const Table *dd_table, dict_table_t *table,
     tbl_name = space_name;
   } else {
     tbl_name = table->name.m_name;
-    dd_filename_to_spacename(tbl_name, &tablespace_name);
+
+    tablespace_name.assign(tbl_name);
+    dict_name::convert_to_space(tablespace_name);
     space_name = tablespace_name.c_str();
   }
 
+  auto is_already_opened = [&]() {
+    if (fil_space_exists_in_mem(table->space, space_name, false, true)) {
+      dd_get_and_save_data_dir_path(table, dd_table, true);
+      ut_free(shared_space_name);
+      return true;
+    }
+    return false;
+  };
+
   /* The tablespace may already be open. */
-  if (fil_space_exists_in_mem(table->space, space_name, false, true, heap,
-                              table->id)) {
-    dd_get_and_save_data_dir_path(table, dd_table, true);
-    ut_free(shared_space_name);
-    return;
-  }
+  if (is_already_opened()) return;
 
   if (!(ignore_err & DICT_ERR_IGNORE_RECOVER_LOCK)) {
     ib::error(ER_IB_MSG_172)
@@ -3883,42 +3992,53 @@ void dd_load_tablespace(const Table *dd_table, dict_table_t *table,
   filepath from the tablespace name */
   char *filepath = fil_space_get_first_path(table->space);
 
-  if (filepath == nullptr) {
-    /* boot_tablespaces() made sure that the scanned filepath
-    is in the DD even if the datafile was moved. So let's use
-    that path to open this tablespace. */
-    mutex_exit(&dict_sys->mutex);
-    filepath = dd_get_first_path(heap, table, dd_table);
-    mutex_enter(&dict_sys->mutex);
+  if (filepath != nullptr) {
+    /* If space id is already open with a different space name, then skip
+    loading the space. It can happen because DDL log recovery might not
+    have happened yet. */
+    table->ibd_file_missing = TRUE;
 
-    if (filepath == nullptr) {
-      ib::warn(ER_IB_MSG_173) << "Could not find the filepath"
-                              << " for table " << table->name << ", space ID "
-                              << table->space << " in the data dictionary.";
-    } else {
-      alloc_from_heap = true;
-    }
+    ut_free(shared_space_name);
+    ut_free(filepath);
+    return;
   }
+
+  ut_ad(filepath == nullptr);
+
+  /* If the space is not open yet, then try to open by dd path. If the file
+  path is changed then boot_tablespaces() would always open the tablespace. */
+  mutex_exit(&dict_sys->mutex);
+  filepath = dd_get_first_path(heap, table, dd_table);
+  DEBUG_SYNC_C("innodb_dd_load_tablespace_no_dict_mutex");
+  mutex_enter(&dict_sys->mutex);
+
+  if (filepath == nullptr) {
+    ib::warn(ER_IB_MSG_173) << "Could not find the filepath"
+                            << " for table " << table->name << ", space ID "
+                            << table->space << " in the data dictionary.";
+  }
+
+  /* The tablespace may have been opened while we released the dict_sys mutex.
+  We need to check again if it was not opened in meantime, as fil_ibd_open
+  will try to close it forcefully, even if some IO is underway, leading to
+  crash. */
+  if (is_already_opened()) return;
 
   /* Try to open the tablespace.  We set the 2nd param (fix_dict) to
   false because we do not have an x-lock on dict_operation_lock */
   dberr_t err =
       fil_ibd_open(true, FIL_TYPE_TABLESPACE, table->space, expected_fsp_flags,
-                   space_name, tbl_name, filepath, true, false);
+                   space_name, filepath, true, false);
 
   if (err == DB_SUCCESS) {
     /* This will set the DATA DIRECTORY for SHOW CREATE TABLE. */
     dd_get_and_save_data_dir_path(table, dd_table, true);
-
   } else {
     /* We failed to find a sensible tablespace file */
     table->ibd_file_missing = TRUE;
   }
 
   ut_free(shared_space_name);
-  if (!alloc_from_heap && filepath) {
-    ut_free(filepath);
-  }
 }
 
 /** Get the space name from mysql.tablespaces for a given space_id.
@@ -3935,28 +4055,28 @@ char *dd_space_get_name(mem_heap_t *heap, dict_table_t *table,
   THD *thd = current_thd;
   dd::Tablespace *dd_space = nullptr;
 
-  ut_ad(!srv_is_being_shutdown);
+  ut_ad(srv_shutdown_state.load() < SRV_SHUTDOWN_DD);
   ut_ad(!mutex_own(&dict_sys->mutex));
 
   dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
   if (dd_table == nullptr) {
-    char db_buf[MAX_DATABASE_NAME_LEN + 1];
-    char tbl_buf[MAX_TABLE_NAME_LEN + 1];
-    const dd::Table *table_def = nullptr;
+    std::string db_str;
+    std::string tbl_str;
+    dict_name::get_table(table->name.m_name, db_str, tbl_str);
 
     MDL_ticket *mdl = nullptr;
-
-    if (!dd_parse_tbl_name(table->name.m_name, db_buf, tbl_buf, nullptr,
-                           nullptr, nullptr) ||
-        dd_mdl_acquire(thd, &mdl, db_buf, tbl_buf)) {
-      return (nullptr);
+    if (db_str.empty() || tbl_str.empty() ||
+        dd_mdl_acquire(thd, &mdl, db_str.c_str(), tbl_str.c_str())) {
+      return nullptr;
     }
 
-    if (client->acquire(db_buf, tbl_buf, &table_def) || table_def == nullptr) {
+    const dd::Table *table_def = nullptr;
+    if (client->acquire(db_str.c_str(), tbl_str.c_str(), &table_def) ||
+        table_def == nullptr) {
       dd_mdl_release(thd, &mdl);
-      return (nullptr);
+      return nullptr;
     }
 
     dd_space_id = dd_first_index(table_def)->tablespace_id();
@@ -3970,10 +4090,10 @@ char *dd_space_get_name(mem_heap_t *heap, dict_table_t *table,
                                                            &dd_space) ||
       dd_space == nullptr) {
     ut_ad(false);
-    return (nullptr);
+    return nullptr;
   }
 
-  return (mem_heap_strdup(heap, dd_space->name().c_str()));
+  return mem_heap_strdup(heap, dd_space->name().c_str());
 }
 
 /** Make sure the tablespace name is saved in dict_table_t if the table
@@ -3981,7 +4101,7 @@ uses a general tablespace.
 Try to read it from the fil_system_t first, then from DD.
 @param[in]	table		Table object
 @param[in]	dd_table	Global DD table or partition object
-@param[in]	dict_mutex_own)	true if dict_sys->mutex is owned already */
+@param[in]	dict_mutex_own 	true if dict_sys->mutex is owned already */
 template <typename Table>
 void dd_get_and_save_space_name(dict_table_t *table, const Table *dd_table,
                                 bool dict_mutex_own) {
@@ -3991,7 +4111,7 @@ void dd_get_and_save_space_name(dict_table_t *table, const Table *dd_table,
   }
 
   bool use_cache = true;
-  if (table->tablespace != NULL) {
+  if (table->tablespace != nullptr) {
     if (srv_sys_tablespaces_open &&
         dict_table_has_temp_general_tablespace_name(table->tablespace)) {
       /* We previous saved the temporary name,
@@ -4006,7 +4126,7 @@ void dd_get_and_save_space_name(dict_table_t *table, const Table *dd_table,
   if (use_cache) {
     fil_space_t *space = fil_space_acquire_silent(table->space);
 
-    if (space != NULL) {
+    if (space != nullptr) {
       /* Use this name unless it is a temporary general
       tablespace name and we can now replace it. */
       if (!srv_sys_tablespaces_open ||
@@ -4068,7 +4188,7 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
                  client, dd_first_index(dd_table)->tablespace_id(), &implicit,
                  &dd_space)) {
     /* Tablespace no longer exist, it could be already dropped */
-    return (nullptr);
+    return nullptr;
   }
 
   const bool zip_allowed = srv_page_size <= UNIV_ZIP_SIZE_MAX;
@@ -4077,19 +4197,19 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
 
   /* Create dict_table_t for the table */
   dict_table_t *m_table = dd_fill_dict_table(
-      dd_table, table, norm_name, NULL, zip_allowed, strict, thd, implicit);
+      dd_table, table, norm_name, nullptr, zip_allowed, strict, thd, implicit);
 
   if (m_table == nullptr) {
-    return (nullptr);
+    return nullptr;
   }
 
   /* Create dict_index_t for the table */
   int ret;
-  ret = dd_fill_dict_index(dd_table->table(), table, m_table, NULL, zip_allowed,
-                           strict, thd);
+  ret = dd_fill_dict_index(dd_table->table(), table, m_table, nullptr,
+                           zip_allowed, strict, thd);
 
   if (ret != 0) {
-    return (nullptr);
+    return nullptr;
   }
 
   if (dd_space && !implicit) {
@@ -4101,12 +4221,12 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
 
   if (Field **autoinc_col = table->s->found_next_number_field) {
     const dd::Properties &p = dd_table->table().se_private_data();
-    dict_table_autoinc_set_col_pos(m_table, (*autoinc_col)->field_index);
+    dict_table_autoinc_set_col_pos(m_table, (*autoinc_col)->field_index());
     uint64 version, autoinc = 0;
     if (p.get(dd_table_key_strings[DD_TABLE_VERSION], &version) ||
         p.get(dd_table_key_strings[DD_TABLE_AUTOINC], &autoinc)) {
       ut_ad(!"problem setting AUTO_INCREMENT");
-      return (nullptr);
+      return nullptr;
     }
 
     m_table->version = version;
@@ -4155,6 +4275,8 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
     if (first_index) {
       ut_ad(m_table->space == 0);
       m_table->space = sid;
+      ut_ad(dd_table->tablespace_id() == dd::INVALID_OBJECT_ID ||
+            dd_table->tablespace_id() == index_space_id);
       m_table->dd_space_id = index_space_id;
 
       uint32 dd_fsp_flags;
@@ -4169,6 +4291,25 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
       mutex_enter(&dict_sys->mutex);
       dd_load_tablespace(dd_table, m_table, heap, DICT_ERR_IGNORE_RECOVER_LOCK,
                          dd_fsp_flags);
+
+      DEBUG_SYNC_C("innodb_dd_load_tablespace_done");
+
+      if (dd_space && m_table->space != TRX_SYS_SPACE &&
+          fil_space_get(m_table->space) != nullptr) {
+        /* Get the autoextend_size property from the tablespace
+        and set the fil_space_t::autoextend_size attribute. */
+        const dd::Properties &o = dd_space->options();
+        uint64_t autoextend_size{};
+
+        if (o.exists(autoextend_size_str)) {
+          o.get(autoextend_size_str, &autoextend_size);
+        }
+
+        ut_d(dberr_t ret =)
+            fil_set_autoextend_size(m_table->space, autoextend_size);
+        ut_ad(ret == DB_SUCCESS);
+      }
+
       mutex_exit(&dict_sys->mutex);
       first_index = false;
     }
@@ -4214,7 +4355,7 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
     mutex_exit(&dict_sys->mutex);
     mem_heap_free(heap);
 
-    return (nullptr);
+    return nullptr;
   }
 
   /* Re-check if the table has been opened/added by a concurrent
@@ -4246,12 +4387,12 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
 
   /* Check if this is a DD system table */
   if (m_table != nullptr) {
-    char db_buf[MAX_DATABASE_NAME_LEN + 1];
-    char tbl_buf[MAX_TABLE_NAME_LEN + 1];
-    dd_parse_tbl_name(m_table->name.m_name, db_buf, tbl_buf, nullptr, nullptr,
-                      nullptr);
+    std::string db_str;
+    std::string tbl_str;
+    dict_name::get_table(m_table->name.m_name, db_str, tbl_str);
+
     m_table->is_dd_table =
-        dd::get_dictionary()->is_dd_table_name(db_buf, tbl_buf);
+        dd::get_dictionary()->is_dd_table_name(db_str.c_str(), tbl_str.c_str());
   }
 
   /* Load foreign key info. It could also register child table(s) that
@@ -4267,7 +4408,7 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
   }
   mem_heap_free(heap);
 
-  return (m_table);
+  return m_table;
 }
 
 /** Open single table with name
@@ -4287,7 +4428,7 @@ static void dd_open_table_one_on_name(const char *name, bool dict_locked,
 
   table = dict_table_check_if_in_cache_low(name);
 
-  if (table != NULL) {
+  if (table != nullptr) {
     /* If the table is in cached already, do nothing. */
     if (!dict_locked) {
       mutex_exit(&dict_sys->mutex);
@@ -4296,24 +4437,24 @@ static void dd_open_table_one_on_name(const char *name, bool dict_locked,
     return;
   } else {
     /* Otherwise, open it by dd obj. */
-    char db_buf[MAX_DATABASE_NAME_LEN + 1];
-    char tbl_buf[MAX_TABLE_NAME_LEN + 1];
 
     /* Exit sys mutex to access server info */
     mutex_exit(&dict_sys->mutex);
 
-    if (!dd_parse_tbl_name(name, db_buf, tbl_buf, nullptr, nullptr, nullptr)) {
-      goto func_exit;
-    }
+    std::string db_str;
+    std::string tbl_str;
+    dict_name::get_table(name, db_str, tbl_str);
 
-    if (dd_mdl_acquire(thd, &mdl, db_buf, tbl_buf)) {
+    if (db_str.empty() || tbl_str.empty() ||
+        dd_mdl_acquire(thd, &mdl, db_str.c_str(), tbl_str.c_str())) {
       goto func_exit;
     }
 
     dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
     dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
-    if (client->acquire(db_buf, tbl_buf, &dd_table) || dd_table == nullptr) {
+    if (client->acquire(db_str.c_str(), tbl_str.c_str(), &dd_table) ||
+        dd_table == nullptr) {
       goto func_exit;
     }
 
@@ -4321,7 +4462,7 @@ static void dd_open_table_one_on_name(const char *name, bool dict_locked,
 
     TABLE_SHARE ts;
 
-    init_tmp_table_share(thd, &ts, db_buf, strlen(db_buf),
+    init_tmp_table_share(thd, &ts, db_str.c_str(), db_str.length(),
                          dd_table->name().c_str(), "" /* file name */, nullptr);
 
     ulint error =
@@ -4348,7 +4489,7 @@ static void dd_open_table_one_on_name(const char *name, bool dict_locked,
   }
 
 func_exit:
-  if (table != NULL) {
+  if (table != nullptr) {
     dd_table_close(table, thd, &mdl, false);
   } else {
     dd_mdl_release(thd, &mdl);
@@ -4406,7 +4547,7 @@ dict_table_t *dd_open_table(dd::cache::Dictionary_client *client,
     dd_open_fk_tables(fk_list, false, thd);
   }
 
-  return (m_table);
+  return m_table;
 }
 
 template dict_table_t *dd_open_table<dd::Table>(dd::cache::Dictionary_client *,
@@ -4418,11 +4559,11 @@ template dict_table_t *dd_open_table<dd::Partition>(
     const dd::Partition *, THD *);
 
 /** Get next record from a new dd system table, like mysql.tables...
-@param[in,out] pcur            persistent cursor
-@param[in]     mtr             the mini-transaction
+@param[in,out] pcur            Persistent cursor
+@param[in]     mtr             Mini-transaction
 @return the next rec of the dd system table */
 static const rec_t *dd_getnext_system_low(btr_pcur_t *pcur, mtr_t *mtr) {
-  rec_t *rec = NULL;
+  rec_t *rec = nullptr;
   bool is_comp = dict_table_is_comp(pcur->index()->table);
 
   while (!rec || rec_get_deleted_flag(rec, is_comp)) {
@@ -4434,33 +4575,33 @@ static const rec_t *dd_getnext_system_low(btr_pcur_t *pcur, mtr_t *mtr) {
       /* end of index */
       btr_pcur_close(pcur);
 
-      return (NULL);
+      return nullptr;
     }
   }
 
   /* Get a record, let's save the position */
   btr_pcur_store_position(pcur, mtr);
 
-  return (rec);
+  return rec;
 }
 
 /** Get next record of new DD system tables
-@param[in,out]	pcur		persistent cursor
-@param[in]	mtr		the mini-transaction
+@param[in,out]	pcur		Persistent cursor
+@param[in]	mtr		Mini-transaction
 @retval next record */
 const rec_t *dd_getnext_system_rec(btr_pcur_t *pcur, mtr_t *mtr) {
   /* Restore the position */
   btr_pcur_restore_position(BTR_SEARCH_LEAF, pcur, mtr);
 
-  return (dd_getnext_system_low(pcur, mtr));
+  return dd_getnext_system_low(pcur, mtr);
 }
 
 /** Scan a new dd system table, like mysql.tables...
-@param[in]	thd		thd
-@param[in,out]	mdl		mdl lock
-@param[in,out]	pcur		persistent cursor
-@param[in,out]	mtr		the mini-transaction
-@param[in]	system_table_name	which dd system table to open
+@param[in]	thd		THD
+@param[in,out]	mdl		MDL lock
+@param[in,out]	pcur		Persistent cursor
+@param[in,out]	mtr		Mini-transaction
+@param[in]	system_table_name	Which dd system table to open
 @param[in,out]	table		dict_table_t obj of dd system table
 @retval the first rec of the dd system table */
 const rec_t *dd_startscan_system(THD *thd, MDL_ticket **mdl, btr_pcur_t *pcur,
@@ -4480,7 +4621,7 @@ const rec_t *dd_startscan_system(THD *thd, MDL_ticket **mdl, btr_pcur_t *pcur,
 
   rec = dd_getnext_system_low(pcur, mtr);
 
-  return (rec);
+  return rec;
 }
 
 /**
@@ -4491,25 +4632,25 @@ const rec_t *dd_startscan_system(THD *thd, MDL_ticket **mdl, btr_pcur_t *pcur,
 static const int DD_FIELD_OFFSET = 2;
 
 /** Process one mysql.tables record and get the dict_table_t
-@param[in]	heap		temp memory heap
+@param[in]	heap		Temp memory heap
 @param[in,out]	rec		mysql.tables record
 @param[in,out]	table		dict_table_t to fill
 @param[in]	dd_tables	dict_table_t obj of dd system table
-@param[in]	mdl		mdl on the table
-@param[in]	mtr		the mini-transaction
+@param[in]	mdl		MDL on the table
+@param[in]	mtr		Mini-transaction
 @retval error message, or NULL on success */
 const char *dd_process_dd_tables_rec_and_mtr_commit(
     mem_heap_t *heap, const rec_t *rec, dict_table_t **table,
     dict_table_t *dd_tables, MDL_ticket **mdl, mtr_t *mtr) {
   ulint len;
   const byte *field;
-  const char *err_msg = NULL;
+  const char *err_msg = nullptr;
   ulint table_id;
 
   ut_ad(!rec_get_deleted_flag(rec, dict_table_is_comp(dd_tables)));
   ut_ad(mtr_memo_contains_page(mtr, rec, MTR_MEMO_PAGE_S_FIX));
 
-  ulint *offsets = rec_get_offsets(rec, dd_tables->first_index(), NULL,
+  ulint *offsets = rec_get_offsets(rec, dd_tables->first_index(), nullptr,
                                    ULINT_UNDEFINED, &heap);
 
   const dd::Object_table &dd_object_table = dd::get_dd_table<dd::Table>();
@@ -4520,9 +4661,9 @@ const char *dd_process_dd_tables_rec_and_mtr_commit(
 
   /* If "engine" field is not "innodb", return. */
   if (strncmp((const char *)field, "InnoDB", 6) != 0) {
-    *table = NULL;
+    *table = nullptr;
     mtr_commit(mtr);
-    return (err_msg);
+    return err_msg;
   }
 
   /* Get the se_private_id field. */
@@ -4532,9 +4673,9 @@ const char *dd_process_dd_tables_rec_and_mtr_commit(
       &len);
 
   if (len != 8) {
-    *table = NULL;
+    *table = nullptr;
     mtr_commit(mtr);
-    return (err_msg);
+    return err_msg;
   }
 
   /* Get the table id */
@@ -4542,9 +4683,9 @@ const char *dd_process_dd_tables_rec_and_mtr_commit(
 
   /* Skip mysql.* tables. */
   if (dict_sys_t::is_dd_table_id(table_id)) {
-    *table = NULL;
+    *table = nullptr;
     mtr_commit(mtr);
-    return (err_msg);
+    return err_msg;
   }
 
   /* Commit before load the table again */
@@ -4557,30 +4698,30 @@ const char *dd_process_dd_tables_rec_and_mtr_commit(
     err_msg = "Table not found";
   }
 
-  return (err_msg);
+  return err_msg;
 }
 
 /** Process one mysql.table_partitions record and get the dict_table_t
-@param[in]	heap		temp memory heap
+@param[in]	heap		Temp memory heap
 @param[in,out]	rec		mysql.table_partitions record
 @param[in,out]	table		dict_table_t to fill
 @param[in]	dd_tables	dict_table_t obj of dd partition table
-@param[in]	mdl		mdl on the table
-@param[in]	mtr		the mini-transaction
+@param[in]	mdl		MDL on the table
+@param[in]	mtr		Mini-transaction
 @retval error message, or NULL on success */
 const char *dd_process_dd_partitions_rec_and_mtr_commit(
     mem_heap_t *heap, const rec_t *rec, dict_table_t **table,
     dict_table_t *dd_tables, MDL_ticket **mdl, mtr_t *mtr) {
   ulint len;
   const byte *field;
-  const char *err_msg = NULL;
+  const char *err_msg = nullptr;
   ulint table_id;
 
   ut_ad(mtr_memo_contains_page(mtr, rec, MTR_MEMO_PAGE_S_FIX));
 
   ut_ad(!rec_get_deleted_flag(rec, dict_table_is_comp(dd_tables)));
 
-  ulint *offsets = rec_get_offsets(rec, dd_tables->first_index(), NULL,
+  ulint *offsets = rec_get_offsets(rec, dd_tables->first_index(), nullptr,
                                    ULINT_UNDEFINED, &heap);
 
   const dd::Object_table &dd_object_table = dd::get_dd_table<dd::Partition>();
@@ -4592,9 +4733,9 @@ const char *dd_process_dd_partitions_rec_and_mtr_commit(
 
   /* If "engine" field is not "innodb", return. */
   if (strncmp((const char *)field, "InnoDB", 6) != 0) {
-    *table = NULL;
+    *table = nullptr;
     mtr_commit(mtr);
-    return (err_msg);
+    return err_msg;
   }
 
   /* Get the se_private_id field. */
@@ -4604,9 +4745,9 @@ const char *dd_process_dd_partitions_rec_and_mtr_commit(
       &len);
   /* When table is partitioned table, the se_private_id is null. */
   if (len != 8) {
-    *table = NULL;
+    *table = nullptr;
     mtr_commit(mtr);
-    return (err_msg);
+    return err_msg;
   }
 
   /* Get the table id */
@@ -4614,9 +4755,9 @@ const char *dd_process_dd_partitions_rec_and_mtr_commit(
 
   /* Skip mysql.* tables. */
   if (dict_sys_t::is_dd_table_id(table_id)) {
-    *table = NULL;
+    *table = nullptr;
     mtr_commit(mtr);
-    return (err_msg);
+    return err_msg;
   }
 
   /* Commit before load the table again */
@@ -4629,18 +4770,18 @@ const char *dd_process_dd_partitions_rec_and_mtr_commit(
     err_msg = "Table not found";
   }
 
-  return (err_msg);
+  return err_msg;
 }
 
 /** Process one mysql.columns record and get info to dict_col_t
-@param[in,out]	heap		temp memory heap
+@param[in,out]	heap		Temp memory heap
 @param[in]	rec		mysql.columns record
 @param[in,out]	col		dict_col_t to fill
-@param[in,out]	table_id	table id
-@param[in,out]	col_name	column name
-@param[in,out]	nth_v_col	nth v column
+@param[in,out]	table_id	Table id
+@param[in,out]	col_name	Column name
+@param[in,out]	nth_v_col	Nth v column
 @param[in]	dd_columns	dict_table_t obj of mysql.columns
-@param[in,out]	mtr		the mini-transaction
+@param[in,out]	mtr		Mini-transaction
 @retval true if column is filled */
 bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
                                dict_col_t *col, table_id_t *table_id,
@@ -4657,7 +4798,7 @@ bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
 
   ut_ad(!rec_get_deleted_flag(rec, dict_table_is_comp(dd_columns)));
 
-  ulint *offsets = rec_get_offsets(rec, dd_columns->first_index(), NULL,
+  ulint *offsets = rec_get_offsets(rec, dd_columns->first_index(), nullptr,
                                    ULINT_UNDEFINED, &heap);
 
   const dd::Object_table &dd_object_table = dd::get_dd_table<dd::Column>();
@@ -4670,7 +4811,7 @@ bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
   if (hidden == dd::Column::enum_hidden_type::HT_HIDDEN_SE ||
       hidden == dd::Column::enum_hidden_type::HT_HIDDEN_SQL) {
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   /* Get the column name. */
@@ -4698,7 +4839,7 @@ bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
 
   if (len == 0 || len == UNIV_SQL_NULL) {
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   char *p_ptr = (char *)mem_heap_strdupl(heap, (const char *)field, len);
@@ -4711,13 +4852,13 @@ bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
       delete p;
     }
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   if (!p->get(dd_index_key_strings[DD_TABLE_ID], (uint64 *)table_id)) {
     THD *thd = current_thd;
     dict_table_t *table;
-    MDL_ticket *mdl = NULL;
+    MDL_ticket *mdl = nullptr;
 
     /* Commit before we try to load the table. */
     mtr_commit(mtr);
@@ -4725,7 +4866,7 @@ bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
 
     if (!table) {
       delete p;
-      return (false);
+      return false;
     }
 
     if (is_virtual) {
@@ -4734,7 +4875,7 @@ bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
       if (vcol == nullptr) {
         dd_table_close(table, thd, &mdl, true);
         delete p;
-        return (false);
+        return false;
       }
 
       /* Copy info. */
@@ -4772,7 +4913,7 @@ bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
   } else {
     delete p;
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   /* Report the virtual column number */
@@ -4786,18 +4927,18 @@ bool dd_process_dd_columns_rec(mem_heap_t *heap, const rec_t *rec,
     *nth_v_col = ULINT_UNDEFINED;
   }
 
-  return (true);
+  return true;
 }
 
 /** Process one mysql.columns record for virtual columns
 @param[in]	heap		temp memory heap
 @param[in,out]	rec		mysql.columns record
-@param[in,out]	table_id	table id
-@param[in,out]	pos		position
-@param[in,out]	base_pos	base column position
-@param[in,out]	n_row		number of rows
+@param[in,out]	table_id	Table id
+@param[in,out]	pos		Position
+@param[in,out]	base_pos	Base column position
+@param[in,out]	n_row		Number of rows
 @param[in]	dd_columns	dict_table_t obj of mysql.columns
-@param[in]	mtr		the mini-transaction
+@param[in]	mtr		Mini-transaction
 @retval true if virtual info is filled */
 bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
                                        table_id_t *table_id, ulint **pos,
@@ -4811,7 +4952,7 @@ bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
 
   ut_ad(!rec_get_deleted_flag(rec, dict_table_is_comp(dd_columns)));
 
-  ulint *offsets = rec_get_offsets(rec, dd_columns->first_index(), NULL,
+  ulint *offsets = rec_get_offsets(rec, dd_columns->first_index(), nullptr,
                                    ULINT_UNDEFINED, &heap);
 
   const dd::Object_table &dd_object_table = dd::get_dd_table<dd::Column>();
@@ -4823,7 +4964,7 @@ bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
   is_virtual = mach_read_from_1(field) & 0x01;
   if (!is_virtual) {
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   /* Get the hidden attribute, and skip if it's a hidden column. */
@@ -4833,7 +4974,7 @@ bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
   hidden = static_cast<dd::Column::enum_hidden_type>(mach_read_from_1(field));
   if (hidden == dd::Column::enum_hidden_type::HT_HIDDEN_SE) {
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   /* Get the position. */
@@ -4851,7 +4992,7 @@ bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
 
   if (len == 0 || len == UNIV_SQL_NULL) {
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   char *p_ptr = (char *)mem_heap_strdupl(heap, (const char *)field, len);
@@ -4864,14 +5005,14 @@ bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
       delete p;
     }
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   if (!p->get(dd_index_key_strings[DD_TABLE_ID], (uint64 *)table_id)) {
     THD *thd = current_thd;
     dict_table_t *table;
-    MDL_ticket *mdl = NULL;
-    dict_v_col_t *vcol = NULL;
+    MDL_ticket *mdl = nullptr;
+    dict_v_col_t *vcol = nullptr;
 
     /* Commit before we try to load the table. */
     mtr_commit(mtr);
@@ -4879,15 +5020,15 @@ bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
 
     if (!table) {
       delete p;
-      return (false);
+      return false;
     }
 
     vcol = dict_table_get_nth_v_col_mysql(table, origin_pos);
 
-    if (vcol == NULL || vcol->num_base == 0) {
+    if (vcol == nullptr || vcol->num_base == 0) {
       dd_table_close(table, thd, &mdl, true);
       delete p;
-      return (false);
+      return false;
     }
 
     *pos = static_cast<ulint *>(
@@ -4905,20 +5046,21 @@ bool dd_process_dd_virtual_columns_rec(mem_heap_t *heap, const rec_t *rec,
   } else {
     delete p;
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
-  return (true);
+  return true;
 }
-/** Process one mysql.indexes record and get dict_index_t
-@param[in]	heap		temp memory heap
+
+/** Process one mysql.indexes record and get the dict_index_t
+@param[in]	heap		Temp memory heap
 @param[in,out]	rec		mysql.indexes record
 @param[in,out]	index		dict_index_t to fill
-@param[in]	mdl		mdl on index->table
-@param[in,out]	parent		parent table if it's fts aux table.
-@param[in,out]	parent_mdl	mdl on parent if it's fts aux table.
+@param[in]	mdl		MDL on index->table
+@param[in,out]	parent		Parent table if it's fts aux table.
+@param[in,out]	parent_mdl	MDL on parent if it's fts aux table.
 @param[in]	dd_indexes	dict_table_t obj of mysql.indexes
-@param[in]	mtr		the mini-transaction
+@param[in]	mtr		Mini-transaction
 @retval true if index is filled */
 bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
                                const dict_index_t **index, MDL_ticket **mdl,
@@ -4934,7 +5076,7 @@ bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
 
   ut_ad(!rec_get_deleted_flag(rec, dict_table_is_comp(dd_indexes)));
 
-  ulint *offsets = rec_get_offsets(rec, dd_indexes->first_index(), NULL,
+  ulint *offsets = rec_get_offsets(rec, dd_indexes->first_index(), nullptr,
                                    ULINT_UNDEFINED, &heap);
 
   const dd::Object_table &dd_object_table = dd::get_dd_table<dd::Index>();
@@ -4946,7 +5088,7 @@ bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
   /* If "engine" field is not "innodb", return. */
   if (strncmp((const char *)field, "InnoDB", 6) != 0) {
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   /* Get the se_private_data field. */
@@ -4957,7 +5099,7 @@ bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
 
   if (len == 0 || len == UNIV_SQL_NULL) {
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   /* Get index id. */
@@ -4970,34 +5112,34 @@ bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
       delete p;
     }
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   if (p->get(dd_index_key_strings[DD_INDEX_ID], &index_id)) {
     delete p;
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   /* Get the tablespace id. */
   if (p->get(dd_index_key_strings[DD_INDEX_SPACE_ID], &space_id)) {
     delete p;
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   /* Skip mysql.* indexes. */
   if (space_id == dict_sys->s_space_id) {
     delete p;
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   /* Load the table and get the index. */
   if (!p->exists(dd_index_key_strings[DD_TABLE_ID])) {
     delete p;
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
   if (!p->get(dd_index_key_strings[DD_TABLE_ID], &table_id)) {
@@ -5010,7 +5152,7 @@ bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
 
     if (!table) {
       delete p;
-      return (false);
+      return false;
     }
 
     /* For fts aux table, we need to acquire mdl lock on parent. */
@@ -5030,7 +5172,7 @@ bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
 
       if (*parent == nullptr) {
         delete p;
-        return (false);
+        return false;
       }
 
       table = dd_table_open_on_id(table_id, thd, mdl, true, true);
@@ -5038,11 +5180,11 @@ bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
       if (!table) {
         dd_table_close(*parent, thd, parent_mdl, true);
         delete p;
-        return (false);
+        return false;
       }
     }
 
-    for (const dict_index_t *t_index = table->first_index(); t_index != NULL;
+    for (const dict_index_t *t_index = table->first_index(); t_index != nullptr;
          t_index = t_index->next()) {
       if (t_index->space == space_id && t_index->id == index_id) {
         *index = t_index;
@@ -5055,20 +5197,20 @@ bool dd_process_dd_indexes_rec(mem_heap_t *heap, const rec_t *rec,
         dd_table_close(*parent, thd, parent_mdl, true);
       }
       delete p;
-      return (false);
+      return false;
     }
 
     delete p;
   } else {
     delete p;
     mtr_commit(mtr);
-    return (false);
+    return false;
   }
 
-  return (true);
+  return true;
 }
 
-/** Process one mysql.indexes record and get breif info to dict_index_t
+/** Process one mysql.indexes record and get brief info to dict_index_t
 @param[in]	heap		temp memory heap
 @param[in,out]	rec		mysql.indexes record
 @param[in,out]	index_id	index id
@@ -5085,7 +5227,7 @@ bool dd_process_dd_indexes_rec_simple(mem_heap_t *heap, const rec_t *rec,
 
   ut_ad(!rec_get_deleted_flag(rec, dict_table_is_comp(dd_indexes)));
 
-  ulint *offsets = rec_get_offsets(rec, dd_indexes->first_index(), NULL,
+  ulint *offsets = rec_get_offsets(rec, dd_indexes->first_index(), nullptr,
                                    ULINT_UNDEFINED, &heap);
 
   const dd::Object_table &dd_object_table = dd::get_dd_table<dd::Index>();
@@ -5096,7 +5238,7 @@ bool dd_process_dd_indexes_rec_simple(mem_heap_t *heap, const rec_t *rec,
 
   /* If "engine" field is not "innodb", return. */
   if (strncmp((const char *)field, "InnoDB", 6) != 0) {
-    return (false);
+    return false;
   }
 
   /* Get the se_private_data field. */
@@ -5106,7 +5248,7 @@ bool dd_process_dd_indexes_rec_simple(mem_heap_t *heap, const rec_t *rec,
       &len);
 
   if (len == 0 || len == UNIV_SQL_NULL) {
-    return (false);
+    return false;
   }
 
   /* Get index id. */
@@ -5118,51 +5260,41 @@ bool dd_process_dd_indexes_rec_simple(mem_heap_t *heap, const rec_t *rec,
     if (p) {
       delete p;
     }
-    return (false);
+    return false;
   }
 
   if (p->get(dd_index_key_strings[DD_INDEX_ID], &idx_id)) {
     delete p;
-    return (false);
+    return false;
   }
   *index_id = idx_id;
 
   /* Get the tablespace_id. */
   if (p->get(dd_index_key_strings[DD_INDEX_SPACE_ID], space_id)) {
     delete p;
-    return (false);
+    return false;
   }
 
   delete p;
 
-  return (true);
+  return true;
 }
 
-/** Process one mysql.tablespaces record and get info
-@param[in]      heap            temp memory heap
-@param[in,out]  rec	            mysql.tablespaces record
-@param[in,out]	space_id        space id
-@param[in,out]  name            space name
-@param[in,out]  flags           space flags
-@param[in,out]  server_version  server version
-@param[in,out]  space_version   space version
-@param[in,out]  is_encrypted    true if tablespace is encrypted
-@param[in,out]  state           space state
-@param[in]      dd_spaces       dict_table_t obj of mysql.tablespaces
-@return true if data is retrived */
 bool dd_process_dd_tablespaces_rec(mem_heap_t *heap, const rec_t *rec,
                                    space_id_t *space_id, char **name,
                                    uint32_t *flags, uint32 *server_version,
                                    uint32 *space_version, bool *is_encrypted,
+                                   uint64_t *autoextend_size,
                                    dd::String_type *state,
                                    dict_table_t *dd_spaces) {
   ulint len;
   const byte *field;
   char *prop_str;
+  char *opt_str;
 
   ut_ad(!rec_get_deleted_flag(rec, dict_table_is_comp(dd_spaces)));
 
-  ulint *offsets = rec_get_offsets(rec, dd_spaces->first_index(), NULL,
+  ulint *offsets = rec_get_offsets(rec, dd_spaces->first_index(), nullptr,
                                    ULINT_UNDEFINED, &heap);
 
   const dd::Object_table &dd_object_table = dd::get_dd_table<dd::Tablespace>();
@@ -5173,7 +5305,7 @@ bool dd_process_dd_tablespaces_rec(mem_heap_t *heap, const rec_t *rec,
 
   /* If "engine" field is not "innodb", return. */
   if (strncmp((const char *)field, "InnoDB", 6) != 0) {
-    return (false);
+    return false;
   }
 
   /* Get name field. */
@@ -5183,6 +5315,50 @@ bool dd_process_dd_tablespaces_rec(mem_heap_t *heap, const rec_t *rec,
   *name = reinterpret_cast<char *>(mem_heap_zalloc(heap, len + 1));
   memcpy(*name, field, len);
 
+  /* Get the options string. */
+  field = (const byte *)rec_get_nth_field(
+      rec, offsets,
+      dd_object_table.field_number("FIELD_OPTIONS") + DD_FIELD_OFFSET, &len);
+
+  if (len == 0 || len == UNIV_SQL_NULL) {
+    return false; /* purecov: inspected */
+  }
+
+  opt_str = static_cast<char *>(mem_heap_zalloc(heap, len + 1));
+  memcpy(opt_str, field, len);
+  dd::String_type opt(opt_str);
+  const dd::Properties *o = dd::Properties::parse_properties(opt);
+
+  if (!o) {
+    return false; /* purecov: inspected */
+  }
+
+  /* Get encrypted. */
+  *is_encrypted = false;
+  dd::String_type encrypt;
+  if (o->exists("encryption") && o->get("encryption", &encrypt)) {
+    /* purecov: begin inspected */
+    delete o;
+    return false;
+    /* purecov: end */
+  }
+
+  if (!Encryption::is_none(encrypt.c_str())) {
+    *is_encrypted = true;
+  }
+
+  /* Get autoextend_size. */
+  *autoextend_size = 0;
+  if (o->exists(autoextend_size_str) &&
+      o->get(autoextend_size_str, autoextend_size)) {
+    /* purecov: begin inspected */
+    delete o;
+    return false;
+    /* purecov: end */
+  }
+
+  delete o;
+
   /* Get the se_private_data field. */
   field = (const byte *)rec_get_nth_field(
       rec, offsets,
@@ -5190,7 +5366,7 @@ bool dd_process_dd_tablespaces_rec(mem_heap_t *heap, const rec_t *rec,
       &len);
 
   if (len == 0 || len == UNIV_SQL_NULL) {
-    return (false);
+    return false;
   }
 
   prop_str = static_cast<char *>(mem_heap_zalloc(heap, len + 1));
@@ -5203,31 +5379,31 @@ bool dd_process_dd_tablespaces_rec(mem_heap_t *heap, const rec_t *rec,
     if (p) {
       delete p;
     }
-    return (false);
+    return false;
   }
 
   /* Get space id. */
   if (p->get(dd_space_key_strings[DD_SPACE_ID], space_id)) {
     delete p;
-    return (false);
+    return false;
   }
 
   /* Get space flags. */
   if (p->get(dd_space_key_strings[DD_SPACE_FLAGS], flags)) {
     delete p;
-    return (false);
+    return false;
   }
 
   /* Get server version. */
   if (p->get(dd_space_key_strings[DD_SPACE_SERVER_VERSION], server_version)) {
     delete p;
-    return (false);
+    return false;
   }
 
   /* Get space version. */
   if (p->get(dd_space_key_strings[DD_SPACE_VERSION], space_version)) {
     delete p;
-    return (false);
+    return false;
   }
 
   /* Get tablespace state. */
@@ -5245,7 +5421,7 @@ bool dd_process_dd_tablespaces_rec(mem_heap_t *heap, const rec_t *rec,
 
   delete p;
 
-  return (true);
+  return true;
 }
 
 /** Get dd tablespace id for fts table
@@ -5253,20 +5429,15 @@ bool dd_process_dd_tablespaces_rec(mem_heap_t *heap, const rec_t *rec,
 @param[in]	table		fts table
 @param[in,out]	dd_space_id	dd table space id
 @return true on success, false on failure. */
-bool dd_get_fts_tablespace_id(const dict_table_t *parent_table,
-                              const dict_table_t *table,
-                              dd::Object_id &dd_space_id) {
-  char db_name[MAX_DATABASE_NAME_LEN + 1];
-  char table_name[MAX_TABLE_NAME_LEN + 1];
-
-  dd_parse_tbl_name(parent_table->name.m_name, db_name, table_name, nullptr,
-                    nullptr, nullptr);
-
+static bool dd_get_or_assign_fts_tablespace_id(const dict_table_t *parent_table,
+                                               const dict_table_t *table,
+                                               dd::Object_id &dd_space_id) {
   THD *thd = current_thd;
   dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
   dd::Object_id space_id = parent_table->dd_space_id;
+  ut_ad(space_id != dd::INVALID_OBJECT_ID);
 
   dd_space_id = dd::INVALID_OBJECT_ID;
 
@@ -5281,31 +5452,32 @@ bool dd_get_fts_tablespace_id(const dict_table_t *parent_table,
 
     ut_free(filename);
     if (ret) {
-      return (false);
+      return false;
     }
 
   } else if (table->space != TRX_SYS_SPACE &&
              table->space != srv_tmp_space.space_id()) {
     /* This is a user table that resides in shared tablespace */
+    ut_ad(!dict_table_is_file_per_table(parent_table));
     ut_ad(!dict_table_is_file_per_table(table));
     ut_ad(DICT_TF_HAS_SHARED_SPACE(table->flags));
 
     /* Currently the tablespace id is hard coded as 0 */
     dd_space_id = space_id;
 
-    const dd::Tablespace *index_space = NULL;
+    const dd::Tablespace *index_space = nullptr;
     if (client->acquire<dd::Tablespace>(space_id, &index_space)) {
-      return (false);
+      return false;
     }
 
     uint32 id;
-    if (index_space == NULL) {
-      return (false);
+    if (index_space == nullptr) {
+      return false;
     } else if (index_space->se_private_data().get(
                    dd_space_key_strings[DD_SPACE_ID], &id) ||
                id != table->space) {
       ut_ad(!"missing or incorrect tablespace id");
-      return (false);
+      return false;
     }
   } else if (table->space == TRX_SYS_SPACE) {
     /* This is a user table that resides in innodb_system
@@ -5314,7 +5486,7 @@ bool dd_get_fts_tablespace_id(const dict_table_t *parent_table,
     dd_space_id = dict_sys_t::s_dd_sys_space_id;
   }
 
-  return (true);
+  return true;
 }
 
 /** Set table options for fts dd tables according to dict table
@@ -5383,11 +5555,9 @@ bool dd_create_fts_index_table(const dict_table_t *parent_table,
                                const CHARSET_INFO *charset) {
   ut_ad(charset != nullptr);
 
-  char db_name[MAX_DATABASE_NAME_LEN + 1];
-  char table_name[MAX_TABLE_NAME_LEN + 1];
-
-  dd_parse_tbl_name(table->name.m_name, db_name, table_name, nullptr, nullptr,
-                    nullptr);
+  std::string db_name;
+  std::string table_name;
+  dict_name::get_table(table->name.m_name, db_name, table_name);
 
   /* Create dd::Table object */
   THD *thd = current_thd;
@@ -5396,21 +5566,21 @@ bool dd_create_fts_index_table(const dict_table_t *parent_table,
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
   const dd::Schema *schema = nullptr;
-  if (mdl_locker.ensure_locked(db_name) ||
-      client->acquire<dd::Schema>(db_name, &schema)) {
-    return (false);
+  if (mdl_locker.ensure_locked(db_name.c_str()) ||
+      client->acquire<dd::Schema>(db_name.c_str(), &schema)) {
+    return false;
   }
 
   /* Check if schema is nullptr? */
   if (schema == nullptr) {
-    my_error(ER_BAD_DB_ERROR, MYF(0), db_name);
-    return (false);
+    my_error(ER_BAD_DB_ERROR, MYF(0), db_name.c_str());
+    return false;
   }
 
   std::unique_ptr<dd::Table> dd_table_obj(schema->create_table(thd));
   dd::Table *dd_table = dd_table_obj.get();
 
-  dd_table->set_name(table_name);
+  dd_table->set_name(table_name.c_str());
   dd_table->set_schema_id(schema->id());
 
   dd_set_fts_table_options(dd_table, table);
@@ -5496,29 +5666,29 @@ bool dd_create_fts_index_table(const dict_table_t *parent_table,
 
   /* Fill table space info, etc */
   dd::Object_id dd_space_id;
-  if (!dd_get_fts_tablespace_id(parent_table, table, dd_space_id)) {
-    return (false);
+  if (!dd_get_or_assign_fts_tablespace_id(parent_table, table, dd_space_id)) {
+    return false;
   }
 
   table->dd_space_id = dd_space_id;
 
   dd_write_table(dd_space_id, dd_table, table);
 
-  MDL_ticket *mdl_ticket = NULL;
-  if (dd::acquire_exclusive_table_mdl(thd, db_name, table_name, false,
-                                      &mdl_ticket)) {
+  MDL_ticket *mdl_ticket = nullptr;
+  if (dd::acquire_exclusive_table_mdl(thd, db_name.c_str(), table_name.c_str(),
+                                      false, &mdl_ticket)) {
     ut_ad(0);
-    return (false);
+    return false;
   }
 
   /* Store table to dd */
   bool fail = client->store(dd_table);
   if (fail) {
     ut_ad(0);
-    return (false);
+    return false;
   }
 
-  return (true);
+  return true;
 }
 
 /** Create dd table for fts aux common table
@@ -5528,11 +5698,10 @@ bool dd_create_fts_index_table(const dict_table_t *parent_table,
 @return true on success, false on failure */
 bool dd_create_fts_common_table(const dict_table_t *parent_table,
                                 dict_table_t *table, bool is_config) {
-  char db_name[MAX_DATABASE_NAME_LEN + 1];
-  char table_name[MAX_TABLE_NAME_LEN + 1];
+  std::string db_name;
+  std::string table_name;
 
-  dd_parse_tbl_name(table->name.m_name, db_name, table_name, nullptr, nullptr,
-                    nullptr);
+  dict_name::get_table(table->name.m_name, db_name, table_name);
 
   /* Create dd::Table object */
   THD *thd = current_thd;
@@ -5541,21 +5710,21 @@ bool dd_create_fts_common_table(const dict_table_t *parent_table,
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
   const dd::Schema *schema = nullptr;
-  if (mdl_locker.ensure_locked(db_name) ||
-      client->acquire<dd::Schema>(db_name, &schema)) {
-    return (false);
+  if (mdl_locker.ensure_locked(db_name.c_str()) ||
+      client->acquire<dd::Schema>(db_name.c_str(), &schema)) {
+    return false;
   }
 
   /* Check if schema is nullptr */
   if (schema == nullptr) {
-    my_error(ER_BAD_DB_ERROR, MYF(0), db_name);
-    return (false);
+    my_error(ER_BAD_DB_ERROR, MYF(0), db_name.c_str());
+    return false;
   }
 
   std::unique_ptr<dd::Table> dd_table_obj(schema->create_table(thd));
   dd::Table *dd_table = dd_table_obj.get();
 
-  dd_table->set_name(table_name);
+  dd_table->set_name(table_name.c_str());
   dd_table->set_schema_id(schema->id());
 
   dd_set_fts_table_options(dd_table, table);
@@ -5637,29 +5806,29 @@ bool dd_create_fts_common_table(const dict_table_t *parent_table,
 
   /* Fill table space info, etc */
   dd::Object_id dd_space_id;
-  if (!dd_get_fts_tablespace_id(parent_table, table, dd_space_id)) {
+  if (!dd_get_or_assign_fts_tablespace_id(parent_table, table, dd_space_id)) {
     ut_ad(0);
-    return (false);
+    return false;
   }
 
   table->dd_space_id = dd_space_id;
 
   dd_write_table(dd_space_id, dd_table, table);
 
-  MDL_ticket *mdl_ticket = NULL;
-  if (dd::acquire_exclusive_table_mdl(thd, db_name, table_name, false,
-                                      &mdl_ticket)) {
-    return (false);
+  MDL_ticket *mdl_ticket = nullptr;
+  if (dd::acquire_exclusive_table_mdl(thd, db_name.c_str(), table_name.c_str(),
+                                      false, &mdl_ticket)) {
+    return false;
   }
 
   /* Store table to dd */
   bool fail = client->store(dd_table);
   if (fail) {
     ut_ad(0);
-    return (false);
+    return false;
   }
 
-  return (true);
+  return true;
 }
 
 /** Drop dd table & tablespace for fts aux table
@@ -5667,10 +5836,10 @@ bool dd_create_fts_common_table(const dict_table_t *parent_table,
 @param[in]	file_per_table	flag whether use file per table
 @return true on success, false on failure. */
 bool dd_drop_fts_table(const char *name, bool file_per_table) {
-  char db_name[MAX_DATABASE_NAME_LEN + 1];
-  char table_name[MAX_TABLE_NAME_LEN + 1];
+  std::string db_name;
+  std::string table_name;
 
-  dd_parse_tbl_name(name, db_name, table_name, nullptr, nullptr, nullptr);
+  dict_name::get_table(name, db_name, table_name);
 
   /* Create dd::Table object */
   THD *thd = current_thd;
@@ -5678,19 +5847,20 @@ bool dd_drop_fts_table(const char *name, bool file_per_table) {
   dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
-  MDL_ticket *mdl_ticket = NULL;
-  if (dd::acquire_exclusive_table_mdl(thd, db_name, table_name, false,
-                                      &mdl_ticket)) {
-    return (false);
+  MDL_ticket *mdl_ticket = nullptr;
+  if (dd::acquire_exclusive_table_mdl(thd, db_name.c_str(), table_name.c_str(),
+                                      false, &mdl_ticket)) {
+    return false;
   }
 
   const dd::Table *dd_table = nullptr;
-  if (client->acquire<dd::Table>(db_name, table_name, &dd_table)) {
-    return (false);
+  if (client->acquire<dd::Table>(db_name.c_str(), table_name.c_str(),
+                                 &dd_table)) {
+    return false;
   }
 
   if (dd_table == nullptr) {
-    return (false);
+    return false;
   }
 
   if (file_per_table) {
@@ -5701,10 +5871,10 @@ bool dd_drop_fts_table(const char *name, bool file_per_table) {
   }
 
   if (client->drop(dd_table)) {
-    return (false);
+    return false;
   }
 
-  return (true);
+  return true;
 }
 
 /** Rename dd table & tablespace files for fts aux table
@@ -5712,19 +5882,16 @@ bool dd_drop_fts_table(const char *name, bool file_per_table) {
 @param[in]	old_name	old innodb table name
 @return true on success, false on failure. */
 bool dd_rename_fts_table(const dict_table_t *table, const char *old_name) {
-  char new_db_name[MAX_DATABASE_NAME_LEN + 1];
-  char new_table_name[MAX_TABLE_NAME_LEN + 1];
-  char old_db_name[MAX_DATABASE_NAME_LEN + 1];
-  char old_table_name[MAX_TABLE_NAME_LEN + 1];
-  char *new_name = table->name.m_name;
+  std::string new_db;
+  std::string new_table;
+  dict_name::get_table(table->name.m_name, new_db, new_table);
 
-  dd_parse_tbl_name(new_name, new_db_name, new_table_name, nullptr, nullptr,
-                    nullptr);
-  dd_parse_tbl_name(old_name, old_db_name, old_table_name, nullptr, nullptr,
-                    nullptr);
+  std::string old_db;
+  std::string old_table;
+  dict_name::get_table(old_name, old_db, old_table);
 
-  ut_ad(strcmp(new_db_name, old_db_name) != 0);
-  ut_ad(strcmp(new_table_name, old_table_name) == 0);
+  ut_ad(new_db.compare(old_db) != 0);
+  ut_ad(new_table.compare(old_table) == 0);
 
   /* Create dd::Table object */
   THD *thd = current_thd;
@@ -5733,26 +5900,26 @@ bool dd_rename_fts_table(const dict_table_t *table, const char *old_name) {
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
   const dd::Schema *to_sch = nullptr;
-  if (client->acquire<dd::Schema>(new_db_name, &to_sch)) {
-    return (false);
+  if (client->acquire<dd::Schema>(new_db.c_str(), &to_sch)) {
+    return false;
   }
 
   MDL_ticket *mdl_ticket = nullptr;
-  if (dd::acquire_exclusive_table_mdl(thd, old_db_name, old_table_name, false,
-                                      &mdl_ticket)) {
-    return (false);
+  if (dd::acquire_exclusive_table_mdl(thd, old_db.c_str(), old_table.c_str(),
+                                      false, &mdl_ticket)) {
+    return false;
   }
 
   MDL_ticket *mdl_ticket2 = nullptr;
-  if (dd::acquire_exclusive_table_mdl(thd, new_db_name, new_table_name, false,
-                                      &mdl_ticket2)) {
-    return (false);
+  if (dd::acquire_exclusive_table_mdl(thd, new_db.c_str(), new_table.c_str(),
+                                      false, &mdl_ticket2)) {
+    return false;
   }
 
   dd::Table *dd_table = nullptr;
-  if (client->acquire_for_modification<dd::Table>(old_db_name, old_table_name,
-                                                  &dd_table)) {
-    return (false);
+  if (client->acquire_for_modification<dd::Table>(
+          old_db.c_str(), old_table.c_str(), &dd_table)) {
+    return false;
   }
 
   // Set schema id
@@ -5762,7 +5929,7 @@ bool dd_rename_fts_table(const dict_table_t *table, const char *old_name) {
   if (dict_table_is_file_per_table(table)) {
     char *new_path = fil_space_get_first_path(table->space);
 
-    if (dd_tablespace_rename(table->dd_space_id, table->name.m_name,
+    if (dd_tablespace_rename(table->dd_space_id, false, table->name.m_name,
                              new_path) != DB_SUCCESS) {
       ut_a(false);
     }
@@ -5772,10 +5939,10 @@ bool dd_rename_fts_table(const dict_table_t *table, const char *old_name) {
 
   if (client->update(dd_table)) {
     ut_ad(0);
-    return (false);
+    return false;
   }
 
-  return (true);
+  return true;
 }
 
 /** Set the space_id attribute in se_private_data of tablespace
@@ -5798,14 +5965,14 @@ bool dd_tablespace_get_space_id(const dd::Tablespace *dd_space,
   if (p.exists(dd_space_key_strings[DD_SPACE_ID])) {
     p.get(dd_space_key_strings[DD_SPACE_ID], space_id);
 
-    return (DD_SUCCESS);
+    return DD_SUCCESS;
   }
-  return (DD_FAILURE);
+  return DD_FAILURE;
 }
 
-/** Get state attribute value in dd::Tablespace::se_private_data
-@param[in,out] dd_space  dd::Tablespace object
-@param[in]     state     value to set for key 'state' */
+/** Set state attribute in se_private_data of tablespace
+@param[in,out]	dd_space	dd::Tablespace object
+@param[in]	state		value to set for key 'state' */
 void dd_tablespace_set_state(dd::Tablespace *dd_space, dd_space_states state) {
   dd::Properties &p = dd_space->se_private_data();
 
@@ -5829,14 +5996,14 @@ bool dd_tablespace_set_id_and_state(const char *space_name, space_id_t space_id,
 
   bool dd_result = dc->acquire_for_modification(tsn, &dd_space);
   if (dd_space == nullptr) {
-    return (DD_FAILURE);
+    return DD_FAILURE;
   }
 
   dd_tablespace_set_space_id(dd_space, space_id);
 
   dd_tablespace_set_state(dd_space, state);
 
-  return (dd::commit_or_rollback_tablespace_change(thd, dd_space, dd_result));
+  return dd::commit_or_rollback_tablespace_change(thd, dd_space, dd_result);
 }
 
 void dd_tablespace_get_state(const dd::Tablespace *dd_space,
@@ -5882,7 +6049,7 @@ dd_space_states dd_tablespace_get_state_enum(const dd::Tablespace *dd_space,
     state_enum = dd_tablespace_get_state_enum(&p, space_id);
   }
 
-  return (state_enum);
+  return state_enum;
 }
 
 dd_space_states dd_tablespace_get_state_enum(const dd::Properties *p,
@@ -5893,7 +6060,7 @@ dd_space_states dd_tablespace_get_state_enum(const dd::Properties *p,
     if (p->exists(dd_space_key_strings[DD_SPACE_ID])) {
       p->get(dd_space_key_strings[DD_SPACE_ID], &space_id);
     } else {
-      return (DD_SPACE_STATE__LAST);
+      return DD_SPACE_STATE__LAST;
     }
   }
   ut_ad(space_id != SPACE_UNKNOWN);
@@ -5922,7 +6089,7 @@ dd_space_states dd_tablespace_get_state_enum(const dd::Properties *p,
         is_discarded ? DD_SPACE_STATE_DISCARDED : DD_SPACE_STATE_NORMAL;
   }
 
-  return (state_enum);
+  return state_enum;
 }
 
 /** Get the discarded state from se_private_data of tablespace
@@ -5933,10 +6100,10 @@ bool dd_tablespace_is_discarded(const dd::Tablespace *dd_space) {
   dd_tablespace_get_state(dd_space, &dd_state);
 
   if (dd_state == dd_space_state_values[DD_SPACE_STATE_DISCARDED]) {
-    return (true);
+    return true;
   }
 
-  return (false);
+  return false;
 }
 
 bool dd_tablespace_get_mdl(const char *space_name, MDL_ticket **mdl_ticket,
@@ -5945,7 +6112,7 @@ bool dd_tablespace_get_mdl(const char *space_name, MDL_ticket **mdl_ticket,
   /* Safeguard in release mode if background thread doesn't have THD. */
   if (thd == nullptr) {
     ut_ad(false);
-    return (true);
+    return true;
   }
   /* Explicit duration for background threads. */
   bool trx_duration = foreground;
@@ -5966,7 +6133,7 @@ bool dd_tablespace_get_mdl(const char *space_name, MDL_ticket **mdl_ticket,
   if (result && !foreground && thd->is_error()) {
     thd->clear_error();
   }
-  return (result);
+  return result;
 }
 
 /** Release the MDL held by the given ticket.
@@ -5983,7 +6150,7 @@ uint32_t dd_get_total_indexes_num() {
   for (uint32_t idx = 0; idx < innodb_dd_table_size; idx++) {
     indexes_count += innodb_dd_table[idx].n_indexes;
   }
-  return (indexes_count);
+  return indexes_count;
 }
 #endif /* UNIV_DEBUG */
 
@@ -6005,9 +6172,8 @@ char *dd_get_referenced_table(const char *name, const char *database_name,
                               MDL_ticket **mdl, mem_heap_t *heap) {
   char *ref;
   const char *db_name;
-  bool is_part;
 
-  is_part = (strstr(name, PART_SEPARATOR) != nullptr);
+  bool is_part = dict_name::is_partition(name);
 
   *table = nullptr;
 
@@ -6055,7 +6221,7 @@ char *dd_get_referenced_table(const char *name, const char *database_name,
     }
   }
 
-  return (ref);
+  return ref;
 }
 
 /** Update all InnoDB tablespace cache objects. This step is done post
@@ -6069,7 +6235,7 @@ bool dd_tablespace_update_cache(THD *thd) {
   /* If there are no prepared trxs, then DD reads would have been
   already consistent. No need to update cache */
   if (!trx_sys->found_prepared_trx) {
-    return (false);
+    return false;
   }
 
   dd::cache::Dictionary_client *dc = dd::get_dd_client(thd);
@@ -6079,7 +6245,7 @@ bool dd_tablespace_update_cache(THD *thd) {
   space_id_t max_id = 0;
 
   if (dc->fetch_global_components(&tablespaces)) {
-    return (true);
+    return true;
   }
 
   bool fail = false;
@@ -6150,10 +6316,11 @@ bool dd_tablespace_update_cache(THD *thd) {
 
       /* It's safe to pass space_name in tablename charset
       because filename is already in filename charset. */
-      dberr_t err = fil_ibd_open(false, purpose, id, flags, space_name, nullptr,
+      dberr_t err = fil_ibd_open(false, purpose, id, flags, space_name,
                                  filename, false, false);
       switch (err) {
         case DB_SUCCESS:
+          break;
         case DB_CANNOT_OPEN_FILE:
           break;
         default:
@@ -6164,10 +6331,23 @@ bool dd_tablespace_update_cache(THD *thd) {
           ut_strerr(err);
       }
     }
+    if (id != TRX_SYS_SPACE && fil_space_get(id) != nullptr) {
+      /* Get the autoextend_size property from the tablespace
+      and set the fil_space_t::autoextend_size attribute. */
+      const dd::Properties &o = t->options();
+      uint64_t autoextend_size{};
+
+      if (o.exists(autoextend_size_str)) {
+        o.get(autoextend_size_str, &autoextend_size);
+      }
+
+      ut_d(dberr_t ret =) fil_set_autoextend_size(id, autoextend_size);
+      ut_ad(ret == DB_SUCCESS);
+    }
   }
 
   fil_set_max_space_id_if_bigger(max_id);
-  return (fail);
+  return fail;
 }
 
 /* Check if the table belongs to an encrypted tablespace.
@@ -6176,7 +6356,7 @@ bool dd_tablespace_update_cache(THD *thd) {
 bool dd_is_table_in_encrypted_tablespace(const dict_table_t *table) {
   fil_space_t *space = fil_space_get(table->space);
   if (space != nullptr) {
-    return (FSP_FLAGS_GET_ENCRYPTION(space->flags));
+    return FSP_FLAGS_GET_ENCRYPTION(space->flags);
   } else {
     /* Its possible that tablespace flag is missing (for ex: after
     discard tablespace). In that case get tablespace flags from Data
@@ -6193,11 +6373,588 @@ bool dd_is_table_in_encrypted_tablespace(const dict_table_t *table) {
       dd_space->se_private_data().get(dd_space_key_strings[DD_SPACE_FLAGS],
                                       &flags);
 
-      return (FSP_FLAGS_GET_ENCRYPTION(flags));
+      return FSP_FLAGS_GET_ENCRYPTION(flags);
     }
     /* We should not reach here */
     ut_ad(0);
     return false;
   }
 }
+
+void dict_table_t::get_table_name(std::string &schema, std::string &table) {
+  std::string dict_table_name(name.m_name);
+  dict_name::get_table(dict_table_name, schema, table);
+}
+#endif /* !UNIV_HOTBACKUP */
+
+#ifndef UNIV_HOTBACKUP
+namespace dict_name {
+void file_to_table(std::string &name, bool quiet) {
+  ut_ad(name.length() < FN_REFLEN);
+  char conv_name[FN_REFLEN + 1];
+
+  /* Convert to system character set from file name character set. */
+  filename_to_tablename(name.c_str(), conv_name, FN_REFLEN, quiet);
+  name.assign(conv_name);
+}
+
+void table_to_file(std::string &name) {
+  ut_ad(name.length() < FN_REFLEN);
+  char conv_name[FN_REFLEN + 1];
+
+  /* Convert to system character set from file name character set. */
+  static_cast<void>(tablename_to_filename(name.c_str(), conv_name, FN_REFLEN));
+  name.assign(conv_name);
+}
+
+/** Get partition and sub-partition separator strings.
+@param[in]	is_57		true, if 5.7 style separator is needed
+@param[out]	part_sep	partition separator
+@param[out]	sub_part_sep	sub-partition separator */
+static void get_partition_separators(bool is_57, std::string &part_sep,
+                                     std::string &sub_part_sep) {
+  if (!is_57) {
+    part_sep.assign(PART_SEPARATOR);
+    sub_part_sep.assign(SUB_PART_SEPARATOR);
+    return;
+  }
+  /* 5.7 style partition separators. */
+#ifdef _WIN32
+  part_sep.assign(PART_SEPARATOR);
+  sub_part_sep.assign(SUB_PART_SEPARATOR);
+#else
+  part_sep.assign(ALT_PART_SEPARATOR);
+  sub_part_sep.assign(ALT_SUB_PART_SEPARATOR);
+#endif /* _WIN32 */
+}
+
+/** Check for partition and sub partition.
+@param[in]	dict_name	name from innodb dictionary
+@param[in]	sub_part	true, if checking sub partition
+@param[out]	position	position of partition in string
+@return true, iff partition/sub-partition exists. */
+static bool check_partition(const std::string &dict_name, bool sub_part,
+                            size_t &position) {
+  std::string part_sep = sub_part ? SUB_PART_SEPARATOR : PART_SEPARATOR;
+
+  /* Check for partition separator string. */
+  position = dict_name.find(part_sep);
+
+  if (position != std::string::npos) {
+    return true;
+  }
+
+  std::string alt_sep = sub_part ? ALT_SUB_PART_SEPARATOR : ALT_PART_SEPARATOR;
+
+  /* Check for alternative partition separator. It is safe check for
+  release build server and for upgrade. */
+  position = dict_name.find(alt_sep);
+
+  if (position != std::string::npos) {
+    return true;
+  }
+
+  return false;
+}
+
+/** Check for TMP extension name.
+@param[in]	dict_name	name from innodb dictionary
+@param[out]	position	position of TMP extension in string
+@return true, iff TMP extension exists. */
+static bool check_tmp(const std::string &dict_name, size_t &position) {
+  std::string check_name(dict_name);
+  position = std::string::npos;
+
+  /* For partitioned or sub partitioned table we need to search the
+  temp postfix within the partition, sub-partition string. The temp
+  extension looks as follows in different cases.
+
+  1. Non partitioned table : table_name#TMP
+  2. Table Partition       : table_name#p#part_name#TMP
+  3. Table Sub Partition   : table_name#p#part_name#sp#sub_part_name#TMP
+
+  The issue with checking only #TMP at the end of string is that the partition
+  or sub partition could be named as 'TMP' and in following cases we could
+  wrongly classify it as name with temporary extension.
+
+  1. Table Partition       : table_name#p#TMP
+  3. Table Sub Partition   : table_name#p#part_name#sp#TMP */
+
+  size_t part_begin = std::string::npos;
+
+  if (check_partition(dict_name, false, part_begin)) {
+    part_begin += PART_SEPARATOR_LEN;
+    auto part_string = check_name.substr(part_begin);
+    /* Modify the name to start from the beginning of partition string
+    excluding the partition separator '#p#'. */
+    check_name.assign(part_string);
+
+    size_t sub_part_begin = std::string::npos;
+
+    if (check_partition(part_string, true, sub_part_begin)) {
+      sub_part_begin += SUB_PART_SEPARATOR_LEN;
+      auto sub_part_string = check_name.substr(sub_part_begin);
+      /* Modify the name to start from the beginning of sub-partition string
+      excluding the sub-partition separator '#sp#'. */
+      check_name.assign(sub_part_string);
+    }
+  }
+
+  auto length = check_name.size();
+
+  if (length < TMP_POSTFIX_LEN) {
+    return false;
+  }
+
+  auto postfix_pos = length - TMP_POSTFIX_LEN;
+  auto ret = check_name.compare(postfix_pos, TMP_POSTFIX_LEN, TMP_POSTFIX);
+
+  if (ret == 0) {
+    auto length = dict_name.size();
+    ut_a(length >= TMP_POSTFIX_LEN);
+
+    position = length - TMP_POSTFIX_LEN;
+    ut_ad(0 == dict_name.compare(position, TMP_POSTFIX_LEN, TMP_POSTFIX));
+    return true;
+  }
+  return false;
+}
+
+bool is_partition(const std::string &dict_name) {
+  size_t position;
+  return check_partition(dict_name, false, position);
+}
+
+void get_table(const std::string &dict_name, std::string &schema,
+               std::string &table) {
+  bool is_tmp;
+  std::string partition;
+  get_table(dict_name, true, schema, table, partition, is_tmp);
+}
+
+void get_table(const std::string &dict_name, bool convert, std::string &schema,
+               std::string &table, std::string &partition, bool &is_tmp) {
+  size_t table_begin = dict_name.find(SCHEMA_SEPARATOR);
+
+  /* Check if schema is specified. */
+  if (table_begin == std::string::npos) {
+    table_begin = 0;
+    schema.clear();
+  } else {
+    schema.assign(dict_name.substr(0, table_begin));
+    if (convert) {
+      /* Perform conversion if requested. Allow invalid conversion
+      in schema name. For temp table server passes directory name
+      instead of schema name which might contain "." resulting in
+      conversion to "?". For temp table this schema name is never used. */
+      file_to_table(schema, true);
+    }
+    ++table_begin;
+  }
+
+  table.assign(dict_name.substr(table_begin));
+  partition.clear();
+
+  /* Check if partitioned table. */
+  size_t part_begin = std::string::npos;
+  bool is_part = check_partition(table, false, part_begin);
+
+  /* Check if temp extension. */
+  size_t tmp_begin = std::string::npos;
+  is_tmp = check_tmp(table, tmp_begin);
+
+  if (is_part) {
+    ut_ad(part_begin > 0);
+    size_t part_len = std::string::npos;
+
+    if (is_tmp && tmp_begin > part_begin) {
+      part_len = tmp_begin - part_begin;
+    } else if (is_tmp) {
+      /* TMP extension must follow partition. */
+      ut_ad(false);
+    }
+    partition.assign(table.substr(part_begin, part_len));
+    table.assign(table.substr(0, part_begin));
+
+  } else if (is_tmp) {
+    ut_ad(tmp_begin > 0);
+    table.assign(table.substr(0, tmp_begin));
+  }
+
+  /* Perform conversion if requested. */
+  if (convert) {
+    file_to_table(table, false);
+  }
+}
+
+void get_partition(const std::string &partition, bool convert,
+                   std::string &part, std::string &sub_part) {
+  ut_ad(is_partition(partition));
+
+  /* Check if sub-partition exists. */
+  size_t sub_pos = std::string::npos;
+  bool is_sub = check_partition(partition, true, sub_pos);
+
+  /* Assign partition name. */
+  size_t part_begin = PART_SEPARATOR_LEN;
+  size_t part_len = std::string::npos;
+
+  if (is_sub) {
+    ut_ad(sub_pos > part_begin);
+    part_len = sub_pos - part_begin;
+  }
+
+  part.assign(partition.substr(part_begin, part_len));
+  if (convert) {
+    file_to_table(part, false);
+  }
+
+  /* Assign sub-partition name. */
+  sub_part.clear();
+  if (!is_sub) {
+    return;
+  }
+
+  auto sub_begin = sub_pos + SUB_PART_SEPARATOR_LEN;
+  auto sub_len = std::string::npos;
+
+  sub_part.assign(partition.substr(sub_begin, sub_len));
+
+  if (convert) {
+    file_to_table(sub_part, false);
+  }
+}
+
+void build_table(const std::string &schema, const std::string &table,
+                 const std::string &partition, bool is_tmp, bool convert,
+                 std::string &dict_name) {
+  dict_name.clear();
+  std::string conv_str;
+
+  /* Check and append schema name. */
+  if (!schema.empty()) {
+    conv_str.assign(schema);
+    /* Convert schema name. */
+    if (convert) {
+      table_to_file(conv_str);
+    }
+    dict_name.append(conv_str);
+    dict_name.append(SCHEMA_SEPARATOR);
+  }
+
+  conv_str.assign(table);
+  /* Convert table name. */
+  if (convert) {
+    table_to_file(conv_str);
+  }
+  dict_name.append(conv_str);
+
+  /* Check and assign partition string. Any conversion for partition
+  and sub-partition is already done while building partition string. */
+  if (!partition.empty()) {
+    dict_name.append(partition);
+  }
+
+  /* Check and append temporary extension. */
+  if (is_tmp) {
+    dict_name.append(TMP_POSTFIX);
+  }
+}
+
+/** Build partition string from partition and sub-partition name
+@param[in]	part		partition name
+@param[in]	sub_part	sub-partition name
+@param[in]	conv		callback to convert partition/sub-partition name
+@param[in]	is_57		if 5.7 style partition name is needed
+@param[out]	partition	partition string for dictionary table name */
+static void build_partition_low(const std::string part,
+                                const std::string sub_part, Convert_Func conv,
+                                bool is_57, std::string &partition) {
+  partition.clear();
+  std::string conv_str;
+
+  if (part.empty()) {
+    ut_ad(false);
+    return;
+  }
+
+  /* Get partition separator strings */
+  std::string part_sep;
+  std::string sub_part_sep;
+
+  get_partition_separators(is_57, part_sep, sub_part_sep);
+
+  /* Append separator and partition. */
+  partition.append(part_sep);
+
+  conv_str.assign(part);
+  if (conv) {
+    conv(conv_str);
+  }
+  partition.append(conv_str);
+
+  if (sub_part.empty()) {
+    return;
+  }
+
+  /* Append separator and sub-partition. */
+  partition.append(sub_part_sep);
+
+  conv_str.assign(sub_part);
+  if (conv) {
+    conv(conv_str);
+  }
+  partition.append(conv_str);
+}
+
+/** Convert string to lower case.
+@param[in,out]	name	name to convert */
+static void to_lower(std::string &name) {
+  /* Skip empty string. */
+  if (name.empty()) {
+    return;
+  }
+  ut_ad(name.length() < FN_REFLEN);
+  char conv_name[FN_REFLEN];
+  auto len = name.copy(&conv_name[0], FN_REFLEN - 1);
+  conv_name[len] = '\0';
+
+  innobase_casedn_str(&conv_name[0]);
+  name.assign(&conv_name[0]);
+}
+
+/** Get partition and sub-partition name from DD. We convert the names to
+lower case.
+@param[in]	dd_part		partition object from DD
+@param[in]	lower_case	convert to lower case name
+@param[out]	part_name	partition name
+@param[out]	sub_name	sub-partition name */
+static void get_part_from_dd(const dd::Partition *dd_part, bool lower_case,
+                             std::string &part_name, std::string &sub_name) {
+  /* Assume sub-partition and get the parent partition. */
+  auto sub_part = dd_part;
+  auto part = sub_part->parent();
+
+  /* If parent is null then there is no sub-partition. */
+  if (part == nullptr) {
+    part = dd_part;
+    sub_part = nullptr;
+  }
+
+  ut_ad(part->name().length() < FN_REFLEN);
+
+  part_name.assign(part->name().c_str());
+  /* Convert partition name to lower case. */
+  if (lower_case) {
+    to_lower(part_name);
+  }
+
+  sub_name.clear();
+  if (sub_part != nullptr) {
+    ut_ad(sub_part->name().length() < FN_REFLEN);
+
+    sub_name.assign(sub_part->name().c_str());
+    /* Convert sub-partition name to lower case. */
+    if (lower_case) {
+      to_lower(sub_name);
+    }
+  }
+}
+
+void build_partition(const dd::Partition *dd_part, std::string &partition) {
+  std::string part_name;
+  std::string sub_name;
+
+  /* Extract partition and sub-partition name from DD. */
+  get_part_from_dd(dd_part, true, part_name, sub_name);
+
+  /* Build partition string after converting names. */
+  build_partition_low(part_name, sub_name, table_to_file, false, partition);
+}
+
+void build_57_partition(const dd::Partition *dd_part, std::string &partition) {
+  std::string part_name;
+  std::string sub_name;
+
+  /* Extract partition and sub-partition name from DD. In 5.7, partition and
+  sub-partition names are kept in same letter case as given by user. */
+  bool lower_case = false;
+
+  /* On windows, 5.7 partition sub-partition names are in lower case always. */
+#ifdef _WIN32
+  lower_case = true;
+#endif /* _WIN32 */
+
+  get_part_from_dd(dd_part, lower_case, part_name, sub_name);
+
+  /* Build partition string after converting names. */
+  build_partition_low(part_name, sub_name, table_to_file, true, partition);
+}
+
+bool match_partition(const std::string &dict_name,
+                     const dd::Partition *dd_part) {
+  std::string dd_partition;
+
+  /* Extract partition and sub-partition name from DD. */
+  build_partition(dd_part, dd_partition);
+
+  std::string schema;
+  std::string table;
+  bool is_tmp;
+  std::string partition;
+
+  /* Extract schema, table and partition string without conversion. */
+  get_table(dict_name, false, schema, table, partition, is_tmp);
+
+#ifdef UNIV_DEBUG
+  /* Innodb dictionary name should already be in lower case. */
+  ut_ad(partition.length() < FN_REFLEN);
+
+  char partition_string[FN_REFLEN];
+  auto part_len = partition.copy(&partition_string[0], FN_REFLEN - 1);
+  partition_string[part_len] = '\0';
+
+  innobase_casedn_path(&partition_string[0]);
+  std::string lower_case_str(&partition_string[0]);
+
+  ut_ad(partition.compare(lower_case_str) == 0);
+#endif /* UNIV_DEBUG */
+
+  /* Match the string from DD and innodb dictionary. */
+  return (dd_partition.compare(partition) == 0);
+}
+
+/** Get table and partition string in system cs from dictionary name.
+@param[in]	dict_name	table name in dictionary
+@param[out]	schema		schema name
+@param[out]	table		table name
+@param[out]	partition	partition string
+@param[out]	is_tmp		true, if temporary table created by DDL */
+static void get_table_parts(const std::string &dict_name, std::string &schema,
+                            std::string &table, std::string &partition,
+                            bool &is_tmp) {
+  /* Extract schema, table and partition string converting to system cs. */
+  get_table(dict_name, true, schema, table, partition, is_tmp);
+
+  if (!partition.empty()) {
+    std::string part;
+    std::string sub_part;
+
+    /* Extract partition details converting to system cs. */
+    get_partition(partition, true, part, sub_part);
+
+    /* During upgrade from 5.7 it is possible to have upper case
+    names from SYS tables. */
+    if (srv_is_upgrade_mode) {
+      to_lower(part);
+      to_lower(sub_part);
+    }
+
+#ifdef UNIV_DEBUG
+    /* Validate that the names are in lower case. */
+    std::string save_part(part);
+    to_lower(part);
+    ut_ad(save_part.compare(part) == 0);
+
+    std::string save_sub_part(sub_part);
+    to_lower(sub_part);
+    ut_ad(save_sub_part.compare(sub_part) == 0);
+#endif  // UNIV_DEBUG
+
+    /* Build partition string. No conversion required. */
+    partition.clear();
+    build_partition_low(part, sub_part, nullptr, false, partition);
+  }
+}
+
+void convert_to_space(std::string &dict_name) {
+  std::string schema;
+  std::string table;
+  std::string partition;
+  bool is_tmp = false;
+
+  /* Get all table parts converted to system cs. */
+  get_table_parts(dict_name, schema, table, partition, is_tmp);
+
+  /* For lower case file systems, schema and table name are converted
+  to lower case before generating tablespace name. Skip for general
+  table space i.e. schema is empty. */
+  if (lower_case_file_system && !schema.empty()) {
+    ut_ad(lower_case_table_names != 0);
+    to_lower(schema);
+    to_lower(table);
+  }
+
+  /* Build the space name. No conversion required. */
+  dict_name.clear();
+  build_table(schema, table, partition, is_tmp, false, dict_name);
+
+  ut_ad(dict_name.length() < dict_name::MAX_SPACE_NAME_LEN);
+}
+
+void rebuild_space(const std::string &dict_name, std::string &space_name) {
+  std::string schema;
+  std::string table;
+  std::string partition;
+  bool is_tmp = false;
+
+  /* Get all table parts converted to system cs. */
+  get_table_parts(dict_name, schema, table, partition, is_tmp);
+
+  if (is_tmp) {
+    partition.append(TMP_POSTFIX);
+  }
+
+  auto part_len = partition.length();
+  auto space_len = space_name.length();
+
+  ut_ad(space_len > part_len);
+
+  if (space_len > part_len) {
+    auto part_pos = space_len - part_len;
+
+    std::string space_part = space_name.substr(part_pos);
+    if (space_part.compare(partition) == 0) {
+      return;
+    }
+    space_name.replace(part_pos, std::string::npos, partition);
+  }
+}
+
+void rebuild(std::string &dict_name) {
+  std::string schema;
+  std::string table;
+  std::string partition;
+  bool is_tmp = false;
+
+  /* Conversion is needed only for partitioned table. */
+  if (!is_partition(dict_name)) {
+    return;
+  }
+
+  /* Extract schema, table and partition string without conversion. */
+  get_table(dict_name, false, schema, table, partition, is_tmp);
+
+  if (!partition.empty()) {
+    std::string part;
+    std::string sub_part;
+
+    /* Extract partition details converting to system cs. */
+    get_partition(partition, true, part, sub_part);
+
+    /* Convert partition names to lower case. */
+    to_lower(part);
+    to_lower(sub_part);
+
+    /* Build partition string converting to file cs. */
+    partition.clear();
+    build_partition_low(part, sub_part, table_to_file, false, partition);
+  }
+
+  /* Re-build the table name. No cs conversion required. */
+  dict_name.clear();
+  build_table(schema, table, partition, is_tmp, false, dict_name);
+}
+
+}  // namespace dict_name
 #endif /* !UNIV_HOTBACKUP */

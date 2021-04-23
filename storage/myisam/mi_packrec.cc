@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -25,6 +25,8 @@
 #include "my_config.h"
 
 #include <sys/types.h>
+
+#include <algorithm>
 
 #include "my_byteorder.h"
 #include "my_compiler.h"
@@ -303,7 +305,7 @@ bool _mi_read_pack_info(MI_INFO *info, bool fix_keys) {
 
   if (bit_buff.error || bit_buff.pos < bit_buff.end) goto err3;
 
-  return 0;
+  return false;
 
 err3:
   set_my_errno(HA_ERR_WRONG_IN_RECORD);
@@ -312,7 +314,7 @@ err2:
 err1:
   my_free(share->decode_trees);
 err0:
-  return 1;
+  return true;
 }
 
 /*
@@ -652,7 +654,7 @@ static uint find_longest_bitstream(uint16 *table, uint16 *end) {
       return OFFSET_TABLE_SIZE;
     }
     length2 = find_longest_bitstream(next, end) + 1;
-    length = MY_MAX(length, length2);
+    length = std::max(length, length2);
   }
   return length;
 }
@@ -759,7 +761,7 @@ static unpack_function_t get_unpack_function(MI_COLUMNDEF *rec) {
       return &uf_varchar2;
     case FIELD_LAST:
     default:
-      return 0; /* This should never happend */
+      return nullptr; /* This should never happend */
   }
 }
 
@@ -1185,7 +1187,7 @@ int _mi_read_rnd_pack_record(MI_INFO *info, uchar *buf, my_off_t filepos,
     b_type = _mi_pack_get_block_info(info, &info->bit_buff, &block_info,
                                      &info->rec_buff, info->dfile, filepos);
   if (b_type) goto err; /* Error code is already set */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (block_info.rec_len > share->max_pack_length) {
     set_my_errno(HA_ERR_WRONG_IN_RECORD);
     goto err;
@@ -1252,7 +1254,7 @@ uint _mi_pack_get_block_info(MI_INFO *myisam, MI_BIT_BUFF *bit_buff,
   }
   info->filepos = filepos + head_length;
   if (file > 0) {
-    info->offset = MY_MIN(info->rec_len, ref_length - head_length);
+    info->offset = std::min<ulong>(info->rec_len, ref_length - head_length);
     memcpy(*rec_buff_p, header + head_length, info->offset);
   }
   return 0;
@@ -1353,7 +1355,7 @@ bool _mi_memmap_file(MI_INFO *info) {
 
     if (eom) {
       DBUG_PRINT("warning", ("File is too large for mmap"));
-      return 0;
+      return false;
     }
     if (mysql_file_seek(info->dfile, 0L, MY_SEEK_END, MYF(0)) <
         share->state.state.data_file_length + MEMMAP_EXTRA_MARGIN) {
@@ -1363,7 +1365,7 @@ bool _mi_memmap_file(MI_INFO *info) {
         myisam_mmap_used -= data_file_length + MEMMAP_EXTRA_MARGIN;
         mysql_mutex_unlock(&THR_LOCK_myisam_mmap);
       }
-      return 0;
+      return false;
     }
     if (mi_dynmap_file(
             info, share->state.state.data_file_length + MEMMAP_EXTRA_MARGIN)) {
@@ -1372,17 +1374,17 @@ bool _mi_memmap_file(MI_INFO *info) {
         myisam_mmap_used -= data_file_length + MEMMAP_EXTRA_MARGIN;
         mysql_mutex_unlock(&THR_LOCK_myisam_mmap);
       }
-      return 0;
+      return false;
     }
   }
   info->opt_flag |= MEMMAP_USED;
   info->read_record = share->read_record = _mi_read_mempack_record;
   share->read_rnd = _mi_read_rnd_mempack_record;
-  return 1;
+  return true;
 }
 
 void _mi_unmap_file(MI_INFO *info) {
-  DBUG_ASSERT(info->s->options & HA_OPTION_COMPRESS_RECORD);
+  assert(info->s->options & HA_OPTION_COMPRESS_RECORD);
 
   (void)my_munmap((char *)info->s->file_map, (size_t)info->s->mmaped_length);
 
@@ -1403,7 +1405,7 @@ static uchar *_mi_mempack_get_block_info(MI_INFO *myisam, MI_BIT_BUFF *bit_buff,
                                &info->blob_len);
     /* mi_alloc_rec_buff sets my_errno on error */
     if (!(mi_alloc_rec_buff(myisam, info->blob_len, rec_buff_p)))
-      return 0; /* not enough memory */
+      return nullptr; /* not enough memory */
     bit_buff->blob_pos = (uchar *)*rec_buff_p;
     bit_buff->blob_end = (uchar *)*rec_buff_p + info->blob_len;
   }
@@ -1444,7 +1446,7 @@ static int _mi_read_rnd_mempack_record(
             info, &info->bit_buff, &block_info, &info->rec_buff,
             (uchar *)(start = share->file_map + filepos))))
     goto err;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (block_info.rec_len > info->s->max_pack_length) {
     set_my_errno(HA_ERR_WRONG_IN_RECORD);
     goto err;
@@ -1476,7 +1478,7 @@ uint save_pack_length(uint version, uchar *block_buff, ulong length) {
   *(uchar *)block_buff = 255;
   if (version == 1) /* old format */
   {
-    DBUG_ASSERT(length <= 0xFFFFFF);
+    assert(length <= 0xFFFFFF);
     int3store(block_buff + 1, (ulong)length);
     return 4;
   } else {

@@ -1,4 +1,4 @@
--- Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2015, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -22,11 +22,11 @@
 -- +-------------------+-------------------+-------------+-----------+-------------+-----------+-------------+---------------------+----------------+----------------------+
 -- | table_schema      | table_name        | column_name | data_type | column_type | is_signed | is_unsigned | max_value           | auto_increment | auto_increment_ratio |
 -- +-------------------+-------------------+-------------+-----------+-------------+-----------+-------------+---------------------+----------------+----------------------+
--- | test              | t1                | i           | tinyint   | tinyint(4)  |         1 |           0 |                 127 |             34 |               0.2677 |
--- | mem__advisor_text | template_meta     | hib_id      | int       | int(11)     |         1 |           0 |          2147483647 |            516 |               0.0000 |
--- | mem__advisors     | advisor_schedules | schedule_id | int       | int(11)     |         1 |           0 |          2147483647 |            249 |               0.0000 |
--- | mem__advisors     | app_identity_path | hib_id      | int       | int(11)     |         1 |           0 |          2147483647 |            251 |               0.0000 |
--- | mem__bean_config  | plists            | id          | bigint    | bigint(20)  |         1 |           0 | 9223372036854775807 |              1 |               0.0000 |
+-- | test              | t1                | i           | tinyint   | tinyint     |         1 |           0 |                 127 |             34 |               0.2677 |
+-- | mem__advisor_text | template_meta     | hib_id      | int       | int         |         1 |           0 |          2147483647 |            516 |               0.0000 |
+-- | mem__advisors     | advisor_schedules | schedule_id | int       | int         |         1 |           0 |          2147483647 |            249 |               0.0000 |
+-- | mem__advisors     | app_identity_path | hib_id      | int       | int         |         1 |           0 |          2147483647 |            251 |               0.0000 |
+-- | mem__bean_config  | plists            | id          | bigint    | bigint      |         1 |           0 | 9223372036854775807 |              1 |               0.0000 |
 -- +-------------------+-------------------+-------------+-----------+-------------+-----------+-------------+---------------------+----------------+----------------------+
 --
 

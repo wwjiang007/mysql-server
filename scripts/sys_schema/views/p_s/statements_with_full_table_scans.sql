@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -64,7 +64,7 @@ VIEW statements_with_full_table_scans (
 SELECT sys.format_statement(DIGEST_TEXT) AS query,
        SCHEMA_NAME as db,
        COUNT_STAR AS exec_count,
-       sys.format_time(SUM_TIMER_WAIT) AS total_latency,
+       format_pico_time(SUM_TIMER_WAIT) AS total_latency,
        SUM_NO_INDEX_USED AS no_index_used_count,
        SUM_NO_GOOD_INDEX_USED AS no_good_index_used_count,
        ROUND(IFNULL(SUM_NO_INDEX_USED / NULLIF(COUNT_STAR, 0), 0) * 100) AS no_index_used_pct,

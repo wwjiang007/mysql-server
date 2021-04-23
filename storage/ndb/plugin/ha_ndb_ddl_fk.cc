@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2011, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2011, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -30,12 +30,13 @@
 #include "sql/mysqld.h"  // global_system_variables table_alias_charset ...
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
-#include "sql/sql_table.h"
 #include "storage/ndb/plugin/ha_ndbcluster.h"
+#include "storage/ndb/plugin/ndb_dbname_guard.h"
 #include "storage/ndb/plugin/ndb_fk_util.h"
 #include "storage/ndb/plugin/ndb_log.h"
+#include "storage/ndb/plugin/ndb_schema_trans_guard.h"
 #include "storage/ndb/plugin/ndb_table_guard.h"
-#include "storage/ndb/plugin/ndb_tdc.h"
+#include "storage/ndb/plugin/ndb_thd.h"
 #include "template_utils.h"
 
 #define ERR_RETURN(err)              \
@@ -50,26 +51,6 @@ typedef NdbDictionary::Table NDBTAB;
 typedef NdbDictionary::Column NDBCOL;
 typedef NdbDictionary::Index NDBINDEX;
 typedef NdbDictionary::ForeignKey NDBFK;
-
-/*
-  Foreign key data where this table is child or parent or both.
-  Like indexes, these are cached under each handler instance.
-  Unlike indexes, no references to global dictionary are kept.
-*/
-
-struct Ndb_fk_item {
-  FOREIGN_KEY_INFO f_key_info;
-  int update_action;  // NDBFK::FkAction
-  int delete_action;
-  bool is_child;
-  bool is_parent;
-};
-
-struct Ndb_fk_data {
-  List<Ndb_fk_item> list;
-  uint cnt_child;
-  uint cnt_parent;
-};
 
 /*
   Create all the fks  for a table.
@@ -180,44 +161,14 @@ static const NDBINDEX *find_matching_index(
   return best_matching_index;  // NOTE: also returns reference
 }
 
-static void setDbName(Ndb *ndb, const char *name) {
-  if (name && strlen(name) != 0) {
-    ndb->setDatabaseName(name);
-  }
-}
-
-template <size_t buf_size>
-const char *lex2str(const LEX_CSTRING &str, char (&buf)[buf_size]) {
-  snprintf(buf, buf_size, "%.*s", (int)str.length, str.str);
-  return buf;
-}
-
-static void ndb_fk_casedn(char *name) {
-  DBUG_ASSERT(name != 0);
-  uint length = (uint)strlen(name);
-  DBUG_ASSERT(files_charset_info != 0 &&
-              files_charset_info->casedn_multiply == 1);
-  files_charset_info->cset->casedn(files_charset_info, name, length, name,
-                                   length);
-}
-
-static int ndb_fk_casecmp(const char *name1, const char *name2) {
-  if (!lower_case_table_names) {
-    return strcmp(name1, name2);
-  }
-  char tmp1[FN_LEN + 1];
-  char tmp2[FN_LEN + 1];
-  strcpy(tmp1, name1);
-  strcpy(tmp2, name2);
-  ndb_fk_casedn(tmp1);
-  ndb_fk_casedn(tmp2);
-  return strcmp(tmp1, tmp2);
+inline static int ndb_fk_casecmp(const char *name1, const char *name2) {
+  return my_strcasecmp(files_charset_info, name1, name2);
 }
 
 extern bool ndb_show_foreign_key_mock_tables(THD *thd);
 
 class Fk_util {
-  THD *m_thd;
+  THD *const m_thd;
 
   void info(const char *fmt, ...) const MY_ATTRIBUTE((format(printf, 2, 3)));
 
@@ -233,15 +184,16 @@ class Fk_util {
     dict->removeIndexGlobal(*index, 0);
   }
 
-  bool copy_fk_to_new_parent(NdbDictionary::Dictionary *dict,
-                             NdbDictionary::ForeignKey &fk,
+  bool copy_fk_to_new_parent(Ndb *ndb, NdbDictionary::ForeignKey &fk,
+                             const char *new_parent_db,
                              const char *new_parent_name,
                              const char *column_names[]) const {
     DBUG_TRACE;
     DBUG_PRINT("info", ("new_parent_name: %s", new_parent_name));
+    NdbDictionary::Dictionary *dict = ndb->getDictionary();
 
     // Load up the new parent table
-    Ndb_table_guard new_parent_tab(dict, new_parent_name);
+    Ndb_table_guard new_parent_tab(ndb, new_parent_db, new_parent_name);
     if (!new_parent_tab.get_table()) {
       error(dict, "Failed to load potentially new parent '%s'",
             new_parent_name);
@@ -332,17 +284,19 @@ class Fk_util {
     return true;
   }
 
-  void resolve_mock(NdbDictionary::Dictionary *dict,
-                    const char *new_parent_name, const char *mock_name) const {
+  /* Note! Both parent and mock are in same database */
+  void resolve_mock(Ndb *ndb, const char *db_name, const char *new_parent_name,
+                    const char *mock_name) const {
     DBUG_TRACE;
     DBUG_PRINT("enter", ("mock_name '%s'", mock_name));
-    DBUG_ASSERT(is_mock_name(mock_name));
+    assert(is_mock_name(mock_name));
+    NdbDictionary::Dictionary *dict = ndb->getDictionary();
 
     // Load up the mock table
-    Ndb_table_guard mock_tab(dict, mock_name);
+    Ndb_table_guard mock_tab(ndb, db_name, mock_name);
     if (!mock_tab.get_table()) {
       error(dict, "Failed to load the listed mock table '%s'", mock_name);
-      DBUG_ASSERT(false);
+      assert(false);
       return;
     }
 
@@ -392,7 +346,7 @@ class Fk_util {
         }
       }
 
-      if (!copy_fk_to_new_parent(dict, fk, new_parent_name, col_names))
+      if (!copy_fk_to_new_parent(ndb, fk, db_name, new_parent_name, col_names))
         continue;
 
       // New fk has been created between child and new parent, drop the mock
@@ -408,10 +362,15 @@ class Fk_util {
     return;
   }
 
-  bool create_mock_tables_and_drop(Ndb *ndb, NdbDictionary::Dictionary *dict,
+  bool create_mock_tables_and_drop(Ndb *ndb, const char *db_name,
                                    const NdbDictionary::Table *table) {
     DBUG_TRACE;
+    DBUG_PRINT("enter", ("db_name: %s", db_name));
     DBUG_PRINT("enter", ("table: %s", table->getName()));
+    NdbDictionary::Dictionary *dict = ndb->getDictionary();
+
+    // Function creates table in NDB, thus requires dbname to be set
+    assert(Ndb_dbname_guard::check_dbname(ndb, db_name));
 
     /*
       List all foreign keys referencing the table to be dropped
@@ -436,7 +395,7 @@ class Fk_util {
       NdbDictionary::ForeignKey fk;
       if (dict->getForeignKey(fk, element.name) != 0) {
         // Could not find the listed fk
-        DBUG_ASSERT(false);
+        assert(false);
         continue;
       }
 
@@ -446,7 +405,7 @@ class Fk_util {
       const char *parent_name =
           fk_split_name(parent_db_and_name, fk.getParentTable());
 
-      if (strcmp(parent_db_and_name, ndb->getDatabaseName()) != 0 ||
+      if (strcmp(parent_db_and_name, db_name) != 0 ||
           strcmp(parent_name, table->getName()) != 0) {
         DBUG_PRINT("info", ("fk is not parent, skip"));
         continue;
@@ -457,11 +416,9 @@ class Fk_util {
       const char *child_name =
           fk_split_name(child_db_and_name, fk.getChildTable());
 
-      // Open child table
-      Ndb_db_guard db_guard(ndb);
-      setDbName(ndb, child_db_and_name);
-      Ndb_table_guard child_tab(dict, child_name);
-      if (child_tab.get_table() == 0) {
+      // Open child table and check it contains all columns referenced by fk
+      Ndb_table_guard child_tab(ndb, child_db_and_name, child_name);
+      if (child_tab.get_table() == nullptr) {
         error(dict, "Failed to open child table '%s'", child_name);
         return false;
       }
@@ -505,17 +462,16 @@ class Fk_util {
           continue;
         }
       }
-      db_guard.restore();  // restore db
 
       // Create new mock
       if (!create(dict, mock_name, child_name, col_names, col_types)) {
         error(dict, "Failed to create mock parent table '%s", mock_name);
-        DBUG_ASSERT(false);
+        assert(false);
         return false;
       }
 
       // Recreate fks to point at new mock
-      if (!copy_fk_to_new_parent(dict, fk, mock_name, col_names)) {
+      if (!copy_fk_to_new_parent(ndb, fk, db_name, mock_name, col_names)) {
         return false;
       }
 
@@ -533,8 +489,42 @@ class Fk_util {
     return true;
   }
 
+  /**
+    @brief Check if the given foreign key name was generated by the server.
+
+    @param table_name  Table name on which the foreign key exists
+    @param fk_name     The foreign key name
+    @return true if the given name is a generated name. false otherwise.
+   */
+  bool is_generated_foreign_key_name(const std::string &table_name,
+                                     const std::string &fk_name) {
+    // MySQL Server versions 8.0.18 and above generate
+    // FK names in the form <table_name>_fk_<generated_number>.
+    // Check if the given FK name is a generated one.
+    DBUG_TRACE;
+    std::string generated_fk_name_prefix(table_name);
+    generated_fk_name_prefix.append("_fk_");
+    // If the fk_name starts with generated_fk_name_prefix and ends with a
+    // number, then it is a generated name.
+    return (fk_name.compare(0, generated_fk_name_prefix.length(),
+                            generated_fk_name_prefix) == 0 &&
+            fk_name.substr(generated_fk_name_prefix.length())
+                    .find_first_not_of("0123456789") == std::string::npos);
+  }
+
  public:
   Fk_util(THD *thd) : m_thd(thd) {}
+
+  static inline int create_failed(const char *fk_name,
+                                  const NdbError &ndb_error) {
+    if (ndb_error.code == 721) {
+      /* An FK constraint with same name exists */
+      my_error(ER_FK_DUP_NAME, MYF(0), fk_name);
+      return ER_FK_DUP_NAME;
+    } else {
+      return ndb_to_mysql_error(&ndb_error);
+    }
+  }
 
   static bool split_mock_name(const char *name, unsigned *child_id_ptr = NULL,
                               unsigned *child_index_ptr = NULL,
@@ -614,7 +604,7 @@ class Fk_util {
 
     DBUG_TRACE;
     DBUG_PRINT("enter", ("mock_name: %s", mock_name));
-    DBUG_ASSERT(is_mock_name(mock_name));
+    assert(is_mock_name(mock_name));
 
     if (mock_tab.setName(mock_name)) {
       return false;
@@ -628,14 +618,14 @@ class Fk_util {
       const char *col_name = col_names[i];
       DBUG_PRINT("info", ("name: %s", col_name));
       if (mock_col.setName(col_name)) {
-        DBUG_ASSERT(false);
+        assert(false);
         return false;
       }
 
       const NDBCOL *col = col_types[i];
       if (!col) {
         // Internal error, the two lists should be same size
-        DBUG_ASSERT(col);
+        assert(col);
         return false;
       }
 
@@ -685,7 +675,7 @@ class Fk_util {
       NdbDictionary::ForeignKey fk;
       if (dict->getForeignKey(fk, element.name) != 0) {
         // Could not find the listed fk
-        DBUG_ASSERT(false);
+        assert(false);
         continue;
       }
 
@@ -707,28 +697,26 @@ class Fk_util {
       DBUG_PRINT("info", ("drop table: '%s'", full_name));
       char db_name[FN_LEN + 1];
       const char *table_name = fk_split_name(db_name, full_name);
-      Ndb_db_guard db_guard(ndb);
-      setDbName(ndb, db_name);
-      Ndb_table_guard mocktab_g(dict, table_name);
+      Ndb_table_guard mocktab_g(ndb, db_name, table_name);
       if (!mocktab_g.get_table()) {
         // Could not open the mock table
         DBUG_PRINT("error",
                    ("Could not open the listed mock table, ignore it"));
-        DBUG_ASSERT(false);
+        assert(false);
         continue;
       }
 
       if (dict->dropTableGlobal(*mocktab_g.get_table()) != 0) {
         DBUG_PRINT("error", ("Failed to drop the mock table '%s'",
                              mocktab_g.get_table()->getName()));
-        DBUG_ASSERT(false);
+        assert(false);
         continue;
       }
       info("Dropped mock table '%s' - referencing table dropped", table_name);
     }
   }
 
-  bool drop(Ndb *ndb, NdbDictionary::Dictionary *dict,
+  bool drop(Ndb *ndb, NdbDictionary::Dictionary *dict, const char *db_name,
             const NdbDictionary::Table *table) {
     DBUG_TRACE;
 
@@ -739,7 +727,7 @@ class Fk_util {
     }
 
     bool result = true;
-    if (!create_mock_tables_and_drop(ndb, dict, table)) {
+    if (!create_mock_tables_and_drop(ndb, db_name, table)) {
       // Operation failed, set flag to abort when ending trans
       result = false;
     }
@@ -778,7 +766,7 @@ class Fk_util {
     NdbDictionary::ForeignKey fk;
     if (dict->getForeignKey(fk, fk_name) != 0) {
       error(dict, "Could not find fk '%s'", fk_name);
-      DBUG_ASSERT(false);
+      assert(false);
       return false;
     }
 
@@ -788,14 +776,12 @@ class Fk_util {
     if (Fk_util::is_mock_name(parent_name)) {
       // Fk is referencing a mock table, drop the table
       // and the constraint at the same time
-      Ndb_db_guard db_guard(ndb);
-      setDbName(ndb, parent_db_and_name);
-      Ndb_table_guard mocktab_g(dict, parent_name);
+      Ndb_table_guard mocktab_g(ndb, parent_db_and_name, parent_name);
       if (mocktab_g.get_table()) {
         const int drop_flags = NDBDICT::DropTableCascadeConstraints;
         if (dict->dropTableGlobal(*mocktab_g.get_table(), drop_flags) != 0) {
           error(dict, "Failed to drop fk mock table '%s'", parent_name);
-          DBUG_ASSERT(false);
+          assert(false);
           return false;
         }
         // table and fk dropped
@@ -803,7 +789,7 @@ class Fk_util {
       } else {
         warn("Could not open the fk mock table '%s', ignoring it...",
              parent_name);
-        DBUG_ASSERT(false);
+        assert(false);
         // fallthrough and try to drop only the fk,
       }
     }
@@ -815,8 +801,7 @@ class Fk_util {
     return true;
   }
 
-  void resolve_mock_tables(NdbDictionary::Dictionary *dict,
-                           const char *new_parent_db,
+  void resolve_mock_tables(Ndb *ndb, const char *new_parent_db,
                            const char *new_parent_name) const {
     DBUG_TRACE;
     DBUG_PRINT("enter", ("new_parent_db: %s, new_parent_name: %s",
@@ -826,10 +811,11 @@ class Fk_util {
       List all tables in NDB and look for mock tables which could
       potentially be resolved to the new table
     */
+    const NdbDictionary::Dictionary *dict = ndb->getDictionary();
     NdbDictionary::Dictionary::List table_list;
     if (dict->listObjects(table_list, NdbDictionary::Object::UserTable, true) !=
         0) {
-      DBUG_ASSERT(false);
+      assert(false);
       return;
     }
 
@@ -837,7 +823,7 @@ class Fk_util {
       const NdbDictionary::Dictionary::List::Element &el =
           table_list.elements[i];
 
-      DBUG_ASSERT(el.type == NdbDictionary::Object::UserTable);
+      assert(el.type == NdbDictionary::Object::UserTable);
 
       // Check if table is in same database as the potential new parent
       if (strcmp(new_parent_db, el.database) != 0) {
@@ -857,52 +843,10 @@ class Fk_util {
         continue;
       }
 
-      resolve_mock(dict, new_parent_name, el.name);
+      resolve_mock(ndb, new_parent_db, new_parent_name, el.name);
     }
 
     return;
-  }
-
-  bool truncate_allowed(NdbDictionary::Dictionary *dict, const char *db,
-                        const NdbDictionary::Table *table, bool &allow) const {
-    DBUG_TRACE;
-
-    NdbDictionary::Dictionary::List list;
-    if (dict->listDependentObjects(list, *table) != 0) {
-      error(dict, "Failed to list dependent objects for table '%s'",
-            table->getName());
-      return false;
-    }
-    allow = true;
-    for (unsigned i = 0; i < list.count; i++) {
-      const NdbDictionary::Dictionary::List::Element &element =
-          list.elements[i];
-      if (element.type != NdbDictionary::Object::ForeignKey) continue;
-
-      DBUG_PRINT("info", ("fk: %s", element.name));
-
-      NdbDictionary::ForeignKey fk;
-      if (dict->getForeignKey(fk, element.name) != 0) {
-        error(dict, "Could not find the listed fk '%s'", element.name);
-        DBUG_ASSERT(false);
-        continue;
-      }
-
-      // Refuse if table is parent of fk
-      char parent_db_and_name[FN_LEN + 1];
-      const char *parent_name =
-          fk_split_name(parent_db_and_name, fk.getParentTable());
-      if (strcmp(db, parent_db_and_name) != 0 ||
-          strcmp(parent_name, table->getName()) != 0) {
-        // Not parent of the fk, skip
-        continue;
-      }
-
-      allow = false;
-      break;
-    }
-    DBUG_PRINT("exit", ("allow: %u", allow));
-    return true;
   }
 
   /**
@@ -910,7 +854,6 @@ class Fk_util {
     This can be called either by ha_ndbcluster::get_error_message
     or ha_ndbcluster:get_foreign_key_create_info.
 
-    @param    thd               Current thread.
     @param    ndb               Pointer to the Ndb Object
     @param    fk                The foreign key object whose info
                                 has to be printed.
@@ -918,9 +861,6 @@ class Fk_util {
                                 table with this table id, is the child table of
                                 the passed fk. This is > 0 only if the caller is
                                 ha_ndbcluster:get_foreign_key_create_info().
-    @param    print_mock_table_names
-                                If true, mock tables names are printed rather
-                                than the real parent names.
     @param    fk_string         String in which the fk info is to be printed.
 
     @retval   true              on success
@@ -928,61 +868,45 @@ class Fk_util {
   */
   bool generate_fk_constraint_string(Ndb *ndb,
                                      const NdbDictionary::ForeignKey &fk,
-                                     const int tab_id,
-                                     const bool print_mock_table_names,
-                                     String &fk_string) {
+                                     const int tab_id, String &fk_string) {
     DBUG_TRACE;
-
-    const NDBTAB *parenttab = 0;
-    const NDBTAB *childtab = 0;
-    NDBDICT *dict = ndb->getDictionary();
-    Ndb_db_guard db_guard(ndb);
 
     /* The function generates fk constraint strings for
      * showing fk info in error and in show create table.
      * child_tab_id is non zero only for generating show create info */
     bool generating_for_show_create = (tab_id != 0);
 
-    /* Fetch parent db and name and load it */
-    Ndb_table_guard parent_table_guard(dict);
+    /* Split parent name and load table */
     char parent_db_and_name[FN_LEN + 1];
-    {
-      const char *name = fk_split_name(parent_db_and_name, fk.getParentTable());
-      setDbName(ndb, parent_db_and_name);
-      parent_table_guard.init(name);
-      parenttab = parent_table_guard.get_table();
-      if (parenttab == 0) {
-        NdbError err = dict->getNdbError();
-        warn("Unable to load parent table : error %d, %s", err.code,
-             err.message);
-        return false;
-      }
+    const char *parent_name =
+        fk_split_name(parent_db_and_name, fk.getParentTable());
+    Ndb_table_guard parent_table_guard(ndb, parent_db_and_name, parent_name);
+    const NdbDictionary::Table *parenttab = parent_table_guard.get_table();
+    if (parenttab == nullptr) {
+      const NdbError &err = parent_table_guard.getNdbError();
+      warn("Unable to load parent table : error %d, %s", err.code, err.message);
+      return false;
     }
 
-    /* Fetch child db and name and load it */
-    Ndb_table_guard child_table_guard(dict);
+    /* Split child name and load table */
     char child_db_and_name[FN_LEN + 1];
-    {
-      const char *name = fk_split_name(child_db_and_name, fk.getChildTable());
-      setDbName(ndb, child_db_and_name);
-      child_table_guard.init(name);
-      childtab = child_table_guard.get_table();
-      if (childtab == 0) {
-        NdbError err = dict->getNdbError();
-        err = dict->getNdbError();
-        warn("Unable to load child table : error %d, %s", err.code,
-             err.message);
-        return false;
-      }
+    const char *child_name =
+        fk_split_name(child_db_and_name, fk.getChildTable());
+    Ndb_table_guard child_table_guard(ndb, child_db_and_name, child_name);
+    const NdbDictionary::Table *childtab = child_table_guard.get_table();
+    if (childtab == nullptr) {
+      const NdbError &err = child_table_guard.getNdbError();
+      warn("Unable to load child table : error %d, %s", err.code, err.message);
+      return false;
+    }
 
-      if (!generating_for_show_create) {
-        /* Print child table name if printing error */
-        fk_string.append("`");
-        fk_string.append(child_db_and_name);
-        fk_string.append("`.`");
-        fk_string.append(name);
-        fk_string.append("`, ");
-      }
+    if (!generating_for_show_create) {
+      /* Print child table name if printing error */
+      fk_string.append("`");
+      fk_string.append(child_db_and_name);
+      fk_string.append("`.`");
+      fk_string.append(child_name);
+      fk_string.append("`, ");
     }
 
     if (generating_for_show_create) {
@@ -1026,8 +950,7 @@ class Fk_util {
       fk_string.append("`.`");
     }
     const char *real_parent_name;
-    if (!print_mock_table_names &&
-        Fk_util::split_mock_name(parenttab->getName(), NULL, NULL,
+    if (Fk_util::split_mock_name(parenttab->getName(), NULL, NULL,
                                  &real_parent_name)) {
       /* print the real table name */
       DBUG_PRINT("info", ("real_parent_name: %s", real_parent_name));
@@ -1088,6 +1011,91 @@ class Fk_util {
     }
 
     return true;
+  }
+
+  /**
+     @brief Rename foreign keys with generated names when child is renamed
+
+     @param dict            The NDB Dictionary object
+     @param renamed_table   The newly renamed NDB table object
+     @param old_table_name  Old table name
+     @param new_db_name     New database name
+     @param new_table_name  New table name
+     @return On success 0, or error code on failure
+   */
+  int rename_foreign_keys(NdbDictionary::Dictionary *dict,
+                          const NdbDictionary::Table *renamed_table,
+                          const std::string &old_table_name,
+                          const std::string &new_db_name,
+                          const std::string &new_table_name) {
+    DBUG_TRACE;
+    // Loop all foreign keys and rename them if required
+    std::vector<NdbDictionary::ForeignKey> fk_list;
+    if (!retrieve_foreign_key_list_from_ndb(dict, renamed_table, &fk_list)) {
+      ERR_RETURN(dict->getNdbError());
+    }
+
+    if (fk_list.empty()) {
+      // Nothing to do
+      return 0;
+    }
+
+    // Start a schema transaction
+    Ndb_schema_trans_guard schema_trans(get_thd_ndb(m_thd), dict);
+    if (!schema_trans.begin_trans()) {
+      return ER_INTERNAL_ERROR;
+    }
+
+    for (const NdbDictionary::ForeignKey &fk : fk_list) {
+      char child_db_and_name[FN_LEN + 1];
+      const char *child_name =
+          fk_split_name(child_db_and_name, fk.getChildTable());
+      if (new_db_name.compare(child_db_and_name) != 0 ||
+          new_table_name.compare(child_name) != 0) {
+        // The table being renamed is just a parent of this FK.
+        // Skip renaming FK
+        continue;
+      }
+
+      std::string fk_name;
+      {
+        char fk_full_name[FN_LEN + 1];
+        fk_name.assign(fk_split_name(fk_full_name, fk.getName()));
+      }
+
+      if (!is_generated_foreign_key_name(old_table_name, fk_name)) {
+        // Not a generated FK name. No need to rename
+        continue;
+      }
+
+      // Rename FK name
+      fk_name.replace(0, old_table_name.length(), new_table_name);
+      NdbDictionary::ForeignKey renamed_fk(fk);
+      renamed_fk.setName(fk_name.c_str());
+
+      // Create new fk referencing the new table
+      DBUG_PRINT("info", ("Create new fk: %s", renamed_fk.getName()));
+      int flags = 0;
+      if (thd_test_options(m_thd, OPTION_NO_FOREIGN_KEY_CHECKS)) {
+        flags |= NdbDictionary::Dictionary::CreateFK_NoVerify;
+      }
+      NdbDictionary::ObjectId objid;
+      if (dict->createForeignKey(renamed_fk, &objid, flags) != 0) {
+        return create_failed(fk_name.c_str(), dict->getNdbError());
+      }
+
+      // Drop old FK
+      DBUG_PRINT("info", ("Dropping fk: %s", fk.getName()));
+      if (dict->dropForeignKey(fk) != 0) {
+        ERR_RETURN(dict->getNdbError());
+      }
+    }
+
+    if (!schema_trans.commit_trans()) {
+      return ER_INTERNAL_ERROR;
+    }
+
+    return 0;
   }
 };
 
@@ -1153,64 +1161,39 @@ void ndb_fk_util_drop_list(THD *thd, Ndb *ndb, NdbDictionary::Dictionary *dict,
   fk_util.drop_mock_list(ndb, dict, drop_list);
 }
 
-bool ndb_fk_util_drop_table(THD *thd, Ndb *ndb, NdbDictionary::Dictionary *dict,
+bool ndb_fk_util_drop_table(THD *thd, Ndb *ndb, const char *db_name,
                             const NdbDictionary::Table *table) {
   Fk_util fk_util(thd);
-  return fk_util.drop(ndb, dict, table);
+  return fk_util.drop(ndb, ndb->getDictionary(), db_name, table);
 }
 
 bool ndb_fk_util_is_mock_name(const char *table_name) {
   return Fk_util::is_mock_name(table_name);
 }
 
-void ndb_fk_util_resolve_mock_tables(THD *thd, NdbDictionary::Dictionary *dict,
+void ndb_fk_util_resolve_mock_tables(THD *thd, Ndb *ndb,
                                      const char *new_parent_db,
                                      const char *new_parent_name) {
   Fk_util fk_util(thd);
-  fk_util.resolve_mock_tables(dict, new_parent_db, new_parent_name);
-}
-
-bool ndb_fk_util_truncate_allowed(THD *thd, NdbDictionary::Dictionary *dict,
-                                  const char *db,
-                                  const NdbDictionary::Table *table,
-                                  bool &allowed) {
-  Fk_util fk_util(thd);
-  if (!fk_util.truncate_allowed(dict, db, table, allowed)) return false;
-  return true;
+  fk_util.resolve_mock_tables(ndb, new_parent_db, new_parent_name);
 }
 
 bool ndb_fk_util_generate_constraint_string(THD *thd, Ndb *ndb,
                                             const NdbDictionary::ForeignKey &fk,
                                             const int tab_id,
-                                            const bool print_mock_table_names,
                                             String &fk_string) {
   Fk_util fk_util(thd);
-  return fk_util.generate_fk_constraint_string(
-      ndb, fk, tab_id, print_mock_table_names, fk_string);
+  return fk_util.generate_fk_constraint_string(ndb, fk, tab_id, fk_string);
 }
 
-/**
-  @brief Flush the parent table after a successful addition/deletion
-         to the Foreign Key. This is done to force reload the Parent
-         table's metadata.
-
-  @param thd            thread handle
-  @param parent_db      Parent table's database name
-  @param parent_name    Parent table's name
-  @return Void
-*/
-static void flush_parent_table_for_fk(THD *thd, const char *parent_db,
-                                      const char *parent_name) {
-  DBUG_TRACE;
-
-  if (Fk_util::is_mock_name(parent_name)) {
-    /* Parent table is mock - no need to flush */
-    DBUG_PRINT("debug", ("Parent table is a mock - skipped flushing"));
-    return;
-  }
-
-  DBUG_PRINT("debug", ("Flushing table : `%s`.`%s` ", parent_db, parent_name));
-  ndb_tdc_close_cached_table(thd, parent_db, parent_name);
+int ndb_fk_util_rename_foreign_keys(THD *thd, NdbDictionary::Dictionary *dict,
+                                    const NdbDictionary::Table *renamed_table,
+                                    const std::string &old_table_name,
+                                    const std::string &new_db_name,
+                                    const std::string &new_table_name) {
+  Fk_util fk_util(thd);
+  return fk_util.rename_foreign_keys(dict, renamed_table, old_table_name,
+                                     new_db_name, new_table_name);
 }
 
 /*
@@ -1239,8 +1222,12 @@ class Ndb_index_release_guard {
   }
 };
 
-int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
+int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb, const char *dbname,
+                              const char *tabname) {
   DBUG_TRACE;
+
+  // Calls functions which require dbname
+  assert(Ndb_dbname_guard::check_dbname(ndb, dbname));
 
   NdbDictionary::Dictionary *dict = ndb->getDictionary();
   // Releaser for child(i.e the table being created/altered) which
@@ -1260,9 +1247,9 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
     const Foreign_key_spec *fk = down_cast<const Foreign_key_spec *>(key);
 
     // Open the table to create foreign keys for
-    Ndb_table_guard child_tab(dict, m_tabname);
-    if (child_tab.get_table() == 0) {
-      ERR_RETURN(dict->getNdbError());
+    Ndb_table_guard child_tab(ndb, dbname, tabname);
+    if (child_tab.get_table() == nullptr) {
+      ERR_RETURN(child_tab.getNdbError());
     }
 
     /**
@@ -1311,8 +1298,6 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
       return err_default;
     }
 
-    Ndb_db_guard db_guard(ndb);  // save db
-
     char parent_db[FN_REFLEN];
     char parent_name[FN_REFLEN];
     /*
@@ -1324,8 +1309,7 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
                fk->ref_db.str);
     } else {
       /* parent db missing - so the db is same as child's */
-      snprintf(parent_db, sizeof(parent_db), "%*s", (int)sizeof(m_dbname),
-               m_dbname);
+      snprintf(parent_db, sizeof(parent_db), "%s", dbname);
     }
     if (fk->ref_table.str != 0 && fk->ref_table.length != 0) {
       snprintf(parent_name, sizeof(parent_name), "%*s",
@@ -1333,15 +1317,14 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
     } else {
       parent_name[0] = 0;
     }
-    if (lower_case_table_names) {
-      ndb_fk_casedn(parent_db);
-      ndb_fk_casedn(parent_name);
-    }
-    setDbName(ndb, parent_db);
-    Ndb_table_guard parent_tab(dict, parent_name);
+
+    // Switch to parent database, since a mock table might be created
+    const Ndb_dbname_guard dbname_guard(ndb, parent_db);
+
+    Ndb_table_guard parent_tab(ndb, parent_db, parent_name);
     if (parent_tab.get_table() == 0) {
       if (!thd_test_options(thd, OPTION_NO_FOREIGN_KEY_CHECKS)) {
-        const NdbError &error = dict->getNdbError();
+        const NdbError &error = parent_tab.getNdbError();
         push_warning_printf(thd, Sql_condition::SL_WARNING,
                             ER_CANNOT_ADD_FOREIGN,
                             "Parent table %s not found in NDB: %d: %s",
@@ -1369,7 +1352,7 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
             "Failed to create mock parent table, too long mock name");
         return err_default;
       }
-      if (!fk_util.create(dict, mock_name, m_tabname, fk->ref_columns,
+      if (!fk_util.create(dict, mock_name, tabname, fk->ref_columns,
                           childcols)) {
         const NdbError &error = dict->getNdbError();
         push_warning_printf(thd, Sql_condition::SL_WARNING,
@@ -1379,15 +1362,16 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
         return err_default;
       }
 
-      parent_tab.init(mock_name);
+      parent_tab.init(parent_db, /* mock table is always in same db */
+                      mock_name);
       parent_tab.invalidate();  // invalidate mock table when releasing
-      if (parent_tab.get_table() == 0) {
+      if (parent_tab.get_table() == nullptr) {
         push_warning_printf(
             thd, Sql_condition::SL_WARNING, ER_CANNOT_ADD_FOREIGN,
             "INTERNAL ERROR: Could not find created mock table '%s'",
             mock_name);
         // Internal error, should be able to load the just created mock table
-        DBUG_ASSERT(parent_tab.get_table());
+        assert(parent_tab.get_table());
         return err_default;
       }
     }
@@ -1417,8 +1401,6 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
       parent_index_releaser.add_index_to_release(parent_index);
     }
 
-    db_guard.restore();  // restore db
-
     if (!parent_primary_key && parent_index == 0) {
       my_error(ER_FK_NO_INDEX_PARENT, MYF(0), fk->name.str ? fk->name.str : "",
                parent_tab.get_table()->getName());
@@ -1433,7 +1415,7 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
       for (unsigned i = 0; parentcols[i] != 0; i++) {
         if (parentcols[i]->isBindable(*childcols[i]) == -1) {
           // Should never happen thanks to SQL-layer doing compatibility check.
-          DBUG_ASSERT(0);
+          assert(0);
           push_warning_printf(
               thd, Sql_condition::SL_WARNING, ER_CANNOT_ADD_FOREIGN,
               "Parent column %s.%s is incompatible with child column %s.%s in "
@@ -1445,20 +1427,16 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
       }
     }
 
-    NdbDictionary::ForeignKey ndbfk;
-    char fk_name[FN_REFLEN];
-
     /*
       In 8.0 we rely on SQL-layer to always provide foreign key name, either
-      by using the name provided by the user, or by generating an unique name.
-      In either case, the name has already been prepared at this point.
+      by using the name provided by the user, or by generating a unique name.
+      In either case, the name has already been prepared at this point, just
+      convert the potentially unterminated string to zero terminated.
     */
-    DBUG_ASSERT(fk->name.str && fk->name.length);
+    const std::string fk_name(fk->name.str, fk->name.length);
 
-    lex2str(fk->name, fk_name);
-    if (lower_case_table_names) ndb_fk_casedn(fk_name);
-
-    ndbfk.setName(fk_name);
+    NdbDictionary::ForeignKey ndbfk;
+    ndbfk.setName(fk_name.c_str());
     ndbfk.setParent(*parent_tab.get_table(), parent_index, parentcols);
     ndbfk.setChild(*child_tab.get_table(), child_index, childcols);
 
@@ -1513,657 +1491,198 @@ int ha_ndbcluster::create_fks(THD *thd, Ndb *ndb) {
     NdbDictionary::ObjectId objid;
     const int err = dict->createForeignKey(ndbfk, &objid, flags);
     if (err) {
-      const NdbError err = dict->getNdbError();
-      if (err.code == 721) {
-        /* An FK constraint with same name exists */
-        my_error(ER_FK_DUP_NAME, MYF(0), ndbfk.getName());
-        return err_default;
-      } else {
-        /* Return the error returned by dict */
-        ERR_RETURN(err);
-      }
-    }
-
-    /* Flush the parent table out if parent is different from child */
-    if (parent_tab.get_table()->getObjectId() !=
-        child_tab.get_table()->getObjectId()) {
-      /* flush parent table */
-      flush_parent_table_for_fk(thd, parent_db, parent_name);
+      return Fk_util::create_failed(ndbfk.getName(), dict->getNdbError());
     }
   }
 
-  ndb_fk_util_resolve_mock_tables(thd, ndb->getDictionary(), m_dbname,
-                                  m_tabname);
+  ndb_fk_util_resolve_mock_tables(thd, ndb, dbname, tabname);
 
   return 0;
-}
-
-uint ha_ndbcluster::referenced_by_foreign_key() {
-  DBUG_TRACE;
-
-  Ndb_fk_data *data = m_fk_data;
-  if (data == 0) {
-    DBUG_ASSERT(false);
-    return 0;
-  }
-
-  DBUG_PRINT("info", ("count FKs total %u child %u parent %u",
-                      data->list.elements, data->cnt_child, data->cnt_parent));
-  return data->cnt_parent != 0;
-}
-
-struct Ndb_mem_root_guard {
-  Ndb_mem_root_guard(MEM_ROOT *new_root) {
-    root_ptr = THR_MALLOC;
-    DBUG_ASSERT(root_ptr != 0);
-    old_root = *root_ptr;
-    *root_ptr = new_root;
-  }
-  ~Ndb_mem_root_guard() { *root_ptr = old_root; }
-
- private:
-  MEM_ROOT **root_ptr;
-  MEM_ROOT *old_root;
-};
-
-int ha_ndbcluster::get_fk_data(THD *thd, Ndb *ndb) {
-  DBUG_TRACE;
-
-  MEM_ROOT *mem_root = &m_fk_mem_root;
-  Ndb_mem_root_guard mem_root_guard(mem_root);
-
-  free_root(mem_root, 0);
-  m_fk_data = 0;
-  init_alloc_root(PSI_INSTRUMENT_ME, mem_root, fk_root_block_size, 0);
-
-  NdbError err_OOM;
-  err_OOM.code = 4000;  // should we check OOM errors at all?
-  NdbError err_API;
-  err_API.code = 4011;  // API internal should not happen
-
-  Ndb_fk_data *data = new (mem_root) Ndb_fk_data;
-  if (data == 0) ERR_RETURN(err_OOM);
-  data->cnt_child = 0;
-  data->cnt_parent = 0;
-
-  DBUG_PRINT("info", ("%s.%s: list dependent objects", m_dbname, m_tabname));
-  int res;
-  NDBDICT *dict = ndb->getDictionary();
-  NDBDICT::List obj_list;
-  res = dict->listDependentObjects(obj_list, *m_table);
-  if (res != 0) ERR_RETURN(dict->getNdbError());
-  DBUG_PRINT("info", ("found %u dependent objects", obj_list.count));
-
-  for (unsigned i = 0; i < obj_list.count; i++) {
-    const NDBDICT::List::Element &e = obj_list.elements[i];
-    if (obj_list.elements[i].type != NdbDictionary::Object::ForeignKey) {
-      DBUG_PRINT("info", ("skip non-FK %s type %d", e.name, e.type));
-      continue;
-    }
-    DBUG_PRINT("info", ("found FK %s", e.name));
-
-    NdbDictionary::ForeignKey fk;
-    res = dict->getForeignKey(fk, e.name);
-    if (res != 0) ERR_RETURN(dict->getNdbError());
-
-    Ndb_fk_item *item = new (mem_root) Ndb_fk_item;
-    if (item == 0) ERR_RETURN(err_OOM);
-    FOREIGN_KEY_INFO &f_key_info = item->f_key_info;
-
-    {
-      char fk_full_name[FN_LEN + 1];
-      const char *name = fk_split_name(fk_full_name, fk.getName());
-      f_key_info.foreign_id =
-          thd_make_lex_string(thd, 0, name, (uint)strlen(name), 1);
-    }
-
-    {
-      char child_db_and_name[FN_LEN + 1];
-      const char *child_name =
-          fk_split_name(child_db_and_name, fk.getChildTable());
-
-      /* Dependent (child) database name */
-      f_key_info.foreign_db = thd_make_lex_string(
-          thd, 0, child_db_and_name, (uint)strlen(child_db_and_name), 1);
-      /* Dependent (child) table name */
-      f_key_info.foreign_table =
-          thd_make_lex_string(thd, 0, child_name, (uint)strlen(child_name), 1);
-
-      Ndb_db_guard db_guard(ndb);
-      setDbName(ndb, child_db_and_name);
-      Ndb_table_guard child_tab(dict, child_name);
-      if (child_tab.get_table() == 0) {
-        DBUG_ASSERT(false);
-        ERR_RETURN(dict->getNdbError());
-      }
-
-      for (unsigned i = 0; i < fk.getChildColumnCount(); i++) {
-        const NdbDictionary::Column *col =
-            child_tab.get_table()->getColumn(fk.getChildColumnNo(i));
-        if (col == 0) ERR_RETURN(err_API);
-        LEX_STRING *name = thd_make_lex_string(thd, 0, col->getName(),
-                                               (uint)strlen(col->getName()), 1);
-        f_key_info.foreign_fields.push_back(name);
-      }
-    }
-
-    {
-      char parent_db_and_name[FN_LEN + 1];
-      const char *parent_name =
-          fk_split_name(parent_db_and_name, fk.getParentTable());
-
-      /* Referenced (parent) database name */
-      f_key_info.referenced_db = thd_make_lex_string(
-          thd, 0, parent_db_and_name, (uint)strlen(parent_db_and_name), 1);
-      /* Referenced (parent) table name */
-      f_key_info.referenced_table = thd_make_lex_string(
-          thd, 0, parent_name, (uint)strlen(parent_name), 1);
-
-      Ndb_db_guard db_guard(ndb);
-      setDbName(ndb, parent_db_and_name);
-      Ndb_table_guard parent_tab(dict, parent_name);
-      if (parent_tab.get_table() == 0) {
-        DBUG_ASSERT(false);
-        ERR_RETURN(dict->getNdbError());
-      }
-
-      for (unsigned i = 0; i < fk.getParentColumnCount(); i++) {
-        const NdbDictionary::Column *col =
-            parent_tab.get_table()->getColumn(fk.getParentColumnNo(i));
-        if (col == 0) ERR_RETURN(err_API);
-        LEX_STRING *name = thd_make_lex_string(thd, 0, col->getName(),
-                                               (uint)strlen(col->getName()), 1);
-        f_key_info.referenced_fields.push_back(name);
-      }
-    }
-
-    {
-      const char *update_method = "";
-      switch (item->update_action = fk.getOnUpdateAction()) {
-        case NdbDictionary::ForeignKey::NoAction:
-          update_method = "NO ACTION";
-          break;
-        case NdbDictionary::ForeignKey::Restrict:
-          update_method = "RESTRICT";
-          break;
-        case NdbDictionary::ForeignKey::Cascade:
-          update_method = "CASCADE";
-          break;
-        case NdbDictionary::ForeignKey::SetNull:
-          update_method = "SET NULL";
-          break;
-        case NdbDictionary::ForeignKey::SetDefault:
-          update_method = "SET DEFAULT";
-          break;
-      }
-      f_key_info.update_method = thd_make_lex_string(
-          thd, 0, update_method, (uint)strlen(update_method), 1);
-    }
-
-    {
-      const char *delete_method = "";
-      switch (item->delete_action = fk.getOnDeleteAction()) {
-        case NdbDictionary::ForeignKey::NoAction:
-          delete_method = "NO ACTION";
-          break;
-        case NdbDictionary::ForeignKey::Restrict:
-          delete_method = "RESTRICT";
-          break;
-        case NdbDictionary::ForeignKey::Cascade:
-          delete_method = "CASCADE";
-          break;
-        case NdbDictionary::ForeignKey::SetNull:
-          delete_method = "SET NULL";
-          break;
-        case NdbDictionary::ForeignKey::SetDefault:
-          delete_method = "SET DEFAULT";
-          break;
-      }
-      f_key_info.delete_method = thd_make_lex_string(
-          thd, 0, delete_method, (uint)strlen(delete_method), 1);
-    }
-
-    if (fk.getParentIndex() != 0) {
-      // sys/def/10/xb1$unique
-      char db_and_name[FN_LEN + 1];
-      const char *name = fk_split_name(db_and_name, fk.getParentIndex(), true);
-      f_key_info.referenced_key_name =
-          thd_make_lex_string(thd, 0, name, (uint)strlen(name), 1);
-    } else {
-      const char *name = "PRIMARY";
-      f_key_info.referenced_key_name =
-          thd_make_lex_string(thd, 0, name, (uint)strlen(name), 1);
-    }
-
-    item->is_child = strcmp(m_dbname, f_key_info.foreign_db->str) == 0 &&
-                     strcmp(m_tabname, f_key_info.foreign_table->str) == 0;
-
-    item->is_parent = strcmp(m_dbname, f_key_info.referenced_db->str) == 0 &&
-                      strcmp(m_tabname, f_key_info.referenced_table->str) == 0;
-
-    data->cnt_child += item->is_child;
-    data->cnt_parent += item->is_parent;
-
-    res = data->list.push_back(item);
-    if (res != 0) ERR_RETURN(err_OOM);
-  }
-
-  DBUG_PRINT("info", ("count FKs total %u child %u parent %u",
-                      data->list.elements, data->cnt_child, data->cnt_parent));
-
-  m_fk_data = data;
-  return 0;
-}
-
-void ha_ndbcluster::release_fk_data() {
-  DBUG_TRACE;
-
-  Ndb_fk_data *data = m_fk_data;
-  if (data != 0) {
-    DBUG_PRINT("info",
-               ("count FKs total %u child %u parent %u", data->list.elements,
-                data->cnt_child, data->cnt_parent));
-  }
-
-  MEM_ROOT *mem_root = &m_fk_mem_root;
-  free_root(mem_root, 0);
-  m_fk_data = 0;
-}
-
-int ha_ndbcluster::get_child_or_parent_fk_list(
-    List<FOREIGN_KEY_INFO> *f_key_list, bool is_child, bool is_parent) {
-  DBUG_TRACE;
-  DBUG_PRINT("info", ("table %s.%s", m_dbname, m_tabname));
-
-  Ndb_fk_data *data = m_fk_data;
-  if (data == 0) {
-    DBUG_ASSERT(false);
-    return 0;
-  }
-
-  DBUG_PRINT("info", ("count FKs total %u child %u parent %u",
-                      data->list.elements, data->cnt_child, data->cnt_parent));
-
-  Ndb_fk_item *item = 0;
-  List_iterator<Ndb_fk_item> iter(data->list);
-  while ((item = iter++)) {
-    FOREIGN_KEY_INFO &f_key_info = item->f_key_info;
-    DBUG_PRINT(
-        "info",
-        ("FK %s ref %s -> %s is_child %d is_parent %d",
-         f_key_info.foreign_id->str, f_key_info.foreign_table->str,
-         f_key_info.referenced_table->str, item->is_child, item->is_parent));
-    if (is_child && !item->is_child) continue;
-    if (is_parent && !item->is_parent) continue;
-
-    DBUG_PRINT("info", ("add %s to list", f_key_info.foreign_id->str));
-    f_key_list->push_back(&f_key_info);
-  }
-
-  return 0;
-}
-
-int ha_ndbcluster::get_foreign_key_list(THD *,
-                                        List<FOREIGN_KEY_INFO> *f_key_list) {
-  DBUG_TRACE;
-  int res = get_child_or_parent_fk_list(f_key_list, true, false);
-  DBUG_PRINT("info", ("count FKs child %u", f_key_list->elements));
-  return res;
-}
-
-int ha_ndbcluster::get_parent_foreign_key_list(
-    THD *, List<FOREIGN_KEY_INFO> *f_key_list) {
-  DBUG_TRACE;
-  int res = get_child_or_parent_fk_list(f_key_list, false, true);
-  DBUG_PRINT("info", ("count FKs parent %u", f_key_list->elements));
-  return res;
-}
-
-namespace {
-
-struct cmp_fk_name {
-  bool operator()(const NDBDICT::List::Element &e0,
-                  const NDBDICT::List::Element &e1) const {
-    int res;
-    if ((res = strcmp(e0.name, e1.name)) != 0) return res < 0;
-
-    if ((res = strcmp(e0.database, e1.database)) != 0) return res < 0;
-
-    if ((res = strcmp(e0.schema, e1.schema)) != 0) return res < 0;
-
-    return e0.id < e1.id;
-  }
-};
-
-}  // namespace
-
-char *ha_ndbcluster::get_foreign_key_create_info() {
-  DBUG_TRACE;
-
-  /**
-   * List foreigns for this table
-   */
-  if (m_table == 0) {
-    return 0;
-  }
-
-  if (table == 0) {
-    return 0;
-  }
-
-  THD *thd = table->in_use;
-  if (thd == 0) {
-    return 0;
-  }
-
-  Ndb *ndb = get_ndb(thd);
-  if (ndb == 0) {
-    return 0;
-  }
-
-  NDBDICT *dict = ndb->getDictionary();
-  NDBDICT::List obj_list;
-
-  dict->listDependentObjects(obj_list, *m_table);
-  /**
-   * listDependentObjects will return FK's in order that they
-   *   are stored in hash-table in Dbdict (i.e random)
-   *
-   * sort them to make MTR and similar happy
-   */
-  std::sort(obj_list.elements, obj_list.elements + obj_list.count,
-            cmp_fk_name());
-  String fk_string;
-  for (unsigned i = 0; i < obj_list.count; i++) {
-    if (obj_list.elements[i].type != NdbDictionary::Object::ForeignKey)
-      continue;
-
-    NdbDictionary::ForeignKey fk;
-    int res = dict->getForeignKey(fk, obj_list.elements[i].name);
-    if (res != 0) {
-      // Push warning??
-      return 0;
-    }
-
-    if (!ndb_fk_util_generate_constraint_string(
-            thd, ndb, fk, m_table->getTableId(),
-            ndb_show_foreign_key_mock_tables(thd), fk_string)) {
-      return 0;  // How to report error ??
-    }
-  }
-
-  return strdup(fk_string.c_ptr());
-}
-
-void ha_ndbcluster::free_foreign_key_create_info(char *str) {
-  if (str != 0) {
-    free(str);
-  }
 }
 
 int ha_ndbcluster::copy_fk_for_offline_alter(THD *thd, Ndb *ndb,
+                                             const char *dbname,
                                              const char *tabname) {
   DBUG_TRACE;
-  DBUG_PRINT("enter", ("tabname: '%s'", tabname));
+  DBUG_PRINT("enter", ("dbname: '%s', tabname: '%s'", dbname, tabname));
 
-  if (thd->lex == 0) {
-    assert(false);
-    return 0;
-  }
+  // This function is called during DDL and should have set dbname already
+  assert(Ndb_dbname_guard::check_dbname(ndb, dbname));
 
-  Ndb_db_guard db_guard(ndb);
-  const char *src_db = thd->lex->select_lex->table_list.first->db;
-  const char *src_tab = thd->lex->select_lex->table_list.first->table_name;
-
+  const char *src_db = thd->lex->query_block->table_list.first->db;
+  const char *src_tab = thd->lex->query_block->table_list.first->table_name;
   if (src_db == 0 || src_tab == 0) {
     assert(false);
     return 0;
   }
 
-  NDBDICT *dict = ndb->getDictionary();
-  setDbName(ndb, src_db);
-  Ndb_table_guard srctab(dict, src_tab);
-  if (srctab.get_table() == 0) {
-    /**
-     * when doign alter table engine=ndb this can happen
-     */
+  Ndb_table_guard srctab(ndb, src_db, src_tab);
+  if (srctab.get_table() == nullptr) {
+    // This is a `ALTER TABLE .. ENGINE=NDB` query.
+    // srctab exists in a different engine.
     return 0;
   }
 
-  db_guard.restore();
-  Ndb_table_guard dsttab(dict, tabname);
-  if (dsttab.get_table() == 0) {
+  Ndb_table_guard dsttab(ndb, dbname, tabname);
+  if (dsttab.get_table() == nullptr) {
+    ERR_RETURN(dsttab.getNdbError());
+  }
+
+  NDBDICT *dict = ndb->getDictionary();
+
+  Ndb_fk_list srctab_fk_list;
+  if (!retrieve_foreign_key_list_from_ndb(dict, srctab.get_table(),
+                                          &srctab_fk_list)) {
     ERR_RETURN(dict->getNdbError());
   }
 
-  setDbName(ndb, src_db);
-  NDBDICT::List obj_list;
-  if (dict->listDependentObjects(obj_list, *srctab.get_table()) != 0) {
-    ERR_RETURN(dict->getNdbError());
-  }
+  for (NdbDictionary::ForeignKey &fk : srctab_fk_list) {
+    // Extract FK name
+    char fk_name_buffer[FN_LEN + 1];
+    const char *fk_name = fk_split_name(fk_name_buffer, fk.getName());
 
-  // check if fk to drop exists
-  {
+    // Extract child name
+    char child_db_name[FN_LEN + 1];
+    const char *child_table_name =
+        fk_split_name(child_db_name, fk.getChildTable());
+
+    // Check if this FK needs to be copied
+    bool found = false;
     for (const Alter_drop *drop_item : thd->lex->alter_info->drop_list) {
       if (drop_item->type != Alter_drop::FOREIGN_KEY) continue;
-      bool found = false;
-      for (unsigned i = 0; i < obj_list.count; i++) {
-        // Skip if the element is not a foreign key
-        if (obj_list.elements[i].type != NdbDictionary::Object::ForeignKey)
-          continue;
-
-        // Check if this is the fk being dropped
-        char db_and_name[FN_LEN + 1];
-        const char *name =
-            fk_split_name(db_and_name, obj_list.elements[i].name);
-        if (ndb_fk_casecmp(drop_item->name, name) != 0) continue;
-
-        NdbDictionary::ForeignKey fk;
-        if (dict->getForeignKey(fk, obj_list.elements[i].name) != 0) {
-          // should never happen
-          DBUG_ASSERT(false);
-          push_warning_printf(thd, Sql_condition::SL_WARNING,
-                              ER_CANT_DROP_FIELD_OR_KEY,
-                              "INTERNAL ERROR: Could not find foreign key '%s'",
-                              obj_list.elements[i].name);
-          ERR_RETURN(dict->getNdbError());
-        }
-
-        // The FK we are looking for is on src_tab.
-        char child_db_and_name[FN_LEN + 1];
-        const char *child_name =
-            fk_split_name(child_db_and_name, fk.getChildTable());
-        if (strcmp(child_db_and_name, src_db) == 0 &&
-            strcmp(child_name, src_tab) == 0) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        // FK not found
-        my_error(ER_CANT_DROP_FIELD_OR_KEY, MYF(0), drop_item->name);
-        return ER_CANT_DROP_FIELD_OR_KEY;
+      if (ndb_fk_casecmp(drop_item->name, fk_name) != 0) continue;
+      if (strcmp(child_db_name, src_db) == 0 &&
+          strcmp(child_table_name, src_tab) == 0) {
+        found = true;
+        break;
       }
     }
-  }
+    if (found) {
+      // FK is on drop list. Skip copying.
+      continue;
+    }
 
-  for (unsigned i = 0; i < obj_list.count; i++) {
-    if (obj_list.elements[i].type == NdbDictionary::Object::ForeignKey) {
-      NdbDictionary::ForeignKey fk;
-      if (dict->getForeignKey(fk, obj_list.elements[i].name) != 0) {
-        // should never happen
-        DBUG_ASSERT(false);
-        push_warning_printf(thd, Sql_condition::SL_WARNING, ER_ALTER_INFO,
-                            "INTERNAL ERROR: Could not find foreign key '%s'",
-                            obj_list.elements[i].name);
-        ERR_RETURN(dict->getNdbError());
+    // flags for CreateForeignKey
+    int create_fk_flags = 0;
+
+    // Extract parent name
+    char parent_db_name[FN_LEN + 1];
+    const char *parent_table_name =
+        fk_split_name(parent_db_name, fk.getParentTable());
+
+    // Update parent table references and indexes
+    // if the table being altered is the parent
+    if (strcmp(parent_table_name, src_tab) == 0 &&
+        strcmp(parent_db_name, src_db) == 0) {
+      // The src_tab is the parent
+      const NDBCOL *cols[NDB_MAX_ATTRIBUTES_IN_INDEX + 1];
+      for (unsigned j = 0; j < fk.getParentColumnCount(); j++) {
+        const int parent_col_index = fk.getParentColumnNo(j);
+        const NDBCOL *orgcol = srctab.get_table()->getColumn(parent_col_index);
+        cols[j] = dsttab.get_table()->getColumn(orgcol->getName());
       }
-
-      {
-        /**
-         * Check if it should be copied
+      cols[fk.getParentColumnCount()] = 0;
+      if (fk.getParentIndex() != 0) {
+        const char *parent_index_name =
+            fk_split_name(parent_db_name, fk.getParentIndex(), true);
+        const NDBINDEX *idx =
+            dict->getIndexGlobal(parent_index_name, *dsttab.get_table());
+        if (idx == 0) {
+          ERR_RETURN(dict->getNdbError());
+        }
+        fk.setParent(*dsttab.get_table(), idx, cols);
+        dict->removeIndexGlobal(*idx, 0);
+      } else {
+        /*
+          The parent column was previously the primary key.
+          Make sure it still is a primary key as implicit pks
+          might change during the alter. If not, get a better
+          matching index.
          */
-        char db_and_name[FN_LEN + 1];
-        const char *name =
-            fk_split_name(db_and_name, obj_list.elements[i].name);
-
-        bool found = false;
-        for (const Alter_drop *drop_item : thd->lex->alter_info->drop_list) {
-          if (drop_item->type != Alter_drop::FOREIGN_KEY) continue;
-          if (ndb_fk_casecmp(drop_item->name, name) != 0) continue;
-
-          char child_db_and_name[FN_LEN + 1];
-          const char *child_name =
-              fk_split_name(child_db_and_name, fk.getChildTable());
-          if (strcmp(child_db_and_name, src_db) == 0 &&
-              strcmp(child_name, src_tab) == 0) {
-            found = true;
-            break;
-          }
+        bool parent_primary = false;
+        const NDBINDEX *idx =
+            find_matching_index(dict, dsttab.get_table(), cols, parent_primary);
+        if (!parent_primary && idx == 0) {
+          my_error(ER_FK_NO_INDEX_PARENT, MYF(0), fk.getName(),
+                   dsttab.get_table()->getName());
+          return HA_ERR_CANNOT_ADD_FOREIGN;
         }
-        if (found) {
-          /**
-           * Item is on drop list...
-           *   don't copy it
-           */
-          continue;
-        }
-      }
-
-      {
-        char db_and_name[FN_LEN + 1];
-        const char *name = fk_split_name(db_and_name, fk.getParentTable());
-        setDbName(ndb, db_and_name);
-        Ndb_table_guard org_parent(dict, name);
-        if (org_parent.get_table() == 0) {
-          ERR_RETURN(dict->getNdbError());
-        }
-      }
-
-      {
-        char db_and_name[FN_LEN + 1];
-        const char *name = fk_split_name(db_and_name, fk.getChildTable());
-        setDbName(ndb, db_and_name);
-        Ndb_table_guard org_child(dict, name);
-        if (org_child.get_table() == 0) {
-          ERR_RETURN(dict->getNdbError());
-        }
+        fk.setParent(*dsttab.get_table(), idx, cols);
       }
 
       /**
-       * flags for CreateForeignKey
+       * We're parent, and this is an offline alter table.
+       * This foreign key being created cannot be verified
+       * as the parent won't have any rows now. The new parent
+       * will be populated later during copy data between tables.
+       *
+       * However, iff the FK is consistent when this alter starts,
+       * it should remain consistent since mysql does not
+       * allow the alter to modify the columns referenced
        */
-      int flags = 0;
+      create_fk_flags |= NdbDictionary::Dictionary::CreateFK_NoVerify;
+    }
 
-      char db_and_name[FN_LEN + 1];
-      const char *name = fk_split_name(db_and_name, fk.getParentTable());
-      if (strcmp(name, src_tab) == 0 && strcmp(db_and_name, src_db) == 0) {
-        /**
-         * We used to be parent...
-         */
-        const NDBCOL *cols[NDB_MAX_ATTRIBUTES_IN_INDEX + 1];
-        for (unsigned j = 0; j < fk.getParentColumnCount(); j++) {
-          const int parent_col_index = fk.getParentColumnNo(j);
-          const NDBCOL *orgcol =
-              srctab.get_table()->getColumn(parent_col_index);
-          cols[j] = dsttab.get_table()->getColumn(orgcol->getName());
+    // Update child table references and indexes
+    // if the table being altered is the child
+    if (strcmp(child_table_name, src_tab) == 0 &&
+        strcmp(child_db_name, src_db) == 0) {
+      const NDBCOL *cols[NDB_MAX_ATTRIBUTES_IN_INDEX + 1];
+      for (unsigned j = 0; j < fk.getChildColumnCount(); j++) {
+        const int child_col_index = fk.getChildColumnNo(j);
+        const NDBCOL *orgcol = srctab.get_table()->getColumn(child_col_index);
+        cols[j] = dsttab.get_table()->getColumn(orgcol->getName());
+      }
+      cols[fk.getChildColumnCount()] = 0;
+      if (fk.getChildIndex() != 0) {
+        bool child_primary_key = false;
+        const NDBINDEX *idx = find_matching_index(dict, dsttab.get_table(),
+                                                  cols, child_primary_key);
+        if (!child_primary_key && idx == 0) {
+          ERR_RETURN(dict->getNdbError());
         }
-        cols[fk.getParentColumnCount()] = 0;
-        if (fk.getParentIndex() != 0) {
-          name = fk_split_name(db_and_name, fk.getParentIndex(), true);
-          setDbName(ndb, db_and_name);
-          const NDBINDEX *idx = dict->getIndexGlobal(name, *dsttab.get_table());
-          if (idx == 0) {
-            ERR_RETURN(dict->getNdbError());
-          }
-          fk.setParent(*dsttab.get_table(), idx, cols);
-          dict->removeIndexGlobal(*idx, 0);
-        } else {
-          /*
-            The parent column was previously the primary key.
-            Make sure it still is a primary key as implicit pks
-            might change during the alter. If not, get a better
-            matching index.
-           */
-          bool parent_primary = false;
-          const NDBINDEX *idx = find_matching_index(dict, dsttab.get_table(),
-                                                    cols, parent_primary);
-          if (!parent_primary && idx == 0) {
-            my_error(ER_FK_NO_INDEX_PARENT, MYF(0), fk.getName(),
-                     dsttab.get_table()->getName());
-            return HA_ERR_CANNOT_ADD_FOREIGN;
-          }
-          fk.setParent(*dsttab.get_table(), idx, cols);
-        }
-
-        /**
-         * We're parent, and this is offline alter table
-         *   then we can't verify that FK cause the new parent will
-         *   be populated later during copy data between tables
-         *
-         * However, iff FK is consistent when this alter starts,
-         *   it should remain consistent since mysql does not
-         *   allow the alter to modify the columns referenced
-         */
-        flags |= NdbDictionary::Dictionary::CreateFK_NoVerify;
+        fk.setChild(*dsttab.get_table(), idx, cols);
+        if (idx) dict->removeIndexGlobal(*idx, 0);
       } else {
-        name = fk_split_name(db_and_name, fk.getChildTable());
-        assert(strcmp(name, src_tab) == 0 && strcmp(db_and_name, src_db) == 0);
-        const NDBCOL *cols[NDB_MAX_ATTRIBUTES_IN_INDEX + 1];
-        for (unsigned j = 0; j < fk.getChildColumnCount(); j++) {
-          const int child_col_index = fk.getChildColumnNo(j);
-          const NDBCOL *orgcol = srctab.get_table()->getColumn(child_col_index);
-          cols[j] = dsttab.get_table()->getColumn(orgcol->getName());
-        }
-        cols[fk.getChildColumnCount()] = 0;
-        if (fk.getChildIndex() != 0) {
-          name = fk_split_name(db_and_name, fk.getChildIndex(), true);
-          setDbName(ndb, db_and_name);
-          bool child_primary_key = false;
-          const NDBINDEX *idx = find_matching_index(dict, dsttab.get_table(),
-                                                    cols, child_primary_key);
-          if (!child_primary_key && idx == 0) {
-            ERR_RETURN(dict->getNdbError());
-          }
-          fk.setChild(*dsttab.get_table(), idx, cols);
-          if (idx) dict->removeIndexGlobal(*idx, 0);
-        } else {
-          fk.setChild(*dsttab.get_table(), 0, cols);
-        }
+        fk.setChild(*dsttab.get_table(), 0, cols);
       }
+    }
 
-      char new_name[FN_LEN + 1];
-      name = fk_split_name(db_and_name, fk.getName());
-      snprintf(new_name, sizeof(new_name), "%s", name);
-      fk.setName(new_name);
-      setDbName(ndb, db_and_name);
+    // FK's name will have the fully qualified internal name.
+    // Reset it to the actual FK name.
+    fk.setName(fk_name);
 
-      if (thd_test_options(thd, OPTION_NO_FOREIGN_KEY_CHECKS)) {
-        flags |= NdbDictionary::Dictionary::CreateFK_NoVerify;
-      }
-      NdbDictionary::ObjectId objid;
-      if (dict->createForeignKey(fk, &objid, flags) != 0) {
-        ERR_RETURN(dict->getNdbError());
-      }
+    // The foreign key is on this table (i.e.) this is the child and
+    // the foreign key should be consistent even during COPY ALTER.
+    // So by default we verify them unless the user has explicitly
+    // turned off the foreign key checks variable which might mean that
+    // they were never consistent to begin with.
+    if (thd_test_options(thd, OPTION_NO_FOREIGN_KEY_CHECKS)) {
+      create_fk_flags |= NdbDictionary::Dictionary::CreateFK_NoVerify;
+    }
+    NdbDictionary::ObjectId objid;
+    if (dict->createForeignKey(fk, &objid, create_fk_flags) != 0) {
+      ERR_RETURN(dict->getNdbError());
     }
   }
   return 0;
 }
 
-int ha_ndbcluster::inplace__drop_fks(THD *thd, Ndb *ndb, NDBDICT *dict,
-                                     const NDBTAB *tab) {
+int ha_ndbcluster::inplace__drop_fks(THD *thd, Ndb *ndb, const char *dbname,
+                                     const char *tabname) {
   DBUG_TRACE;
   if (thd->lex == 0) {
     assert(false);
     return 0;
   }
 
-  Ndb_table_guard srctab(dict, tab->getName());
+  Ndb_table_guard srctab(ndb, dbname, tabname);
   if (srctab.get_table() == 0) {
-    DBUG_ASSERT(false);  // Why ??
+    assert(false);  // Why ??
     return 0;
   }
 
+  NdbDictionary::Dictionary *dict = ndb->getDictionary();
   NDBDICT::List obj_list;
   if (dict->listDependentObjects(obj_list, *srctab.get_table()) != 0) {
     ERR_RETURN(dict->getNdbError());
@@ -2191,26 +1710,24 @@ int ha_ndbcluster::inplace__drop_fks(THD *thd, Ndb *ndb, NDBDICT *dict,
       char child_db_and_name[FN_LEN + 1];
       const char *child_name =
           fk_split_name(child_db_and_name, fk.getChildTable());
-      if (strcmp(child_db_and_name, ndb->getDatabaseName()) == 0 &&
-          strcmp(child_name, tab->getName()) == 0) {
+      if (strcmp(child_db_and_name, dbname) == 0 &&
+          strcmp(child_name, tabname) == 0) {
         found = true;
         Fk_util fk_util(thd);
         if (!fk_util.drop_fk(ndb, dict, obj_list.elements[i].name)) {
           ERR_RETURN(dict->getNdbError());
         }
 
-        /* Flush the parent table out if parent is different from child */
-        if (ndb_fk_casecmp(fk.getParentTable(), fk.getChildTable()) != 0) {
-          char parent_db[FN_LEN + 1];
-          const char *parent_name =
-              fk_split_name(parent_db, fk.getParentTable());
-          flush_parent_table_for_fk(thd, parent_db, parent_name);
-        }
         break;
       }
     }
     if (!found) {
-      // FK not found
+      /*
+        Since we check that foreign key to be dropped exists on SQL-layer,
+        we should not come here unless there is some bug and data-dictionary
+        and NDB internal structures got out of sync.
+      */
+      assert(false);
       my_error(ER_CANT_DROP_FIELD_OR_KEY, MYF(0), drop_item->name);
       return ER_CANT_DROP_FIELD_OR_KEY;
     }
@@ -2219,95 +1736,74 @@ int ha_ndbcluster::inplace__drop_fks(THD *thd, Ndb *ndb, NDBDICT *dict,
 }
 
 /**
-  Save all fk data into a fk_list
-  - Build list of foreign keys for which the given table is child
+  Restore foreign keys into the table from fk_list
+  For all foreign keys in the given fk list, if the table is a child in the
+  foreign key relationship,
+  - re-assign child object ids to reflect the newly created child table/indexes.
+  - If the table is also the parent, i.e. the foreign key is self referencing,
+    additionally re-assign the parent object ids of the foreign key.
+  - Recreate the foreign key in the table.
+  If the table is a parent in atleast one foreign key that is not self
+  referencing, resolve all mock tables based on this table to update those
+  foreign keys' parent references.
 
   @retval
     0     ok
   @retval
-   != 0   failure in saving the fk data
-*/
-
-int ha_ndbcluster::get_fk_data_for_truncate(NdbDictionary::Dictionary *dict,
-                                            const NdbDictionary::Table *ndbtab,
-                                            Ndb_fk_list &fk_list) {
-  DBUG_TRACE;
-
-  NDBDICT::List obj_list;
-  if (dict->listDependentObjects(obj_list, *ndbtab) != 0) {
-    ERR_RETURN(dict->getNdbError());
-  }
-  for (unsigned i = 0; i < obj_list.count; i++) {
-    DBUG_PRINT("debug", ("DependentObject %d : %s, Type : %d", i,
-                         obj_list.elements[i].name, obj_list.elements[i].type));
-    if (obj_list.elements[i].type != NdbDictionary::Object::ForeignKey)
-      continue;
-
-    /* obj is an fk. Fetch it */
-    NDBFK fk;
-    if (dict->getForeignKey(fk, obj_list.elements[i].name) != 0) {
-      ERR_RETURN(dict->getNdbError());
-    }
-    DBUG_PRINT("debug", ("Retrieving FK : %s", fk.getName()));
-
-    fk_list.push_back(new NdbDictionary::ForeignKey(fk));
-    DBUG_PRINT("info", ("Foreign Key added to list : %s", fk.getName()));
-  }
-
-  return 0;
-}
-
-/**
-  Restore foreign keys into the child table from fk_list
-  - for all foreign keys in the given fk list, re-assign child object ids
-    to reflect the newly created child table/indexes
-  - create the fk in the child table
-
-  @retval
-    0     ok
-  @retval
-   != 0   failure in recreating the fk data
+   != 0   failure in restoring the foreign keys
 */
 
 int ha_ndbcluster::recreate_fk_for_truncate(THD *thd, Ndb *ndb,
+                                            const char *db_name,
                                             const char *tab_name,
-                                            Ndb_fk_list &fk_list) {
+                                            Ndb_fk_list *fk_list) {
   DBUG_TRACE;
 
-  int flags = 0;
+  // Calls functions that requires dbname to be set
+  assert(Ndb_dbname_guard::check_dbname(ndb, db_name));
+
   const int err_default = HA_ERR_CANNOT_ADD_FOREIGN;
 
-  NDBDICT *dict = ndb->getDictionary();
-
-  /* fetch child table */
-  Ndb_table_guard child_tab(dict, tab_name);
-  if (child_tab.get_table() == 0) {
+  // Fetch the table from NDB
+  Ndb_table_guard ndb_table_guard(ndb, db_name, tab_name);
+  const NDBTAB *table = ndb_table_guard.get_table();
+  if (!table) {
     push_warning_printf(
         thd, Sql_condition::SL_WARNING, ER_CANNOT_ADD_FOREIGN,
         "INTERNAL ERROR: Could not find created child table '%s'", tab_name);
     // Internal error, should be able to load the just created child table
-    DBUG_ASSERT(child_tab.get_table());
+    assert(table);
     return err_default;
   }
 
-  NDBFK *fk;
-  List_iterator<NDBFK> fk_iterator(fk_list);
-  while ((fk = fk_iterator++)) {
-    DBUG_PRINT("info", ("Parsing foreign key : %s", fk->getName()));
+  NdbDictionary::Dictionary *dict = ndb->getDictionary();
+  bool resolve_mock_tables = false;
+  for (NdbDictionary::ForeignKey &fk : *fk_list) {
+    DBUG_PRINT("info", ("Parsing foreign key : %s", fk.getName()));
+    char child_db[FN_LEN + 1];
+    const char *child_name = fk_split_name(child_db, fk.getChildTable());
+
+    if (!(strcmp(db_name, child_db) == 0 &&
+          strcmp(tab_name, child_name) == 0)) {
+      // Table is just a parent in the foreign key reference. It will be handled
+      // later in the end by resolving the mock tables based on this table.
+      resolve_mock_tables = true;
+      continue;
+    }
 
     /* Get child table columns and index */
     const NDBCOL *child_cols[NDB_MAX_ATTRIBUTES_IN_INDEX + 1];
     {
       unsigned pos = 0;
-      const NDBTAB *tab = child_tab.get_table();
-      for (unsigned i = 0; i < fk->getChildColumnCount(); i++) {
-        const NDBCOL *ndbcol = tab->getColumn(fk->getChildColumnNo(i));
+
+      for (unsigned i = 0; i < fk.getChildColumnCount(); i++) {
+        const NDBCOL *ndbcol = table->getColumn(fk.getChildColumnNo(i));
         if (ndbcol == 0) {
           push_warning_printf(
               thd, Sql_condition::SL_WARNING, ER_CANNOT_ADD_FOREIGN,
               "Child table %s has no column referred by the FK %s",
-              tab->getName(), fk->getName());
-          DBUG_ASSERT(ndbcol);
+              table->getName(), fk.getName());
+          assert(ndbcol);
           return err_default;
         }
         child_cols[pos++] = ndbcol;
@@ -2316,17 +1812,56 @@ int ha_ndbcluster::recreate_fk_for_truncate(THD *thd, Ndb *ndb,
     }
 
     bool child_primary_key = false;
-    const NDBINDEX *child_index = find_matching_index(
-        dict, child_tab.get_table(), child_cols, child_primary_key);
+    const NDBINDEX *child_index =
+        find_matching_index(dict, table, child_cols, child_primary_key);
 
     if (!child_primary_key && child_index == 0) {
-      my_error(ER_FK_NO_INDEX_CHILD, MYF(0), fk->getName(),
-               child_tab.get_table()->getName());
+      assert(false);
+      my_error(ER_FK_NO_INDEX_CHILD, MYF(0), fk.getName(), table->getName());
       return err_default;
     }
 
     /* update the fk's child references */
-    fk->setChild(*child_tab.get_table(), child_index, child_cols);
+    fk.setChild(*table, child_index, child_cols);
+
+    const NDBINDEX *parent_index = nullptr;
+    char parent_db[FN_LEN + 1];
+    const char *parent_name = fk_split_name(parent_db, fk.getParentTable());
+
+    if (strcmp(parent_db, child_db) == 0 &&
+        strcmp(parent_name, child_name) == 0) {
+      const NDBCOL *parent_cols[NDB_MAX_ATTRIBUTES_IN_INDEX + 1];
+      {
+        /* Self referencing foreign key. Update the parent references*/
+        unsigned pos = 0;
+        for (unsigned i = 0; i < fk.getParentColumnCount(); i++) {
+          const NDBCOL *ndbcol = table->getColumn(fk.getParentColumnNo(i));
+          if (ndbcol == 0) {
+            push_warning_printf(
+                thd, Sql_condition::SL_WARNING, ER_CANNOT_ADD_FOREIGN,
+                "parent table %s has no column referred by the FK %s",
+                table->getName(), fk.getName());
+            assert(ndbcol);
+            return err_default;
+          }
+          parent_cols[pos++] = ndbcol;
+        }
+        parent_cols[pos] = 0;
+      }
+
+      bool parent_primary_key = false;
+      parent_index =
+          find_matching_index(dict, table, parent_cols, parent_primary_key);
+
+      if (!parent_primary_key && parent_index == 0) {
+        assert(false);
+        my_error(ER_FK_NO_INDEX_PARENT, MYF(0), fk.getName(), table->getName());
+        return err_default;
+      }
+
+      /* update the fk's parent references */
+      fk.setParent(*table, parent_index, parent_cols);
+    }
 
     /*
      the name of "fk" seems to be different when you read it up
@@ -2336,52 +1871,57 @@ int ha_ndbcluster::recreate_fk_for_truncate(THD *thd, Ndb *ndb,
     {
       char name[FN_REFLEN + 1];
       unsigned parent_id, child_id;
-      if (sscanf(fk->getName(), "%u/%u/%s", &parent_id, &child_id, name) != 3) {
+      if (sscanf(fk.getName(), "%u/%u/%s", &parent_id, &child_id, name) != 3) {
         push_warning_printf(
             thd, Sql_condition::SL_WARNING, ER_CANNOT_ADD_FOREIGN,
-            "Skip, failed to parse name of fk: %s", fk->getName());
+            "Skip, failed to parse name of fk: %s", fk.getName());
         return err_default;
       }
 
       char fk_name[FN_REFLEN + 1];
       snprintf(fk_name, sizeof(fk_name), "%s", name);
       DBUG_PRINT("info", ("Setting new fk name: %s", fk_name));
-      fk->setName(fk_name);
+      fk.setName(fk_name);
     }
 
+    int flags = 0;
     if (thd_test_options(thd, OPTION_NO_FOREIGN_KEY_CHECKS)) {
       flags |= NdbDictionary::Dictionary::CreateFK_NoVerify;
     }
 
     NdbDictionary::ObjectId objid;
-    int err = dict->createForeignKey(*fk, &objid, flags);
+    int err = dict->createForeignKey(fk, &objid, flags);
 
     if (child_index) {
       dict->removeIndexGlobal(*child_index, 0);
     }
 
+    if (parent_index) {
+      dict->removeIndexGlobal(*parent_index, 0);
+    }
+
     if (err) {
       ERR_RETURN(dict->getNdbError());
     }
+  }
 
-    /* Flush the parent table out if parent is different from child */
-    char parent_db[FN_LEN + 1];
-    const char *parent_name = fk_split_name(parent_db, fk->getParentTable());
-    if (ndb_fk_casecmp(parent_name, tab_name) != 0 ||
-        ndb_fk_casecmp(parent_db, ndb->getDatabaseName()) != 0) {
-      flush_parent_table_for_fk(thd, parent_db, parent_name);
-    }
+  if (resolve_mock_tables) {
+    // Should happen only when the foreign key checks option is disabled
+    assert(thd_test_options(thd, OPTION_NO_FOREIGN_KEY_CHECKS));
+    // The table was a parent in atleast one foreign key relationship that was
+    // not self referencing. Update all foreign key definitions referencing the
+    // table by resolving all the mock tables based on it.
+    ndb_fk_util_resolve_mock_tables(thd, ndb, db_name, tab_name);
   }
   return 0;
 }
 
 bool ha_ndbcluster::has_fk_dependency(
-    THD *thd, const NdbDictionary::Column *column) const {
+    NdbDictionary::Dictionary *dict,
+    const NdbDictionary::Column *column) const {
   DBUG_TRACE;
-  Ndb *ndb = get_ndb(thd);
-  NDBDICT *dict = ndb->getDictionary();
+  DBUG_PRINT("enter", ("Searching for column %s", column->getName()));
   NdbDictionary::Dictionary::List obj_list;
-  DBUG_PRINT("info", ("Searching for column %s", column->getName()));
   if (dict->listDependentObjects(obj_list, *m_table) == 0) {
     for (unsigned i = 0; i < obj_list.count; i++) {
       const NDBDICT::List::Element &e = obj_list.elements[i];

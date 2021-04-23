@@ -102,24 +102,33 @@ select t from t1 order by t;
 select c from t1 order by c;
 select b from t1 order by b;
 select d from t1 order by d;
+--sorted_result
 select distinct t from t1;
+--sorted_result
 select distinct b from t1;
 select distinct t from t1 order by t;
 select distinct b from t1 order by b;
+--sorted_result
 select t from t1 group by t;
+--sorted_result
 select b from t1 group by b;
 set big_tables=1;
+--sorted_result
 select distinct t from t1;
+--sorted_result
 select distinct b from t1;
 select distinct t from t1 order by t;
 select distinct b from t1 order by b;
+--sorted_result
 select distinct c from t1;
+--sorted_result
 select distinct d from t1;
 select distinct c from t1 order by c;
 select distinct d from t1 order by d;
 select c from t1 group by c;
 select d from t1 group by d;
 set big_tables=0;
+--sorted_result
 select distinct * from t1;
 --sorted_result
 select t,count(*) from t1 group by t;
@@ -837,3 +846,18 @@ SELECT ( SELECT ( b <> 1 ) FROM t2) <> ALL(SELECT 1681007452 FROM t1) FROM t1;
 SELECT ( SELECT ( b <> 1 ) FROM t2) <> ALL(SELECT 1681007452 FROM t1) FROM t1;
 DROP TABLE t1,t2;
 set sql_mode=default;
+
+--echo #
+--echo # Bug#30308063 UBSAN: NULL POINTER PASSED AS ARGUMENT 2,
+--echo #              WHICH IS DECLARED TO NEVER BE NULL
+--echo #
+
+CREATE TABLE t1 (c1 INTEGER PRIMARY KEY, c2 TEXT, c3 INTEGER);
+
+INSERT INTO t1(c1) VALUES(0);
+
+INSERT INTO t1(c1) VALUES(0) ON DUPLICATE KEY
+UPDATE c2 = VALUES(c2), c3 = NULL;
+
+SELECT * FROM t1;
+DROP TABLE t1;

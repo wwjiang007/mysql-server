@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2021, Oracle and/or its affiliates.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -519,7 +519,15 @@ struct dtype_t {
                             DATA_MBMINMAXLEN(mbminlen,mbmaxlen);
                             mbminlen=DATA_MBMINLEN(mbminmaxlen);
                             mbmaxlen=DATA_MBMINLEN(mbminmaxlen) */
+
+  bool is_virtual() const { return ((prtype & DATA_VIRTUAL) == DATA_VIRTUAL); }
+
+  std::ostream &print(std::ostream &out) const;
 };
+
+inline std::ostream &operator<<(std::ostream &out, const dtype_t &obj) {
+  return (obj.print(out));
+}
 
 static_assert(TRUE == 1, "TRUE != 1");
 

@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -45,10 +45,10 @@ VIEW wait_classes_global_by_avg_latency (
 ) AS
 SELECT SUBSTRING_INDEX(event_name,'/', 3) AS event_class,
        SUM(COUNT_STAR) AS total,
-       sys.format_time(CAST(SUM(sum_timer_wait) AS UNSIGNED)) AS total_latency,
-       sys.format_time(MIN(min_timer_wait)) AS min_latency,
-       sys.format_time(IFNULL(SUM(sum_timer_wait) / NULLIF(SUM(COUNT_STAR), 0), 0)) AS avg_latency,
-       sys.format_time(CAST(MAX(max_timer_wait) AS UNSIGNED)) AS max_latency
+       format_pico_time(CAST(SUM(sum_timer_wait) AS UNSIGNED)) AS total_latency,
+       format_pico_time(MIN(min_timer_wait)) AS min_latency,
+       format_pico_time(IFNULL(SUM(sum_timer_wait) / NULLIF(SUM(COUNT_STAR), 0), 0)) AS avg_latency,
+       format_pico_time(CAST(MAX(max_timer_wait) AS UNSIGNED)) AS max_latency
   FROM performance_schema.events_waits_summary_global_by_event_name
  WHERE sum_timer_wait > 0
    AND event_name != 'idle'

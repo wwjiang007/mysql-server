@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -85,9 +85,9 @@ public:
     ErrorHandlerImpl(CallBack* f, ArrayPool<T>& p) :
       func(f), pool(p)
     {}
-    virtual ~ErrorHandlerImpl() {}
+    ~ErrorHandlerImpl() override {}
 
-    virtual void failure() const {
+    void failure() const override {
       if (func != nullptr) {
         (*func)(pool);
       }
@@ -238,7 +238,7 @@ protected:
   Uint32 seizeN(Uint32 n);
 
   /**
-   * Deallocate <b>n<b> consecutive object to pool
+   * Deallocate <b>n</b> consecutive object to pool
    *  starting from base
    */
   void releaseN(Uint32 base, Uint32 n);
@@ -303,6 +303,23 @@ protected:
   void * alloc_ptr;
   // Call this function if a seize request fails.
   const ErrorHandler* const seizeErrHand;
+public:
+  T* getArrayPtr()
+  {
+    return theArray;
+  }
+  void setArrayPtr(T* newArray)
+  {
+    theArray = newArray;
+  }
+  Uint32 getSize()
+  {
+    return size;
+  }
+  void setNewSize(Uint32 newSize)
+  {
+    size = newSize;
+  }
 };
 
 template <class T>
@@ -348,7 +365,11 @@ template <class T>
 inline
 bool
 ArrayPool<T>::setSize(Uint32 noOfElements, 
-		      bool align, bool exit_on_error, bool guard, Uint32 paramId){
+		      bool align,
+                      bool exit_on_error,
+                      bool guard,
+                      Uint32 paramId)
+{
   if(size == 0)
   {
     if(noOfElements == 0)
@@ -1240,9 +1261,9 @@ public:
     ErrorHandlerImpl(CallBack* f, CachedArrayPool<T>& p) :
       func(f), pool(p)
     {}
-    virtual ~ErrorHandlerImpl() {}
+    ~ErrorHandlerImpl() override {}
 
-    virtual void failure() const {
+    void failure() const override {
       if (func != nullptr) {
         (*func)(pool);
       }

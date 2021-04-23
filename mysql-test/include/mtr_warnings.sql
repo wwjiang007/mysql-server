@@ -1,4 +1,4 @@
--- Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2008, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License, version 2.0,
@@ -48,6 +48,9 @@ SET @collation_connection_saved = @@collation_connection;
 SET @@character_set_client = latin1;
 SET @@character_set_results = latin1;
 SET @@collation_connection = latin1_swedish_ci;
+
+DELIMITER $$
+
 /*!50002
 CREATE DEFINER=root@localhost TRIGGER ts_insert
 BEFORE INSERT ON test_suppressions
@@ -57,7 +60,10 @@ FOR EACH ROW BEGIN
   SELECT "" REGEXP NEW.pattern INTO dummy;
   SET GLOBAL regexp_time_limit = DEFAULT;
 END
-*/;
+*/;$$
+
+DELIMITER ;
+
 SET @@character_set_client = @character_set_client_saved;
 SET @@character_set_results = @character_set_results_saved;
 SET @@collation_connection = @collation_connection_saved;
@@ -81,6 +87,9 @@ SET @collation_connection_saved = @@collation_connection;
 SET @@character_set_client = latin1;
 SET @@character_set_results = latin1;
 SET @@collation_connection = latin1_swedish_ci;
+
+DELIMITER $$
+
 /*!50002
 CREATE DEFINER=root@localhost TRIGGER gs_insert
 BEFORE INSERT ON global_suppressions
@@ -90,7 +99,10 @@ FOR EACH ROW BEGIN
   SELECT "" REGEXP NEW.pattern INTO dummy;
   SET GLOBAL regexp_time_limit = DEFAULT;
 END
-*/;
+*/;$$
+
+DELIMITER ;
+
 SET @@character_set_client = @character_set_client_saved;
 SET @@character_set_results = @character_set_results_saved;
 SET @@collation_connection = @collation_connection_saved;
@@ -173,7 +185,11 @@ INSERT INTO global_suppressions VALUES
  ("==[0-9]*== Massif"),
  ("==[0-9]*== Helgrind"),
 
-/*
+ /* Suppress warnings caused by foreign clients, see Bug#31893901 */
+
+ ("IP address .* could not be resolved.*"),
+
+ /*
    Transient network failures that cause warnings on reconnect.
    BUG#47743 and BUG#47983.
  */
@@ -233,10 +249,15 @@ INSERT INTO global_suppressions VALUES
  ("\\[GCS\\] The member is already leaving or joining a group."),
  ("\\[GCS\\] The member is leaving a group without being on one."),
  ("\\[GCS\\] Processing new view on handler without a valid group configuration."),
- ("\\[GCS\\] Error on opening a connection to localhost:.* on local port: .*."),
+ ("\\[GCS\\] Error on opening a connection to .*"),
  ("\\[GCS\\] Error pushing message into group communication engine."),
  ("\\[GCS\\] Message cannot be sent because the member does not belong to a group."),
- ("\\[GCS\\] Automatically adding IPv4 localhost address to the whitelist. It is mandatory that it is added."),
+ ("\\[GCS\\] Automatically adding IPv4 localhost address to the allowlist. It is mandatory that it is added."),
+ ("\\[GCS\\] Unable to bind to INADDR_ANY:.*"),
+ ("\\[GCS\\] Unable to announce tcp port .*. Port already in use\\?"),
+ ("\\[GCS\\] Error joining the group while waiting for the network layer to become ready."),
+ ("\\[GCS\\] The member was unable to join the group. Local port: .*"),
+ ("Shutting down an outgoing connection. This happens because something might be wrong .*"),
  ("Member with address .* has become unreachable."),
  ("This server is not able to reach a majority of members in the group.*"),
  ("Member with address .* is reachable again."),
@@ -264,6 +285,28 @@ INSERT INTO global_suppressions VALUES
    SSL Library instrumentation failed
  */
  ("The SSL library function CRYPTO_set_mem_functions failed"),
+
+ /*
+   binlog-less slave (WL#7846)
+ */
+ ("The transaction owned GTID is already in the gtid_executed table"),
+
+ /*
+   TLS warnings
+ */
+ ("Channel mysql_main configured to support TLS"),
+
+ /*
+   systemd debug (when built WITH_SYSTEMD and WITH_SYSTEMD_DEBUG,
+   and systemd logging is not actually available)
+ */
+ ("NOTIFY_SOCKET not set in environment. sd_notify messages will not be sent!"),
+ ("Invalid systemd notify socket, cannot send: "),
+
+ /*
+   Manifest file processing
+ */
+ ("Manifest file '.*' is not read-only. For better security, please make sure that the file is read-only."),
 
  ("THE_LAST_SUPPRESSION");
 

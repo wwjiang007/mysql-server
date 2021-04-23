@@ -19,10 +19,11 @@ VARIABLE_NAME LIKE '%rpl%' OR
 VARIABLE_NAME LIKE '%semi_sync%' OR
 VARIABLE_NAME LIKE '%slave%') AND
 (VARIABLE_NAME NOT IN ('innodb_api_enable_binlog',
-'innodb_master_thread_disabled_debug'))
+'innodb_master_thread_disabled_debug',
+'skip_slave_start'))
 ORDER BY VARIABLE_NAME;
 
-include/assert.inc ['Expect 83 variables in the table.']
+include/assert.inc ['Expect 85 variables in the table.']
 
 # Test SET PERSIST
 SET PERSIST binlog_cache_size = @@GLOBAL.binlog_cache_size;
@@ -50,6 +51,8 @@ SET PERSIST binlog_row_metadata = @@GLOBAL.binlog_row_metadata;
 SET PERSIST binlog_row_value_options = @@GLOBAL.binlog_row_value_options;
 SET PERSIST binlog_rows_query_log_events = @@GLOBAL.binlog_rows_query_log_events;
 SET PERSIST binlog_stmt_cache_size = @@GLOBAL.binlog_stmt_cache_size;
+SET PERSIST binlog_transaction_compression = @@GLOBAL.binlog_transaction_compression;
+SET PERSIST binlog_transaction_compression_level_zstd = @@GLOBAL.binlog_transaction_compression_level_zstd;
 SET PERSIST binlog_transaction_dependency_history_size = @@GLOBAL.binlog_transaction_dependency_history_size;
 SET PERSIST binlog_transaction_dependency_tracking = @@GLOBAL.binlog_transaction_dependency_tracking;
 SET PERSIST enforce_gtid_consistency = @@GLOBAL.enforce_gtid_consistency;
@@ -75,6 +78,9 @@ ERROR HY000: Variable 'log_slave_updates' is a read only variable
 SET PERSIST log_slow_slave_statements = @@GLOBAL.log_slow_slave_statements;
 SET PERSIST log_statements_unsafe_for_binlog = @@GLOBAL.log_statements_unsafe_for_binlog;
 SET PERSIST master_info_repository = @@GLOBAL.master_info_repository;
+Warnings:
+Warning	1287	'@@master_info_repository' is deprecated and will be removed in a future release.
+Warning	1287	'@@master_info_repository' is deprecated and will be removed in a future release.
 SET PERSIST master_verify_checksum = @@GLOBAL.master_verify_checksum;
 SET PERSIST max_binlog_cache_size = @@GLOBAL.max_binlog_cache_size;
 SET PERSIST max_binlog_size = @@GLOBAL.max_binlog_size;
@@ -89,6 +95,9 @@ ERROR HY000: Variable 'relay_log_index' is a read only variable
 SET PERSIST relay_log_info_file = @@GLOBAL.relay_log_info_file;
 ERROR HY000: Variable 'relay_log_info_file' is a read only variable
 SET PERSIST relay_log_info_repository = @@GLOBAL.relay_log_info_repository;
+Warnings:
+Warning	1287	'@@relay_log_info_repository' is deprecated and will be removed in a future release.
+Warning	1287	'@@relay_log_info_repository' is deprecated and will be removed in a future release.
 SET PERSIST relay_log_purge = @@GLOBAL.relay_log_purge;
 SET PERSIST relay_log_recovery = @@GLOBAL.relay_log_recovery;
 ERROR HY000: Variable 'relay_log_recovery' is a read only variable
@@ -133,16 +142,16 @@ SET PERSIST sync_master_info = @@GLOBAL.sync_master_info;
 SET PERSIST sync_relay_log = @@GLOBAL.sync_relay_log;
 SET PERSIST sync_relay_log_info = @@GLOBAL.sync_relay_log_info;
 
-include/assert.inc ['Expect 65 persisted variables in persisted_variables table.']
+include/assert.inc ['Expect 67 persisted variables in persisted_variables table.']
 
 ############################################################
 # 2. Restart server, it must preserve the persisted variable
 #    settings. Verify persisted configuration.
 # restart
 
-include/assert.inc ['Expect 65 persisted variables in persisted_variables table.']
-include/assert.inc ['Expect 65 persisted variables shown as PERSISTED in variables_info table.']
-include/assert.inc ['Expect 65 persisted variables with matching persisted and global values.']
+include/assert.inc ['Expect 67 persisted variables in persisted_variables table.']
+include/assert.inc ['Expect 67 persisted variables shown as PERSISTED in variables_info table.']
+include/assert.inc ['Expect 67 persisted variables with matching persisted and global values.']
 
 ############################################################
 # 3. Test RESET PERSIST IF EXISTS. Verify persisted variable
@@ -172,6 +181,8 @@ RESET PERSIST IF EXISTS binlog_row_metadata;
 RESET PERSIST IF EXISTS binlog_row_value_options;
 RESET PERSIST IF EXISTS binlog_rows_query_log_events;
 RESET PERSIST IF EXISTS binlog_stmt_cache_size;
+RESET PERSIST IF EXISTS binlog_transaction_compression;
+RESET PERSIST IF EXISTS binlog_transaction_compression_level_zstd;
 RESET PERSIST IF EXISTS binlog_transaction_dependency_history_size;
 RESET PERSIST IF EXISTS binlog_transaction_dependency_tracking;
 RESET PERSIST IF EXISTS enforce_gtid_consistency;

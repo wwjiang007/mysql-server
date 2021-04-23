@@ -1,4 +1,4 @@
-/* Copyright (c) 2001, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2001, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -43,9 +43,12 @@
 #endif
 #include <time.h>
 
+#include <algorithm>
+
 #include "my_inttypes.h"
 #include "my_macros.h"
 #include "my_stacktrace.h"
+#include "template_utils.h"
 
 #ifndef _WIN32
 #include <signal.h>
@@ -132,7 +135,7 @@ static int safe_print_str(const char *addr, int max_len) {
 
   /* Read up to the maximum number of bytes. */
   while (total) {
-    count = MY_MIN(sizeof(buf), total);
+    count = std::min(sizeof(buf), total);
 
     if ((nbytes = pread(fd, buf, count, offset)) < 0) {
       /* Just in case... */
@@ -192,11 +195,11 @@ void my_safe_puts_stderr(const char *val, size_t max_len) {
 #include <cxxabi.h>
 
 static char *my_demangle(const char *mangled_name, int *status) {
-  return abi::__cxa_demangle(mangled_name, NULL, NULL, status);
+  return abi::__cxa_demangle(mangled_name, nullptr, nullptr, status);
 }
 
 static bool my_demangle_symbol(char *line) {
-  char *demangled = NULL;
+  char *demangled = nullptr;
 #ifdef __APPLE__  // OS X formatting of stacktraces is different from Linux
   char *begin = strstr(line, "_Z");
   char *end = begin ? strchr(begin, ' ') : NULL;
@@ -229,21 +232,21 @@ static bool my_demangle_symbol(char *line) {
   if (demangled) my_safe_printf_stderr("%s %s+%s\n", line, demangled, end);
 #else                       // !__APPLE__ and !__SUNPRO_CC
   char *begin = strchr(line, '(');
-  char *end = begin ? strchr(begin, '+') : NULL;
+  char *end = begin ? strchr(begin, '+') : nullptr;
 
   if (begin && end) {
     *begin++ = *end++ = '\0';
     int status;
     demangled = my_demangle(begin, &status);
     if (!demangled || status) {
-      demangled = NULL;
+      demangled = nullptr;
       begin[-1] = '(';
       end[-1] = '+';
     }
   }
   if (demangled) my_safe_printf_stderr("%s(%s+%s\n", line, demangled, end);
 #endif
-  bool ret = (demangled == NULL);
+  bool ret = (demangled == nullptr);
   free(demangled);
   return (ret);
 }
@@ -281,7 +284,7 @@ void my_print_stacktrace(const uchar *stack_bottom, ulong thread_stack) {
 #endif
 
   void *addrs[128];
-  char **strings = NULL;
+  char **strings = nullptr;
   int n = backtrace(addrs, array_elements(addrs));
   my_safe_printf_stderr("stack_bottom = %p thread_stack 0x%lx\n", stack_bottom,
                         thread_stack);
@@ -347,13 +350,13 @@ static void get_symbol_path(char *path, size_t size) {
   HANDLE hSnap;
   char *envvar;
   char *p;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   static char pdb_debug_dir[MAX_PATH + 7];
 #endif
 
   path[0] = '\0';
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   /*
     Add "debug" subdirectory of the application directory, sometimes PDB will
     placed here by installation.
@@ -789,7 +792,7 @@ void my_safe_print_system_time() {
   secs = utc_time.wSecond;
 #else
   /* Using time() instead of my_time() to avoid looping */
-  const time_t curr_time = time(NULL);
+  const time_t curr_time = time(nullptr);
   /* Calculate time of day */
   const long tmins = curr_time / 60;
   const long thrs = tmins / 60;

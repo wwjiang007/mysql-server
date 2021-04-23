@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2008, 2021, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -63,7 +63,6 @@
 */
 
 #include <stdio.h>
-#include <atomic>
 
 #include "my_config.h"
 #include "my_inttypes.h"
@@ -253,21 +252,22 @@ ulonglong my_timer_nanoseconds(void) {
 ulonglong my_timer_microseconds(void) {
 #if defined(HAVE_GETTIMEOFDAY)
   {
-    static std::atomic<ulonglong> atomic_last_value{0};
     struct timeval tv;
-    if (gettimeofday(&tv, NULL) == 0)
-      atomic_last_value =
-          (ulonglong)tv.tv_sec * 1000000 + (ulonglong)tv.tv_usec;
-    else {
+    ulonglong result;
+    if (gettimeofday(&tv, nullptr) == 0) {
+      result = (ulonglong)tv.tv_sec * 1000000 + (ulonglong)tv.tv_usec;
+    } else {
       /*
         There are reports that gettimeofday(2) can have intermittent failures
         on some platform, see for example Bug#36819.
         We are not trying again or looping, just returning the best value
         possible under the circumstances ...
+        Do not attempt to maintain a replacement counter using a global,
+        it creates even more issues with contention, just return 0.
       */
-      atomic_last_value++;
+      result = 0;
     }
-    return atomic_last_value;
+    return result;
   }
 #elif defined(_WIN32)
   {
@@ -291,21 +291,22 @@ ulonglong my_timer_microseconds(void) {
 ulonglong my_timer_milliseconds(void) {
 #if defined(HAVE_GETTIMEOFDAY)
   {
-    static ulonglong last_ms_value = 0;
     struct timeval tv;
-    if (gettimeofday(&tv, NULL) == 0)
-      last_ms_value =
-          (ulonglong)tv.tv_sec * 1000 + (ulonglong)tv.tv_usec / 1000;
-    else {
+    ulonglong result;
+    if (gettimeofday(&tv, nullptr) == 0) {
+      result = (ulonglong)tv.tv_sec * 1000 + (ulonglong)tv.tv_usec / 1000;
+    } else {
       /*
         There are reports that gettimeofday(2) can have intermittent failures
         on some platform, see for example Bug#36819.
         We are not trying again or looping, just returning the best value
         possible under the circumstances ...
+        Do not attempt to maintain a replacement counter using a global,
+        it creates even more issues with contention, just return 0.
       */
-      last_ms_value++;
+      result = 0;
     }
-    return last_ms_value;
+    return result;
   }
 #elif defined(_WIN32)
   FILETIME ft;
@@ -465,8 +466,6 @@ static ulonglong my_timer_init_frequency(MY_TIMER_INFO *mti) {
 void my_timer_init(MY_TIMER_INFO *mti) {
   ulonglong (*best_timer)(void);
   ulonglong best_timer_overhead;
-  ulonglong time1, time2;
-  int i;
 
   /* cycles */
   mti->cycles.frequency = 1000000000;
@@ -608,7 +607,9 @@ void my_timer_init(MY_TIMER_INFO *mti) {
   }
 
   /* best_timer_overhead = least of 20 calculations */
-  for (i = 0, best_timer_overhead = 1000000000; i < 20; ++i) {
+  best_timer_overhead = 1000000000;
+  for (int i = 0; i < 20; ++i) {
+    ulonglong time1, time2;
     time1 = best_timer();
     time2 = best_timer() - time1;
     if (best_timer_overhead > time2) best_timer_overhead = time2;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -28,6 +28,8 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#include <algorithm>
+
 #include "my_dbug.h"
 #include "my_inttypes.h"
 #include "my_macros.h"
@@ -54,7 +56,7 @@
 int mi_preload(MI_INFO *info, ulonglong key_map, bool ignore_leaves) {
   uint i;
   ulong length, block_length = 0;
-  uchar *buff = NULL;
+  uchar *buff = nullptr;
   MYISAM_SHARE *share = info->s;
   uint keys = share->state.header.keys;
   MI_KEYDEF *keyinfo = share->keyinfo;
@@ -66,7 +68,7 @@ int mi_preload(MI_INFO *info, ulonglong key_map, bool ignore_leaves) {
     return 0;
 
   /* Preload into a non initialized key cache should never happen. */
-  DBUG_ASSERT(share->key_cache->key_cache_inited);
+  assert(share->key_cache->key_cache_inited);
 
   block_length = keyinfo[0].block_length;
 
@@ -82,7 +84,7 @@ int mi_preload(MI_INFO *info, ulonglong key_map, bool ignore_leaves) {
     block_length = share->key_cache->key_cache_block_size;
 
   length = info->preload_buff_size / block_length * block_length;
-  set_if_bigger(length, block_length);
+  length = std::max(length, block_length);
 
   if (!(buff = (uchar *)my_malloc(mi_key_memory_preload_buffer, length,
                                   MYF(MY_WME)))) {

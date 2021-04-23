@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -49,7 +49,7 @@ class Suma : public SimulatedBlock {
   BLOCK_DEFINES(Suma);
 public:
   Suma(Block_context& ctx);
-  virtual ~Suma();
+  ~Suma() override;
 
   /**
    * Private interface
@@ -142,11 +142,11 @@ public:
   // m_dummy is used to pass value.
   union FragmentDescriptor { 
     struct  {
-      Uint16 m_fragmentNo;
-      Uint8 m_lqhInstanceKey;
-      Uint8 m_nodeId;
+      Uint32 m_fragmentNo;
+      Uint16 m_lqhInstanceKey;
+      Uint16 m_nodeId;
     } m_fragDesc;
-    Uint32 m_dummy;
+    Uint32 m_dummy[2];
   };
   
   /**
@@ -569,7 +569,7 @@ public:
   const NodeBitmask& getSubscriberNodes() const { return c_subscriber_nodes; }
 
 protected:
-  virtual bool getParam(const char * param, Uint32 * retVal);
+  bool getParam(const char * param, Uint32 * retVal) override;
 
 private:
   /**

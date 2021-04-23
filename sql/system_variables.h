@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -87,7 +87,11 @@ enum enum_transaction_write_set_hashing_algorithm {
 };
 
 // Values for session_track_gtids sysvar
-enum enum_session_track_gtids { OFF = 0, OWN_GTID = 1, ALL_GTIDS = 2 };
+enum enum_session_track_gtids {
+  SESSION_TRACK_GTIDS_OFF = 0,
+  SESSION_TRACK_GTIDS_OWN_GTID = 1,
+  SESSION_TRACK_GTIDS_ALL_GTIDS = 2
+};
 
 /** Values for use_secondary_engine sysvar. */
 enum use_secondary_engine {
@@ -212,7 +216,7 @@ struct System_variables {
   ulong lock_wait_timeout;
   ulong max_allowed_packet;
   ulong max_error_count;
-  ulong max_length_for_sort_data;
+  ulong max_length_for_sort_data;  ///< Unused.
   ulong max_points_in_geometry;
   ulong max_sort_length;
   ulong max_insert_delayed_threads;
@@ -246,6 +250,9 @@ struct System_variables {
   ulong rbr_exec_mode_options;  // see enum_rbr_exec_mode
   bool binlog_direct_non_trans_update;
   ulong binlog_row_image;  // see enum_binlog_row_image
+  bool binlog_trx_compression;
+  ulong binlog_trx_compression_type;  // see enum_binlog_trx_compression
+  uint binlog_trx_compression_level_zstd;
   ulonglong binlog_row_value_options;
   bool sql_log_bin;
   // see enum_transaction_write_set_hashing_algorithm
@@ -398,6 +405,23 @@ struct System_variables {
     @sa Sys_var_generated_random_password_length
   */
   uint32_t generated_random_password_length;
+
+  /**
+    @sa Sys_var_require_row_format
+  */
+  bool require_row_format;
+  /**
+    @sa Sys_select_into_buffer_size
+  */
+  ulong select_into_buffer_size;
+  /**
+    @sa Sys_select_into_disk_sync
+  */
+  bool select_into_disk_sync;
+  /**
+    @sa Sys_select_disk_sync_delay
+  */
+  uint select_into_disk_sync_delay;
 };
 
 /**

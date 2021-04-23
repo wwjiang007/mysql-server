@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -24,7 +24,6 @@
 
 #include <ndb_global.h>
 
-#include <NdbTCP.h>
 #include "ConfigInfo.hpp"
 #include <mgmapi_config_parameters.h>
 #include <ndb_limits.h>
@@ -33,11 +32,10 @@
 #include <Bitmask.hpp>
 #include <ndb_opts.h>
 #include <ndb_version.h>
-#include <ConfigObject.hpp>
-#include <unordered_map>
-#include <string>
+#include "../src/kernel/vm/mt-asm.h"
 
 #include <portlib/ndb_localtime.h>
+#include <NdbTCP.h>
 
 #define KEY_INTERNAL 0
 #define MAX_INT_RNIL 0xfffffeff
@@ -98,7 +96,6 @@ static bool fixPortNumber(InitConfigFileParser::Context & ctx, const char *);
 static bool fixShmKey(InitConfigFileParser::Context & ctx, const char *);
 static bool checkDbConstraints(InitConfigFileParser::Context & ctx, const char *);
 static bool checkConnectionConstraints(InitConfigFileParser::Context &, const char *);
-static bool checkTCPConstraints(InitConfigFileParser::Context &, const char *);
 static bool fixNodeHostname(InitConfigFileParser::Context & ctx, const char * data);
 static bool fixHostname(InitConfigFileParser::Context & ctx, const char * data);
 static bool fixNodeId(InitConfigFileParser::Context & ctx, const char * data);
@@ -171,11 +168,6 @@ ConfigInfo::m_SectionRules[] = {
   { "TCP",  checkConnectionConstraints, 0 },
   { "SHM",  checkConnectionConstraints, 0 },
 
-  { "TCP",  checkTCPConstraints, "HostName1" },
-  { "TCP",  checkTCPConstraints, "HostName2" },
-  { "SHM",  checkTCPConstraints, "HostName1" },
-  { "SHM",  checkTCPConstraints, "HostName2" },
-  
   { "*",    checkMandatory, 0 }
 };
 const int ConfigInfo::m_NoOfRules = sizeof(m_SectionRules)/sizeof(SectionRule);
@@ -201,6 +193,9 @@ static bool check_node_vs_replicas(Vector<ConfigInfo::ConfigRuleSection>&section
 static bool check_mutually_exclusive(Vector<ConfigInfo::ConfigRuleSection>&sections, 
                                      struct InitConfigFileParser::Context &ctx, 
                                      const char * rule_data);
+static bool validate_unique_mgm_ports(Vector<ConfigInfo::ConfigRuleSection>& sections,
+                                      struct InitConfigFileParser::Context& ctx,
+                                      const char* rule_data);
 
 
 static bool saveSectionsInConfigValues(Vector<ConfigInfo::ConfigRuleSection>&,
@@ -215,6 +210,7 @@ ConfigInfo::m_ConfigRules[] = {
   { set_connection_priorities, 0 },
   { check_node_vs_replicas, 0 },
   { check_mutually_exclusive, 0 },
+  { validate_unique_mgm_ports, 0 },
   { saveSectionsInConfigValues, "SYSTEM,Node,Connection" },
   { 0, 0 }
 };
@@ -390,6 +386,18 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     STR_VALUE(MAX_INT_RNIL) },
 
   {
+    CFG_DB_CLASSIC_FRAGMENTATION,
+    "ClassicFragmentation",
+    DB_TOKEN,
+    "Use classic fragmentation technique",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_BOOL,
+    "true",
+    "false",
+    "true" },
+
+  {
     CFG_DB_SUBSCRIBERS,
     "MaxNoOfSubscribers",
     DB_TOKEN,
@@ -437,6 +445,24 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     0, 0 },
 
   {
+    CFG_NODE_DEDICATED,
+    "Dedicated",
+    DB_TOKEN,
+    "The node id for this node will only be handed out to connections that "
+    "explicitly request it. Data nodes that request 'any' nodeid will not be "
+    "able to use this one. Can be used when HostName is not enough to "
+    "distinguish different processes, and one runs several data nodes on same "
+    "host. There is typically no need to use this option since ven if one run "
+    "several data nodes on same host it is enough to always use --ndb-nodeid "
+    "option when starting data nodes even without this option. ",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_BOOL,
+    "false",
+    "false",
+    "true" },
+
+  {
     CFG_NODE_SYSTEM,
     "System",
     DB_TOKEN,
@@ -482,6 +508,18 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     "2",
     "1",
     "4" },
+
+  {
+    CFG_DB_NODE_GROUP_TRANSPORTERS,
+    "NodeGroupTransporters",
+    DB_TOKEN,
+    "Number of transporters to use between nodes in same node group",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_INT,
+    "0",
+    "0",
+    STR_VALUE(MAX_NODE_GROUP_TRANSPORTERS) },
 
   {
     CFG_DB_NO_ATTRIBUTES,
@@ -535,8 +573,8 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     CFG_DB_NO_INDEX_OPS,
     "MaxNoOfConcurrentIndexOperations",
     DB_TOKEN,
-    "Total number of index operations that can execute simultaneously on one " DB_TOKEN_PRINT " node",
-    ConfigInfo::CI_USED,
+    "TransactionMemory",
+    ConfigInfo::CI_DEPRECATED,
     false,
     ConfigInfo::CI_INT,
     "8K",
@@ -560,8 +598,8 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     CFG_DB_NO_TRIGGER_OPS,
     "MaxNoOfFiredTriggers",
     DB_TOKEN,
-    "Total number of triggers that can fire simultaneously in one " DB_TOKEN_PRINT " node",
-    ConfigInfo::CI_USED,
+    "TransactionMemory",
+    ConfigInfo::CI_DEPRECATED,
     false,
     ConfigInfo::CI_INT,
     "4000",
@@ -701,6 +739,41 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     "500" },
 
   {
+    /**
+     * Allowed values are:
+     * StaticSpinning
+     *   Use traditional static spinning based on configuration.
+     *
+     * CostBasedSpinning
+     *   Use adaptive spinning, allow overhead of 200% and max
+     *   spintime of 100 us. This gives some benefits on VMs
+     *   even in shared environment although it pays a small
+     *   cost for improved latency.
+     *
+     * LatencyOptimisedSpinning
+     *   Use adaptive spinning, allow overhead of 1000% and
+     *   max spintime of 200 us. This mode means spinning at a
+     *   fairly high cost, but still limited. This mode can
+     *   be used when latency is important, but it one still
+     *   attempts to have reasonable limits on CPU usage.
+     *
+     * DatabaseMachineSpinning
+     *   Use adaptive spinning, allow overhead of 10000% and
+     *   max spintime of 500 us. This mode means spinning
+     *   all the time except when we are idle. Use this when
+     *   latency is vital and no other users exists on the
+     *   machine or at least the CPUs used by the data node.
+     */
+    CFG_DB_SPIN_METHOD,
+    "SpinMethod",
+    DB_TOKEN,
+    "Spin method used by data node",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_STRING,
+    "StaticSpinning", 0, 0 },
+
+  {
     CFG_DB_SCHED_RESPONSIVENESS,
     "SchedulerResponsiveness",
     DB_TOKEN,
@@ -813,8 +886,8 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     CFG_DB_NO_LOCAL_OPS,
     "MaxNoOfLocalOperations",
     DB_TOKEN,
-    "Max number of operation records defined in the local storage node",
-    ConfigInfo::CI_USED,
+    "TransactionMemory",
+    ConfigInfo::CI_DEPRECATED,
     false,
     ConfigInfo::CI_INT,
     0,
@@ -825,8 +898,8 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     CFG_DB_NO_LOCAL_SCANS,
     "MaxNoOfLocalScans",
     DB_TOKEN,
-    "Max number of fragment scans in parallel in the local storage node",
-    ConfigInfo::CI_USED,
+    "TransactionMemory",
+    ConfigInfo::CI_DEPRECATED,
     false,
     ConfigInfo::CI_INT,
     0,
@@ -903,7 +976,19 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     ConfigInfo::CI_INT64,
     "98M",
     "1M",
-    "1024G" },
+    "16384G" },
+
+  {
+    CFG_DB_TRANSACTION_MEM,
+    "TransactionMemory",
+    DB_TOKEN,
+    "Number bytes on each " DB_TOKEN_PRINT " node allocated for operations",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_INT64,
+    "0",
+    "0",
+    "16384G" },
 
   {
     CFG_DB_UNDO_INDEX_BUFFER,
@@ -963,7 +1048,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     ConfigInfo::CI_INT64,
     "64M",
     "4M",
-    "1024G" },
+    "16384G" },
 
   {
     CFG_DB_SGA,
@@ -973,11 +1058,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     ConfigInfo::CI_USED,
     false,
     ConfigInfo::CI_INT64,
-#if NDB_VERSION_D < NDB_MAKE_VERSION(7,2,0)
-    "20M",
-#else
     "128M",
-#endif
     "0",
     "65536G" }, // 32k pages * 32-bit i value
   
@@ -1160,6 +1241,19 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     "26214400",
     "26214400",
     STR_VALUE(MAX_INT_RNIL) },
+
+  {
+    CFG_DB_PARTITIONS_PER_NODE,
+    "PartitionsPerNode",
+    DB_TOKEN,
+    "Partitions per node created for tables",
+    ConfigInfo::CI_USED,
+    0,
+    ConfigInfo::CI_INT,
+    "2",
+    "1",
+    STR_VALUE(NDB_MAX_LOG_PARTS)
+  },
 
   {
     CFG_DB_NO_REDOLOG_PARTS,
@@ -1582,7 +1676,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     CFG_DB_BACKUP_MEM,
     "BackupMemory",
     DB_TOKEN,
-    "Total memory allocated for backups per node (in bytes)",
+    "sum of hardcoded BackupDataBufferSize(=2MB) and BackupLogBufferSize",
     ConfigInfo::CI_DEPRECATED,
     false,
     ConfigInfo::CI_INT,
@@ -1594,7 +1688,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     CFG_DB_BACKUP_DATA_BUFFER_MEM,
     "BackupDataBufferSize",
     DB_TOKEN,
-    "Default size of databuffer for a backup (in bytes)",
+    "hardcoded value of 2MB",
     ConfigInfo::CI_DEPRECATED,
     false,
     ConfigInfo::CI_INT,
@@ -1618,7 +1712,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     CFG_DB_BACKUP_WRITE_SIZE,
     "BackupWriteSize",
     DB_TOKEN,
-    "Default size of filesystem writes made by backup (in bytes)",
+    "hardcoded value of 256 KB",
     ConfigInfo::CI_DEPRECATED,
     false,
     ConfigInfo::CI_INT,
@@ -1630,7 +1724,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     CFG_DB_BACKUP_MAX_WRITE_SIZE,
     "BackupMaxWriteSize",
     DB_TOKEN,
-    "Max size of filesystem writes made by backup (in bytes)",
+    "hardcoded value of 2MB",
     ConfigInfo::CI_DEPRECATED,
     false,
     ConfigInfo::CI_INT,
@@ -1646,7 +1740,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     ConfigInfo::CI_USED,
     false,
     ConfigInfo::CI_INT,
-    "25",
+    "5",
     "0",
     STR_VALUE(MAX_INT_RNIL) },
 
@@ -1746,6 +1840,19 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     "true"},
 
   {
+    CFG_DB_REQUIRE_ENCRYPTED_BACKUP,
+    "RequireEncryptedBackup",
+    DB_TOKEN,
+    "If set to one only encrypted backups are allowed. If zero both encrypted "
+    "and unencrypted backups are allowed.",
+    ConfigInfo::CI_USED,
+    0,
+    ConfigInfo::CI_INT,
+    "0",
+    "0",
+    "1"},
+
+  {
     CFG_EXTRA_SEND_BUFFER_MEMORY,
     "ExtraSendBufferMemory",
     DB_TOKEN,
@@ -1795,6 +1902,32 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     0,
     "0",
     STR_VALUE(NDB_NO_NODEGROUP)
+  },
+
+  {
+    CFG_DB_AUTO_THREAD_CONFIG,
+    "AutomaticThreadConfig",
+    DB_TOKEN,
+    "Use automatic thread configuration, overrides MaxNoOfExecutionThreads",
+    ConfigInfo::CI_USED,
+    CI_RESTART_SYSTEM | CI_RESTART_INITIAL,
+    ConfigInfo::CI_BOOL,
+    "false",
+    "false",
+    "true"
+  },
+
+  {
+    CFG_DB_NUM_CPUS,
+    "NumCPUs",
+    DB_TOKEN,
+    "Hard coded number of CPUs to use in automatic thread configuration",
+    ConfigInfo::CI_USED,
+    CI_RESTART_SYSTEM | CI_RESTART_INITIAL,
+    ConfigInfo::CI_INT,
+    "0",
+    "0",
+    STR_VALUE(MAX_USED_NUM_CPUS)
   },
 
   {
@@ -2041,7 +2174,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     false,
     ConfigInfo::CI_INT,
     "20",                    /* Default */
-    "0",                     /* Min */
+    "1",                     /* Min */
     STR_VALUE(MAX_INT_RNIL)  /* Max */
   },
 
@@ -2055,7 +2188,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     false,
     ConfigInfo::CI_INT,
     "3",                     /* Default */
-    "0",                     /* Min */
+    "1",                     /* Min */
     STR_VALUE(MAX_INT_RNIL)  /* Max */
   },
 
@@ -2283,9 +2416,40 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     ConfigInfo::CI_USED,
     false,
     ConfigInfo::CI_INT,
-    "60",
+    "180",
     "0",
     STR_VALUE(MAX_INT_RNIL)
+  },
+
+  {
+    CFG_DB_MAX_DD_LATENCY,
+    "MaxDiskDataLatency",
+    DB_TOKEN,
+    "Maximum allowed mean latency of disk access in milliseconds."
+    "When this limit is reached we will start aborting transactions"
+    " to decrease pressure on IO susbsystem. 0 means this check is"
+    " not active",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_INT,
+    "0",
+    "0",
+    "8000"
+  },
+
+  {
+    CFG_DB_DD_USING_SAME_DISK,
+    "DiskDataUsingSameDisk",
+    DB_TOKEN,
+    "Set this to false if Disk data tablespaces uses their own disk"
+    " drives. This means that we can push checkpoints to tablespaces"
+    " at a higher rate than if disk drives are shared.",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_BOOL,
+    "true",
+    "false",
+    "true"
   },
 
   {
@@ -2489,7 +2653,7 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     ConfigInfo::CI_USED,
     false,
     ConfigInfo::CI_INT,
-    "0", // "8k",
+    "0", // "32k",
     "0",
     STR_VALUE(MAX_INT_RNIL)
   },
@@ -2584,6 +2748,24 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     ConfigInfo::CI_STRING,
     "",
     0, 0 },
+
+  {
+    CFG_NODE_DEDICATED,
+    "Dedicated",
+    API_TOKEN,
+    "The node id for this node will only be handed out to connections that "
+    "explicitly request it. Api client that request 'any' nodeid will not be "
+    "able to use this one. Can be used when HostName is not enough to "
+    "distinguish different processes, and one runs a server process like "
+    "mysqld on same host as some other ndb client programs and want to avoid "
+    "the client program steal a node id dedicated to mysqld while the mysqld "
+    "is not connected.",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_BOOL,
+    "false",
+    "false",
+    "true" },
 
   {
     CFG_NODE_SYSTEM,
@@ -2885,6 +3067,23 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     ConfigInfo::CI_STRING,
     "",
     0, 0 },
+
+  {
+    CFG_NODE_DEDICATED,
+    "Dedicated",
+    MGM_TOKEN,
+    "The node id for this node will only be handed out to connections that "
+    "explicitly request it. Management servers that request 'any' nodeid will "
+    "not be able to use this one. Can be used when HostName is not enough to "
+    "distinguish different processes, and one runs several management "
+    "servers on same host, which should typically only be the case in test "
+    "clusters.",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_BOOL,
+    "false",
+    "false",
+    "true" },
 
   {
     CFG_NODE_DATADIR,
@@ -3229,6 +3428,19 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     STR_VALUE(MAX_INT_RNIL) },
 
   {
+    CFG_TCP_SPINTIME,
+    "TcpSpintime",
+    "TCP",
+    "Number of microseconds to spin before going to sleep when receiving",
+    ConfigInfo::CI_USED,
+    false,
+    ConfigInfo::CI_INT,
+    "0",
+    "0",
+    "2000"
+  },
+
+  {
     CFG_TCP_RECEIVE_BUFFER_SIZE,
     "ReceiveBufferMemory",
     "TCP",
@@ -3336,6 +3548,18 @@ const ConfigInfo::ParamInfo ConfigInfo::m_ParamInfo[] = {
     "0",
     STR_VALUE(MAX_INT_RNIL)
   },
+
+  {
+     CFG_CONNECTION_UNRES_HOSTS,
+     "AllowUnresolvedHostnames",
+     "TCP",
+     "Allow startup to continue with unresolved hostnames in configuration",
+     ConfigInfo::CI_USED,
+     false,
+     ConfigInfo::CI_BOOL,
+     "false",
+     "false", "true"
+   },
 
   /****************************************************************************
    * SHM
@@ -4332,6 +4556,16 @@ ConfigInfo::verify_enum(const Properties * section, const char* fname,
 }
 
 
+/*
+ * Get allowed values for enum parameters in a space separated list.
+ *
+ * It returns values in order of increasing numerical value to make it possible
+ * to map numerical value to string value.
+ *
+ * At least in the cases there enum values are consecutive and zero based,
+ * which is the case for ConfigInfo.
+ */
+
 void
 ConfigInfo::get_enum_values(const Properties * section, const char* fname,
                       BaseString& list) const {
@@ -4342,9 +4576,25 @@ ConfigInfo::get_enum_values(const Properties * section, const char* fname,
 
   const char* separator = "";
   Properties::Iterator it(values);
+  Vector<const char*> enum_names;
+  const char* fill = nullptr;
+  unsigned cnt = 0;
   for (const char* name = it.first(); name != NULL; name = it.next())
   {
-    list.appfmt("%s%s", separator, name);
+    Uint32 val;
+    values->get(name, &val);
+    enum_names.set(name, val, fill);
+    cnt++;
+  }
+  // Enum values should be consecutive starting at zero.
+  assert(enum_names.size() == cnt);
+  for (unsigned i = 0; i < enum_names.size(); i++)
+  {
+    if (enum_names[i] == nullptr)
+    {
+      continue;
+    }
+    list.appfmt("%s%s", separator, enum_names[i]);
     separator = " ";
   }
 }
@@ -4395,17 +4645,17 @@ public:
 class PrettyPrinter : public ConfigPrinter {
 public:
   PrettyPrinter(FILE* out = stdout) : ConfigPrinter(out) {}
-  virtual ~PrettyPrinter() {}
+  ~PrettyPrinter() override {}
 
-  virtual void section_start(const char* name, const char* alias,
-                             const char* primarykeys = NULL) {
+  void section_start(const char* name, const char* alias,
+                     const char* primarykeys = NULL) override {
     fprintf(m_out, "****** %s ******\n\n", name);
   }
 
-  virtual void parameter(const char* section_name,
+  void parameter(const char* section_name,
                          const Properties* section,
                          const char* param_name,
-                         const ConfigInfo& info)
+                         const ConfigInfo& info) override
   {
     // Don't print deprecated parameters
     const Uint32 status = info.getStatus(section, param_name);
@@ -4519,11 +4769,11 @@ class XMLPrinter : public ConfigPrinter {
 
 public:
   XMLPrinter(FILE* out = stdout) : ConfigPrinter(out), m_indent(0) {}
-  virtual ~XMLPrinter() {
+  ~XMLPrinter() override {
     assert(m_indent == 0);
   }
 
-  virtual void start() {
+  void start() override {
     BaseString buf;
     Properties pairs;
     pairs.put("protocolversion", "1");
@@ -4541,14 +4791,14 @@ public:
     print_xml("configvariables", pairs, false);
     m_indent++;
   }
-  virtual void end() {
+  void end() override {
     m_indent--;
     Properties pairs;
     print_xml("/configvariables", pairs, false);
   }
 
-  virtual void section_start(const char* name, const char* alias,
-                             const char* primarykeys = NULL) {
+  void section_start(const char* name, const char* alias,
+                     const char* primarykeys = NULL) override {
     Properties pairs;
     pairs.put("name", alias ? alias : name);
     if (primarykeys)
@@ -4556,16 +4806,16 @@ public:
     print_xml("section", pairs, false);
     m_indent++;
   }
-  virtual void section_end(const char* name) {
+  void section_end(const char* name) override {
     m_indent--;
     Properties pairs;
     print_xml("/section", pairs, false);
   }
 
-  virtual void parameter(const char* section_name,
-                         const Properties* section,
-                         const char* param_name,
-                         const ConfigInfo& info){
+  void parameter(const char* section_name,
+                 const Properties* section,
+                 const char* param_name,
+                 const ConfigInfo& info) override{
     BaseString buf;
     Properties pairs;
     pairs.put("name", param_name);
@@ -4800,6 +5050,11 @@ transformNode(InitConfigFileParser::Context & ctx, const char * data){
   ctx.m_userProperties.get(ctx.fname, &nodes);
   ctx.m_userProperties.put(ctx.fname, ++nodes, true);
 
+  // Store the node id if this a MGM for later validations
+  if (strcmp(ctx.fname, MGM_TOKEN) == 0) {
+    ctx.m_userProperties.put("mgmd_nodeid", nodes, id);
+  }
+
   return true;
 }
 
@@ -4812,7 +5067,9 @@ static bool checkLocalhostHostnameMix(InitConfigFileParser::Context & ctx, const
     DBUG_RETURN(true);
 
   Uint32 localhost_used= 0;
-  if(!strcmp(hostname, "localhost") || !strcmp(hostname, "127.0.0.1")){
+  if(!strcmp(hostname, "localhost") ||
+     !strcmp(hostname, "127.0.0.1") ||
+     !strcmp(hostname, "::1")){
     localhost_used= 1;
     ctx.m_userProperties.put("$computer-localhost-used", localhost_used);
     if(!ctx.m_userProperties.get("$computer-localhost", &hostname))
@@ -5027,7 +5284,7 @@ applyDefaultValues(InitConfigFileParser::Context & ctx,
 	  break;
         }
       }
-#ifndef DBUG_OFF
+#ifndef NDEBUG
       else
       {
         switch (ctx.m_info->getType(ctx.m_currentInfo, name)){
@@ -5522,6 +5779,7 @@ checkThreadConfig(InitConfigFileParser::Context & ctx, const char * unused)
   Uint32 ndbLogParts = 0;
   Uint32 realtimeScheduler = 0;
   Uint32 spinTimer = 0;
+  Uint32 auto_thread_config = 0;
   const char * thrconfig = 0;
   const char * locktocpu = 0;
 
@@ -5531,6 +5789,7 @@ checkThreadConfig(InitConfigFileParser::Context & ctx, const char * unused)
     tmp.setLockExecuteThreadToCPU(locktocpu);
   }
 
+  ctx.m_currentSection->get("AutomaticThreadConfig", &auto_thread_config);
   ctx.m_currentSection->get("MaxNoOfExecutionThreads", &maxExecuteThreads);
   ctx.m_currentSection->get("__ndbmt_lqh_threads", &lqhThreads);
   ctx.m_currentSection->get("__ndbmt_classic", &classic);
@@ -5549,9 +5808,18 @@ checkThreadConfig(InitConfigFileParser::Context & ctx, const char * unused)
     ctx.reportError("NoOfLogParts must be 4,6,8,10,12,16,20,24 or 32");
     return false;
   }
-  if (ctx.m_currentSection->get("ThreadConfig", &thrconfig))
+  Uint32 dummy;
+  if (auto_thread_config)
   {
-    int ret = tmp.do_parse(thrconfig, realtimeScheduler, spinTimer);
+    ;
+  }
+  else if (ctx.m_currentSection->get("ThreadConfig", &thrconfig))
+  {
+    int ret = tmp.do_parse(thrconfig,
+                           realtimeScheduler,
+                           spinTimer,
+                           dummy,
+                           true);
     if (ret)
     {
       ctx.reportError("Unable to parse ThreadConfig: %s",
@@ -5580,7 +5848,9 @@ checkThreadConfig(InitConfigFileParser::Context & ctx, const char * unused)
                            lqhThreads,
                            classic,
                            realtimeScheduler,
-                           spinTimer);
+                           spinTimer,
+                           dummy,
+                           true);
     if (ret)
     {
       ctx.reportError("Unable to set thread configuration: %s",
@@ -5594,7 +5864,7 @@ checkThreadConfig(InitConfigFileParser::Context & ctx, const char * unused)
     ctx.reportWarning("%s", tmp.getInfoMessage());
   }
 
-  if (thrconfig == 0)
+  if (auto_thread_config == 0 && thrconfig == 0)
   {
     ctx.m_currentSection->put("ThreadConfig", tmp.getConfigString());
   }
@@ -5697,45 +5967,6 @@ uniqueConnection(InitConfigFileParser::Context & ctx, const char * data)
   ctx.m_userProperties.put(key.c_str(), defn.c_str());
   
   return true;
-}
-
-static bool
-checkTCPConstraints(InitConfigFileParser::Context & ctx, const char * data){
-  
-  const char * host;
-  struct in_addr addr;
-  static std::unordered_map<std::string, bool> host_map;
-  bool ret = true;
-
-  if (ctx.m_currentSection->get(data, &host) && (strlen(host) > 0))
-  {
-    /**
-     * First an attempt is made to look into the hash table for a hostname and
-     * only if it's not found, we call Ndb_getInAddr().
-     */
-    auto ent = host_map.find(host);
-    if (ent != host_map.end())
-    {
-      const bool valid_host = ent->second;
-      ret = valid_host;
-    }
-    else if (Ndb_getInAddr(&addr, host) == 0)
-    {
-      host_map[host] = true;
-    }
-    else
-    {
-      host_map[host] = false;
-      ret = false;
-    }
-  }
-  if (!ret)
-  {
-    ctx.reportError("Unable to lookup/illegal hostname %s"
-              " - [%s] starting at line: %d",
-              host, ctx.fname, ctx.m_sectionLineno);
-  }
-  return ret;
 }
 
 static
@@ -6270,7 +6501,7 @@ check_node_vs_replicas(Vector<ConfigInfo::ConfigRuleSection>&sections,
       {
         if (ng == NDB_NO_NODEGROUP)
         {
-          break;
+          continue;
         }
         else if (ng >= MAX_NDB_NODES)
         {
@@ -6385,7 +6616,7 @@ check_node_vs_replicas(Vector<ConfigInfo::ConfigRuleSection>&sections,
             } 
           } 
           i_group++; 
-          DBUG_ASSERT(i_group <= replicas); 
+          assert(i_group <= replicas); 
           if (i_group == replicas) 
           { 
             unsigned c= 0; 
@@ -6510,6 +6741,72 @@ check_mutually_exclusive(Vector<ConfigInfo::ConfigRuleSection>&sections,
   return true;
 }
 
+static bool validate_unique_mgm_ports(
+    Vector<ConfigInfo::ConfigRuleSection>& sections,
+    struct InitConfigFileParser::Context& ctx, const char* rule_data) {
+  /* This rule checks for unique ports in mgm config for nodes on
+   * same Host.
+   */
+  Uint32 num_mgm_nodes;
+  require(ctx.m_userProperties.get("MGM", &num_mgm_nodes));
+
+  Uint32 allow_unresolved = false;
+  const Properties* tcpProperties;
+  if (ctx.m_defaults->get("TCP", &tcpProperties)) {
+    tcpProperties->get("AllowUnresolvedHostnames", &allow_unresolved);
+  }
+
+  /* Map to maintain "ip:port -> nodeId" mapping */
+  std::unordered_map<std::string, Uint32> ip_map;
+
+  /* Loop through mgmd nodes */
+  for (Uint32 n = 1; n <= num_mgm_nodes; n++) {
+    Uint32 nodeId;
+    require(ctx.m_userProperties.get("mgmd_nodeid", n, &nodeId));
+
+    const Properties* nodeProperties;
+    require(ctx.m_config->get("Node", nodeId, &nodeProperties));
+
+    const char* hostname;
+    Uint32 port;
+    require(nodeProperties->get("HostName", &hostname));
+    require(nodeProperties->get("PortNumber", &port));
+
+    // Get ipv4/ipv6 address string from the hostname.
+    std::string addr_str(hostname);
+    struct in6_addr addr;
+    if (Ndb_getInAddr6(&addr, hostname) != 0) {
+      if (!allow_unresolved) {
+        ctx.reportError("Could not resolve hostname [node %d]: %s", nodeId,
+                        hostname);
+        return false;
+      }
+      ctx.reportWarning("Could not resolve hostname [node %d]: %s", nodeId,
+                        hostname);
+    }
+
+    if (!allow_unresolved) {
+      char addr_buf[NDB_ADDR_STRLEN];
+      addr_str = Ndb_inet_ntop(AF_INET6, static_cast<void*>(&addr), addr_buf,
+                               sizeof(addr_buf));
+    }
+
+    // Create ipkey: <ip_string>:<port>
+    std::string ipkey = addr_str + ":" + std::to_string(port);
+
+    /* Check if ipkey is already present in map. */
+    if (ip_map.find(ipkey) != ip_map.end()) {
+      ctx.reportError(
+          "Same port number is specified for management nodes %d and %d (or) "
+          "they both are using the default port number on same host %s.",
+          ip_map.at(ipkey), nodeId, hostname);
+      return false;
+    }
+    ip_map.insert({ipkey, nodeId});
+  }
+
+  return true;
+}
 
 ConfigInfo::ParamInfoIter::ParamInfoIter(const ConfigInfo& info,
                                          Uint32 section,

@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2019, 2021, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -86,10 +86,10 @@ bool RestMetadataCacheConfig::on_handle_request(
         .AddMember<uint64_t>("timeRefreshInMs",
                              static_cast<uint64_t>(md_api->ttl().count()),
                              allocator)
-        .AddMember(
-            "groupReplicationId",
-            json_value_from_string(md_api->group_replication_id(), allocator),
-            allocator)
+        .AddMember("groupReplicationId",
+                   json_value_from_string(md_api->cluster_type_specific_id(),
+                                          allocator),
+                   allocator)
         .AddMember("nodes", members, allocator)
         //
         ;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -34,11 +34,8 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <algorithm>
 #include <atomic>
-#include <boost/algorithm/string/case_conv.hpp>
-#include <boost/foreach.hpp>
-#include <boost/token_functions.hpp>
-#include <boost/tokenizer.hpp>
 #include <cmath>
 #include <list>
 #include <random>  // std::uniform_real_distribution
@@ -60,6 +57,7 @@
 #include "my_sqlcommand.h"
 #include "my_sys.h"  // MEM_DEFINED_IF_ADDRESSABLE()
 #include "myisam.h"  // TT_FOR_UPGRADE
+#include "mysql/components/services/bits/psi_bits.h"
 #include "mysql/components/services/log_builtins.h"
 #include "mysql/components/services/log_shared.h"
 #include "mysql/plugin.h"
@@ -67,7 +65,6 @@
 #include "mysql/psi/mysql_mutex.h"
 #include "mysql/psi/mysql_table.h"
 #include "mysql/psi/mysql_transaction.h"
-#include "mysql/psi/psi_base.h"
 #include "mysql/psi/psi_table.h"
 #include "mysql/service_mysql_alloc.h"
 #include "mysql_com.h"
@@ -103,10 +100,11 @@
 #include "sql/record_buffer.h"  // Record_buffer
 #include "sql/rpl_filter.h"
 #include "sql/rpl_gtid.h"
-#include "sql/rpl_handler.h"            // RUN_HOOK
-#include "sql/rpl_rli.h"                // is_atomic_ddl_commit_on_slave
-#include "sql/rpl_write_set_handler.h"  // add_pke
-#include "sql/sdi_utils.h"              // import_serialized_meta_data
+#include "sql/rpl_handler.h"  // RUN_HOOK
+#include "sql/rpl_rli.h"      // is_atomic_ddl_commit_on_slave
+#include "sql/rpl_slave_commit_order_manager.h"  // Commit_order_manager
+#include "sql/rpl_write_set_handler.h"           // add_pke
+#include "sql/sdi_utils.h"                       // import_serialized_meta_data
 #include "sql/session_tracker.h"
 #include "sql/sql_base.h"  // free_io_cache
 #include "sql/sql_bitmap.h"
@@ -117,6 +115,7 @@
 #include "sql/sql_plugin.h"  // plugin_foreach
 #include "sql/sql_select.h"  // actual_key_parts
 #include "sql/sql_table.h"   // build_table_filename
+#include "sql/strfunc.h"     // strnncmp_nopads
 #include "sql/system_variables.h"
 #include "sql/table.h"
 #include "sql/tc_log.h"
@@ -155,6 +154,8 @@
         case PSI_BATCH_MODE_NONE: {                                         \
           PSI_table_locker *sub_locker = NULL;                              \
           PSI_table_locker_state reentrant_safe_state;                      \
+          reentrant_safe_state.m_thread = nullptr;                          \
+          reentrant_safe_state.m_wait = nullptr;                            \
           sub_locker = PSI_TABLE_CALL(start_table_io_wait)(                 \
               &reentrant_safe_state, m_psi, OP, INDEX, __FILE__, __LINE__); \
           PAYLOAD                                                           \
@@ -172,7 +173,7 @@
         }                                                                   \
         case PSI_BATCH_MODE_STARTED:                                        \
         default: {                                                          \
-          DBUG_ASSERT(m_psi_batch_mode == PSI_BATCH_MODE_STARTED);          \
+          assert(m_psi_batch_mode == PSI_BATCH_MODE_STARTED);               \
           PAYLOAD                                                           \
           if (!RESULT) m_psi_numrows++;                                     \
           break;                                                            \
@@ -237,18 +238,20 @@ st_plugin_int *hton2plugin(uint slot) { return se_plugin_array[slot]; }
 size_t num_hton2plugins() { return se_plugin_array.size(); }
 
 st_plugin_int *insert_hton2plugin(uint slot, st_plugin_int *plugin) {
-  if (se_plugin_array.assign_at(slot, plugin)) return NULL;
+  if (se_plugin_array.assign_at(slot, plugin)) return nullptr;
+  builtin_htons.assign_at(slot, true);
   return se_plugin_array[slot];
 }
 
 st_plugin_int *remove_hton2plugin(uint slot) {
   st_plugin_int *retval = se_plugin_array[slot];
   se_plugin_array[slot] = NULL;
+  builtin_htons.assign_at(slot, false);
   return retval;
 }
 
 const char *ha_resolve_storage_engine_name(const handlerton *db_type) {
-  return db_type == NULL ? "UNKNOWN" : hton2plugin(db_type->slot)->name.str;
+  return db_type == nullptr ? "UNKNOWN" : hton2plugin(db_type->slot)->name.str;
 }
 
 static handlerton *installed_htons[128];
@@ -258,15 +261,19 @@ ulong total_ha_2pc = 0;
 /* size of savepoint storage area (see ha_init) */
 ulong savepoint_alloc_size = 0;
 
-static const LEX_CSTRING sys_table_aliases[] = {{STRING_WITH_LEN("INNOBASE")},
-                                                {STRING_WITH_LEN("INNODB")},
-                                                {STRING_WITH_LEN("NDB")},
-                                                {STRING_WITH_LEN("NDBCLUSTER")},
-                                                {STRING_WITH_LEN("HEAP")},
-                                                {STRING_WITH_LEN("MEMORY")},
-                                                {STRING_WITH_LEN("MERGE")},
-                                                {STRING_WITH_LEN("MRG_MYISAM")},
-                                                {NullS, 0}};
+namespace {
+struct Storage_engine_identifier {
+  const LEX_CSTRING canonical;
+  const LEX_CSTRING legacy;
+};
+const Storage_engine_identifier se_names[] = {
+    {{STRING_WITH_LEN("INNODB")}, {STRING_WITH_LEN("INNOBASE")}},
+    {{STRING_WITH_LEN("NDBCLUSTER")}, {STRING_WITH_LEN("NDB")}},
+    {{STRING_WITH_LEN("MEMORY")}, {STRING_WITH_LEN("HEAP")}},
+    {{STRING_WITH_LEN("MRG_MYISAM")}, {STRING_WITH_LEN("MERGE")}}};
+const auto se_names_end = std::end(se_names);
+std::vector<std::string> disabled_se_names;
+}  // namespace
 
 const char *ha_row_type[] = {"",
                              "FIXED",
@@ -282,32 +289,7 @@ const char *ha_row_type[] = {"",
 const char *tx_isolation_names[] = {"READ-UNCOMMITTED", "READ-COMMITTED",
                                     "REPEATABLE-READ", "SERIALIZABLE", NullS};
 TYPELIB tx_isolation_typelib = {array_elements(tx_isolation_names) - 1, "",
-                                tx_isolation_names, NULL};
-
-// System tables that belong to the 'mysql' system database.
-// These are the "dictionary external system tables" (see WL#6391).
-st_handler_tablename mysqld_system_tables[] = {
-    {MYSQL_SCHEMA_NAME.str, "db"},
-    {MYSQL_SCHEMA_NAME.str, "user"},
-    {MYSQL_SCHEMA_NAME.str, "host"},
-    {MYSQL_SCHEMA_NAME.str, "func"},
-    {MYSQL_SCHEMA_NAME.str, "plugin"},
-    {MYSQL_SCHEMA_NAME.str, "servers"},
-    {MYSQL_SCHEMA_NAME.str, "procs_priv"},
-    {MYSQL_SCHEMA_NAME.str, "tables_priv"},
-    {MYSQL_SCHEMA_NAME.str, "proxies_priv"},
-    {MYSQL_SCHEMA_NAME.str, "columns_priv"},
-    {MYSQL_SCHEMA_NAME.str, "time_zone"},
-    {MYSQL_SCHEMA_NAME.str, "time_zone_name"},
-    {MYSQL_SCHEMA_NAME.str, "time_zone_leap_second"},
-    {MYSQL_SCHEMA_NAME.str, "time_zone_transition"},
-    {MYSQL_SCHEMA_NAME.str, "time_zone_transition_type"},
-    {MYSQL_SCHEMA_NAME.str, "help_category"},
-    {MYSQL_SCHEMA_NAME.str, "help_keyword"},
-    {MYSQL_SCHEMA_NAME.str, "help_relation"},
-    {MYSQL_SCHEMA_NAME.str, "help_topic"},
-    {(const char *)NULL, (const char *)NULL} /* This must be at the end */
-};
+                                tx_isolation_names, nullptr};
 
 // Called for each SE to check if given db.table_name is a system table.
 static bool check_engine_system_table_handlerton(THD *unused, plugin_ref plugin,
@@ -361,9 +343,9 @@ static plugin_ref ha_default_plugin(THD *thd) {
 */
 handlerton *ha_default_handlerton(THD *thd) {
   plugin_ref plugin = ha_default_plugin(thd);
-  DBUG_ASSERT(plugin);
+  assert(plugin);
   handlerton *hton = plugin_data<handlerton *>(plugin);
-  DBUG_ASSERT(hton);
+  assert(hton);
   return hton;
 }
 
@@ -385,9 +367,9 @@ static plugin_ref ha_default_temp_plugin(THD *thd) {
 */
 handlerton *ha_default_temp_handlerton(THD *thd) {
   plugin_ref plugin = ha_default_temp_plugin(thd);
-  DBUG_ASSERT(plugin);
+  assert(plugin);
   handlerton *hton = plugin_data<handlerton *>(plugin);
-  DBUG_ASSERT(hton);
+  assert(hton);
   return hton;
 }
 
@@ -404,31 +386,41 @@ plugin_ref ha_resolve_by_name_raw(THD *thd, const LEX_CSTRING &name) {
   return plugin_lock_by_name(thd, name, MYSQL_STORAGE_ENGINE_PLUGIN);
 }
 
-/** @brief
-  Return the storage engine handlerton for the supplied name
+static const CHARSET_INFO &hton_charset() { return *system_charset_info; }
 
-  SYNOPSIS
-    ha_resolve_by_name(thd, name)
-    thd         current thread
-    name        name of storage engine
+/**
+  Return the storage engine handlerton for the supplied name.
 
-  RETURN
-    pointer to storage engine plugin handle
+  @param thd           Current thread. May be nullptr, (e.g. during initialize).
+  @param name          Name of storage engine.
+  @param is_temp_table true if table is a temporary table.
+
+  @return Pointer to storage engine plugin handle.
 */
 plugin_ref ha_resolve_by_name(THD *thd, const LEX_CSTRING *name,
                               bool is_temp_table) {
-  const LEX_CSTRING *table_alias;
-  plugin_ref plugin;
-
-redo:
-  /* my_strnncoll is a macro and gcc doesn't do early expansion of macro */
-  if (thd && !my_charset_latin1.coll->strnncoll(
-                 &my_charset_latin1, (const uchar *)name->str, name->length,
-                 (const uchar *)STRING_WITH_LEN("DEFAULT"), 0))
+  if (thd && 0 == strnncmp_nopads(hton_charset(), *name,
+                                  {STRING_WITH_LEN("DEFAULT")})) {
     return is_temp_table ? ha_default_plugin(thd) : ha_default_temp_plugin(thd);
+  }
 
-  LEX_CSTRING cstring_name = {name->str, name->length};
-  if ((plugin = ha_resolve_by_name_raw(thd, cstring_name))) {
+  // Note that thd CAN be nullptr here - it is not actually needed by
+  // ha_resolve_by_name_raw().
+  plugin_ref plugin = ha_resolve_by_name_raw(thd, *name);
+  if (plugin == nullptr) {
+    // If we fail to resolve the name passed in, we try to see if it is a
+    // historical alias.
+    auto match = std::find_if(
+        std::begin(se_names), se_names_end,
+        [&](const Storage_engine_identifier &sei) {
+          return (0 == strnncmp_nopads(hton_charset(), *name, sei.legacy));
+        });
+    if (match != se_names_end) {
+      // if it is, we resolve using the new name
+      plugin = ha_resolve_by_name_raw(thd, match->canonical);
+    }
+  }
+  if (plugin != nullptr) {
     handlerton *hton = plugin_data<handlerton *>(plugin);
     if (hton && !(hton->flags & HTON_NOT_USER_SELECTABLE)) return plugin;
 
@@ -437,67 +429,77 @@ redo:
     */
     plugin_unlock(thd, plugin);
   }
-
-  /*
-    We check for the historical aliases.
-  */
-  for (table_alias = sys_table_aliases; table_alias->str; table_alias += 2) {
-    if (!my_strnncoll(&my_charset_latin1, (const uchar *)name->str,
-                      name->length, (const uchar *)table_alias->str,
-                      table_alias->length)) {
-      name = table_alias + 1;
-      goto redo;
-    }
-  }
-
-  return NULL;
+  return nullptr;
 }
 
-std::string normalized_se_str = "";
-
-/*
-  Parse comma separated list of disabled storage engine names
-  and create a normalized string by appending storage names that
-  have aliases. This normalized string is used to disallow
-  table/tablespace creation under the storage engines specified.
+/**
+  Read a comma-separated list of storage engine names. Look up each in the
+  known list of canonical and legacy names. In case of a match; add both the
+  canonical and the legacy name to disabled_se_names, which is a static vector
+  of disabled storage engine names.
+  If there is no match, the unmodified name is added to the vector.
 */
-void ha_set_normalized_disabled_se_str(const std::string &disabled_se) {
-  boost::char_separator<char> sep(",");
-  boost::tokenizer<boost::char_separator<char>> tokens(disabled_se, sep);
-  normalized_se_str.append(",");
-  BOOST_FOREACH (std::string se_name, tokens) {
-    const LEX_CSTRING *table_alias;
-    boost::algorithm::to_upper(se_name);
-    for (table_alias = sys_table_aliases; table_alias->str; table_alias += 2) {
-      if (!native_strcasecmp(se_name.c_str(), table_alias->str) ||
-          !native_strcasecmp(se_name.c_str(), (table_alias + 1)->str)) {
-        normalized_se_str.append(std::string(table_alias->str) + "," +
-                                 std::string((table_alias + 1)->str) + ",");
-        break;
-      }
-    }
+void set_externally_disabled_storage_engine_names(const char *disabled_list) {
+  assert(disabled_list != nullptr);
 
-    if (table_alias->str == NULL) normalized_se_str.append(se_name + ",");
-  }
+  myu::Split(
+      disabled_list, disabled_list + strlen(disabled_list), myu::IsComma,
+      [](const char *f, const char *l) {
+        auto tr = myu::FindTrimmedRange(f, l, myu::IsSpace);
+        if (tr.first == tr.second) return;
+
+        const LEX_CSTRING dse{tr.first,
+                              static_cast<size_t>(tr.second - tr.first)};
+        auto match = std::find_if(
+            std::begin(se_names), se_names_end,
+            [&](const Storage_engine_identifier &seid) {
+              return (
+                  (0 == strnncmp_nopads(hton_charset(), dse, seid.canonical)) ||
+                  (0 == strnncmp_nopads(hton_charset(), dse, seid.legacy)));
+            });
+        if (match == se_names_end) {
+          disabled_se_names.emplace_back(dse.str, dse.length);
+          return;
+        }
+        disabled_se_names.emplace_back(match->canonical.str,
+                                       match->canonical.length);
+        disabled_se_names.emplace_back(match->legacy.str, match->legacy.length);
+      });
+}
+
+static bool is_storage_engine_name_externally_disabled(const char *name) {
+  const LEX_CSTRING n{name, strlen(name)};
+  return std::any_of(
+      disabled_se_names.begin(), disabled_se_names.end(),
+      [&](const std::string &dse) {
+        return (0 == strnncmp_nopads(hton_charset(), n,
+                                     {dse.c_str(), dse.length()}));
+      });
+}
+
+/**
+  Returns true if the storage engine of the handlerton argument has
+  been listed in the disabled_storage_engines system variable. @note
+  that the SE may still be internally enabled, that is
+  HaIsInternallyEnabled may return true.
+ */
+bool ha_is_externally_disabled(const handlerton &htnr) {
+  const char *se_name = ha_resolve_storage_engine_name(&htnr);
+  assert(se_name != nullptr);
+  return is_storage_engine_name_externally_disabled(se_name);
 }
 
 // Check if storage engine is disabled for table/tablespace creation.
 bool ha_is_storage_engine_disabled(handlerton *se_handle) {
-  if (normalized_se_str.size()) {
-    std::string se_name(",");
-    se_name.append(ha_resolve_storage_engine_name(se_handle));
-    se_name.append(",");
-    boost::algorithm::to_upper(se_name);
-    if (strstr(normalized_se_str.c_str(), se_name.c_str())) return true;
-  }
-  return false;
+  assert(se_handle != nullptr);
+  return ha_is_externally_disabled(*se_handle);
 }
 
 plugin_ref ha_lock_engine(THD *thd, const handlerton *hton) {
   if (hton) {
     st_plugin_int **plugin = &se_plugin_array[hton->slot];
 
-#ifdef DBUG_OFF
+#ifdef NDEBUG
     /*
       Take a shortcut for builtin engines -- return pointer to plugin
       without acquiring LOCK_plugin mutex. This is safe safe since such
@@ -517,11 +519,11 @@ plugin_ref ha_lock_engine(THD *thd, const handlerton *hton) {
       We can't take shortcut in debug builds.
       At least assert that builtin_htons[slot] is set correctly.
     */
-    DBUG_ASSERT(builtin_htons[hton->slot] == (plugin[0]->plugin_dl == NULL));
+    assert(builtin_htons[hton->slot] == (plugin[0]->plugin_dl == nullptr));
     return my_plugin_lock(thd, &plugin);
 #endif
   }
-  return NULL;
+  return nullptr;
 }
 
 handlerton *ha_resolve_by_legacy_type(THD *thd, enum legacy_db_type db_type) {
@@ -535,7 +537,7 @@ handlerton *ha_resolve_by_legacy_type(THD *thd, enum legacy_db_type db_type) {
         return plugin_data<handlerton *>(plugin);
       /* fall through */
     case DB_TYPE_UNKNOWN:
-      return NULL;
+      return nullptr;
   }
 }
 
@@ -544,6 +546,7 @@ handlerton *ha_resolve_by_legacy_type(THD *thd, enum legacy_db_type db_type) {
 */
 handlerton *ha_checktype(THD *thd, enum legacy_db_type database_type,
                          bool no_substitute, bool report_error) {
+  DBUG_TRACE;
   handlerton *hton = ha_resolve_by_legacy_type(thd, database_type);
   if (ha_storage_engine_is_enabled(hton)) return hton;
 
@@ -552,7 +555,7 @@ handlerton *ha_checktype(THD *thd, enum legacy_db_type database_type,
       const char *engine_name = ha_resolve_storage_engine_name(hton);
       my_error(ER_FEATURE_DISABLED, MYF(0), engine_name, engine_name);
     }
-    return NULL;
+    return nullptr;
   }
 
   (void)RUN_HOOK(transaction, after_rollback, (thd, false));
@@ -619,9 +622,9 @@ int ha_init_errors(void) {
 
   /* Allocate a pointer array for the error message strings. */
   /* Zerofill it to avoid uninitialized gaps. */
-  if (!(handler_errmsgs = (const char **)my_malloc(
-            key_memory_handler_errmsgs, HA_ERR_ERRORS * sizeof(char *),
-            MYF(MY_WME | MY_ZEROFILL))))
+  if (!(handler_errmsgs = static_cast<const char **>(my_malloc(
+            key_memory_errmsgs_handler, HA_ERR_ERRORS * sizeof(char *),
+            MYF(MY_WME | MY_ZEROFILL)))))
     return 1;
 
   /* Set the dedicated error messages. */
@@ -693,6 +696,8 @@ int ha_init_errors(void) {
   SETMSG(HA_ERR_NO_SESSION_TEMP, ER_DEFAULT(ER_NO_SESSION_TEMP));
   SETMSG(HA_ERR_WRONG_TABLE_NAME, ER_DEFAULT(ER_WRONG_TABLE_NAME));
   SETMSG(HA_ERR_TOO_LONG_PATH, ER_DEFAULT(ER_TABLE_NAME_CAUSES_TOO_LONG_PATH));
+  SETMSG(HA_ERR_FTS_TOO_MANY_NESTED_EXP,
+         "Too many nested sub-expressions in a full-text search");
   /* Register the error messages for use with my_error(). */
   return my_error_register(get_handler_errmsg, HA_ERR_FIRST, HA_ERR_LAST);
 }
@@ -710,7 +715,7 @@ int ha_finalize_handlerton(st_plugin_int *plugin) {
       break;
     case SHOW_OPTION_YES:
       if (installed_htons[hton->db_type] == hton)
-        installed_htons[hton->db_type] = NULL;
+        installed_htons[hton->db_type] = nullptr;
       break;
   };
 
@@ -722,7 +727,7 @@ int ha_finalize_handlerton(st_plugin_int *plugin) {
       engine plugins.
     */
     DBUG_PRINT("info", ("Deinitializing plugin: '%s'", plugin->name.str));
-    if (plugin->plugin->deinit(NULL)) {
+    if (plugin->plugin->deinit(nullptr)) {
       DBUG_PRINT("warning", ("Plugin '%s' deinit function returned error.",
                              plugin->name.str));
     }
@@ -735,8 +740,8 @@ int ha_finalize_handlerton(st_plugin_int *plugin) {
   */
   if (hton->slot != HA_SLOT_UNDEF) {
     /* Make sure we are not unpluging another plugin */
-    DBUG_ASSERT(se_plugin_array[hton->slot] == plugin);
-    DBUG_ASSERT(hton->slot < se_plugin_array.size());
+    assert(se_plugin_array[hton->slot] == plugin);
+    assert(hton->slot < se_plugin_array.size());
     se_plugin_array[hton->slot] = NULL;
     builtin_htons[hton->slot] = false; /* Extra correctness. */
   }
@@ -752,10 +757,11 @@ int ha_initialize_handlerton(st_plugin_int *plugin) {
   DBUG_TRACE;
   DBUG_PRINT("plugin", ("initialize plugin: '%s'", plugin->name.str));
 
-  hton = (handlerton *)my_malloc(key_memory_handlerton, sizeof(handlerton),
-                                 MYF(MY_WME | MY_ZEROFILL));
+  hton = static_cast<handlerton *>(my_malloc(key_memory_handlerton_objects,
+                                             sizeof(handlerton),
+                                             MYF(MY_WME | MY_ZEROFILL)));
 
-  if (hton == NULL) {
+  if (hton == nullptr) {
     LogErr(ERROR_LEVEL, ER_HANDLERTON_OOM, plugin->name.str);
     goto err_no_hton_memory;
   }
@@ -812,7 +818,7 @@ int ha_initialize_handlerton(st_plugin_int *plugin) {
         hton->slot = se_plugin_array.size();
       }
       if (se_plugin_array.assign_at(hton->slot, plugin) ||
-          builtin_htons.assign_at(hton->slot, (plugin->plugin_dl == NULL)))
+          builtin_htons.assign_at(hton->slot, (plugin->plugin_dl == nullptr)))
         goto err_deinit;
 
       installed_htons[hton->db_type] = hton;
@@ -863,12 +869,12 @@ err_deinit:
     Let plugin do its inner deinitialization as plugin->init()
     was successfully called before.
   */
-  if (plugin->plugin->deinit) (void)plugin->plugin->deinit(NULL);
+  if (plugin->plugin->deinit) (void)plugin->plugin->deinit(nullptr);
 
 err:
   my_free(hton);
 err_no_hton_memory:
-  plugin->data = NULL;
+  plugin->data = nullptr;
   return 1;
 }
 
@@ -901,7 +907,7 @@ static bool dropdb_handlerton(THD *, plugin_ref plugin, void *path) {
 }
 
 void ha_drop_database(char *path) {
-  plugin_foreach(NULL, dropdb_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN, path);
+  plugin_foreach(nullptr, dropdb_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN, path);
 }
 
 static bool closecon_handlerton(THD *thd, plugin_ref plugin, void *) {
@@ -913,7 +919,7 @@ static bool closecon_handlerton(THD *thd, plugin_ref plugin, void *) {
   if (hton->state == SHOW_OPTION_YES && thd_get_ha_data(thd, hton)) {
     if (hton->close_connection) hton->close_connection(hton, thd);
     /* make sure ha_data is reset and ha_data_lock is released */
-    thd_set_ha_data(thd, hton, NULL);
+    thd_set_ha_data(thd, hton, nullptr);
   }
   return false;
 }
@@ -923,7 +929,8 @@ static bool closecon_handlerton(THD *thd, plugin_ref plugin, void *) {
     don't bother to rollback here, it's done already
 */
 void ha_close_connection(THD *thd) {
-  plugin_foreach(thd, closecon_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN, 0);
+  plugin_foreach(thd, closecon_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
+                 nullptr);
 }
 
 static bool kill_handlerton(THD *thd, plugin_ref plugin, void *) {
@@ -937,7 +944,7 @@ static bool kill_handlerton(THD *thd, plugin_ref plugin, void *) {
 }
 
 void ha_kill_connection(THD *thd) {
-  plugin_foreach(thd, kill_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN, 0);
+  plugin_foreach(thd, kill_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN, nullptr);
 }
 
 /** Invoke handlerton::pre_dd_shutdown() on a plugin.
@@ -952,8 +959,8 @@ static bool pre_dd_shutdown_handlerton(THD *, plugin_ref plugin, void *) {
 
 /** Invoke handlerton::pre_dd_shutdown() on every storage engine plugin. */
 void ha_pre_dd_shutdown(void) {
-  plugin_foreach(NULL, pre_dd_shutdown_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
-                 0);
+  plugin_foreach(nullptr, pre_dd_shutdown_handlerton,
+                 MYSQL_STORAGE_ENGINE_PLUGIN, nullptr);
 }
 
 /* ========================================================================
@@ -1277,11 +1284,11 @@ void trans_register_ha(THD *thd, bool all, handlerton *ht_arg,
       Ensure no active backup engine data exists, unless the current
       transaction is from replication and in active xa state.
     */
-    DBUG_ASSERT(
-        thd->get_ha_data(ht_arg->slot)->ha_ptr_backup == NULL ||
+    assert(
+        thd->get_ha_data(ht_arg->slot)->ha_ptr_backup == nullptr ||
         (thd->get_transaction()->xid_state()->has_state(XID_STATE::XA_ACTIVE)));
-    DBUG_ASSERT(thd->get_ha_data(ht_arg->slot)->ha_ptr_backup == NULL ||
-                (thd->is_binlog_applier() || thd->slave_thread));
+    assert(thd->get_ha_data(ht_arg->slot)->ha_ptr_backup == nullptr ||
+           (thd->is_binlog_applier() || thd->slave_thread));
 
     thd->server_status |= SERVER_STATUS_IN_TRANS;
     if (thd->tx_read_only)
@@ -1292,14 +1299,14 @@ void trans_register_ha(THD *thd, bool all, handlerton *ht_arg,
   ha_info = thd->get_ha_data(ht_arg->slot)->ha_info + (all ? 1 : 0);
 
   if (ha_info->is_started()) {
-    DBUG_ASSERT(trn_ctx->ha_trx_info(trx_scope));
+    assert(trn_ctx->ha_trx_info(trx_scope));
     return; /* already registered, return */
   }
 
   trn_ctx->register_ha(trx_scope, ha_info, ht_arg);
   trn_ctx->set_ha_trx_info(trx_scope, ha_info);
 
-  if (ht_arg->prepare == 0) trn_ctx->set_no_2pc(trx_scope, true);
+  if (ht_arg->prepare == nullptr) trn_ctx->set_no_2pc(trx_scope, true);
 
   trn_ctx->xid_state()->set_query_id(thd->query_id);
 /*
@@ -1314,7 +1321,7 @@ void trans_register_ha(THD *thd, bool all, handlerton *ht_arg,
   transactional storage engine.
 */
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
-  if (thd->m_transaction_psi == NULL && ht_arg->db_type != DB_TYPE_BINLOG &&
+  if (thd->m_transaction_psi == nullptr && ht_arg->db_type != DB_TYPE_BINLOG &&
       !thd->is_attachable_transaction_active()) {
     const XID *xid = trn_ctx->xid_state()->get_xid();
     bool autocommit = !thd->in_multi_stmt_transaction_mode();
@@ -1333,7 +1340,7 @@ void trans_register_ha(THD *thd, bool all, handlerton *ht_arg,
 @return 0 for success, 1 for error - entire transaction is rolled back. */
 static int prepare_one_ht(THD *thd, handlerton *ht) {
   DBUG_TRACE;
-  DBUG_ASSERT(!thd->status_var_aggregated);
+  assert(!thd->status_var_aggregated);
   thd->status_var.ha_prepare_count++;
   if (ht->prepare) {
     DBUG_EXECUTE_IF("simulate_xa_failure_prepare", {
@@ -1358,20 +1365,35 @@ static int prepare_one_ht(THD *thd, handlerton *ht) {
   @retval
     1   error, transaction was rolled back
 */
-int ha_prepare(THD *thd) {
+int ha_xa_prepare(THD *thd) {
   int error = 0;
   Transaction_ctx *trn_ctx = thd->get_transaction();
   DBUG_TRACE;
 
   if (trn_ctx->is_active(Transaction_ctx::SESSION)) {
     const Ha_trx_info *ha_info = trn_ctx->ha_trx_info(Transaction_ctx::SESSION);
-    bool gtid_error = false, need_clear_owned_gtid = false;
-
-    if ((gtid_error = commit_owned_gtids(thd, true, &need_clear_owned_gtid))) {
-      DBUG_ASSERT(need_clear_owned_gtid);
+    bool gtid_error = false;
+    bool need_clear_owned_gtid = false;
+    std::tie(gtid_error, need_clear_owned_gtid) = commit_owned_gtids(thd, true);
+    if (gtid_error) {
+      assert(need_clear_owned_gtid);
 
       ha_rollback_trans(thd, true);
       error = 1;
+      goto err;
+    }
+
+    /*
+      Ensure externalization order for applier threads.
+
+      Note: the calls to Commit_order_manager::wait/wait_and_finish() will be
+            no-op for threads other than replication applier threads.
+    */
+    if (Commit_order_manager::wait(thd)) {
+      thd->commit_error = THD::CE_NONE;
+      ha_rollback_trans(thd, true);
+      error = 1;
+      gtid_error = true;
       goto err;
     }
 
@@ -1400,10 +1422,19 @@ int ha_prepare(THD *thd) {
       }
     }
 
-    DBUG_ASSERT(error != 0 || thd->get_transaction()->xid_state()->has_state(
-                                  XID_STATE::XA_IDLE));
+    assert(error != 0 ||
+           thd->get_transaction()->xid_state()->has_state(XID_STATE::XA_IDLE));
 
   err:
+    /*
+      After ensuring externalization order for applier thread, remove it
+      from waiting (Commit Order Queue) and allow next applier thread to
+      be ordered.
+
+      Note: the calls to Commit_order_manager::wait_and_finish() will be
+            no-op for threads other than replication applier threads.
+    */
+    Commit_order_manager::wait_and_finish(thd, error);
     gtid_state_commit_or_rollback(thd, need_clear_owned_gtid, !gtid_error);
   }
 
@@ -1441,7 +1472,7 @@ static uint ha_check_and_coalesce_trx_read_only(THD *thd, Ha_trx_info *ha_list,
     if (!all) {
       Ha_trx_info *ha_info_all =
           &thd->get_ha_data(ha_info->ht()->slot)->ha_info[1];
-      DBUG_ASSERT(ha_info != ha_info_all);
+      assert(ha_info != ha_info_all);
       /*
         Merge read-only/read-write information about statement
         transaction to its enclosing normal transaction. Do this
@@ -1472,32 +1503,57 @@ static uint ha_check_and_coalesce_trx_read_only(THD *thd, Ha_trx_info *ha_list,
   @param thd  Thread context.
   @param all  The execution scope, true for the transaction one, false
               for the statement one.
-  @param[out] need_clear_owned_gtid_ptr
-              A pointer to bool variable to return the computed decision
-              value.
-  @return zero as no error indication, non-zero otherwise
+
+  @return   std::pair containing: Error and Owned GTID release status
+   Error
+            @retval  0    Ok
+            @retval !0    Error
+
+   Owned GTID release status
+            @retval  true   remove the GTID owned by thread from owned GTIDs
+            @retval  false  removal of the GTID owned by thread from owned GTIDs
+                            is not required
 */
 
-int commit_owned_gtids(THD *thd, bool all, bool *need_clear_owned_gtid_ptr) {
+std::pair<int, bool> commit_owned_gtids(THD *thd, bool all) {
   DBUG_TRACE;
   int error = 0;
+  bool need_clear_owned_gtid = false;
 
-  if ((!opt_bin_log || (thd->slave_thread && !opt_log_slave_updates)) &&
-      (all || !thd->in_multi_stmt_transaction_mode()) &&
-      !thd->is_operating_gtid_table_implicitly &&
+  /*
+    If the binary log is disabled for this thread (either by
+    log_bin=0 or sql_log_bin=0 or by log_slave_updates=0 for a
+    slave thread), then the statement will not be written to
+    the binary log. In this case, we should save its GTID into
+    mysql.gtid_executed table and @@GLOBAL.GTID_EXECUTED as it
+    did when binlog is enabled.
+
+    We also skip saving GTID into mysql.gtid_executed table and
+    @@GLOBAL.GTID_EXECUTED when slave-preserve-commit-order is enabled. We skip
+    as GTID will be saved in
+    Commit_order_manager::flush_engine_and_signal_threads (invoked from
+    Commit_order_manager::wait_and_finish). In particular, there is the
+    following call stack under ha_commit_low which save GTID in case its skipped
+    here:
+
+      ha_commit_low ->
+      Commit_order_manager::wait_and_finish ->
+      Commit_order_manager::finish ->
+      Commit_order_manager::flush_engine_and_signal_threads ->
+      Gtid_state::update_commit_group
+
+    We also skip saving GTID for intermediate commits i.e. when
+    thd->is_operating_substatement_implicitly is enabled.
+  */
+  if (thd->is_current_stmt_binlog_log_slave_updates_disabled() &&
+      ending_trans(thd, all) && !thd->is_operating_gtid_table_implicitly &&
       !thd->is_operating_substatement_implicitly) {
-    /*
-      If the binary log is disabled for this thread (either by
-      log_bin=0 or sql_log_bin=0 or by log_slave_updates=0 for a
-      slave thread), then the statement will not be written to
-      the binary log. In this case, we should save its GTID into
-      mysql.gtid_executed table and @@GLOBAL.GTID_EXECUTED as it
-      did when binlog is enabled.
-    */
-    if (thd->owned_gtid.sidno > 0 ||
-        thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS) {
-      *need_clear_owned_gtid_ptr = true;
+    if (!has_commit_order_manager(thd) &&
+        (thd->owned_gtid.sidno > 0 ||
+         thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS)) {
+      need_clear_owned_gtid = true;
     }
+
     /*
       If GTID is not persisted by SE, write it to
       mysql.gtid_executed table.
@@ -1505,40 +1561,9 @@ int commit_owned_gtids(THD *thd, bool all, bool *need_clear_owned_gtid_ptr) {
     if (thd->owned_gtid.sidno > 0 && !thd->se_persists_gtid()) {
       error = gtid_state->save(thd);
     }
-  } else {
-    *need_clear_owned_gtid_ptr = false;
   }
 
-  return error;
-}
-
-/**
-  The function is a wrapper of commit_owned_gtids(...). It is invoked
-  at committing a partially failed statement or transaction.
-
-  @param thd  Thread context.
-
-  @retval -1 if error when persisting owned gtid.
-  @retval 0 if succeed to commit owned gtid.
-  @retval 1 if do not meet conditions to commit owned gtid.
-*/
-int commit_owned_gtid_by_partial_command(THD *thd) {
-  DBUG_TRACE;
-  bool need_clear_owned_gtid_ptr = false;
-  int ret = 0;
-
-  if (commit_owned_gtids(thd, true, &need_clear_owned_gtid_ptr)) {
-    /* Error when saving gtid into mysql.gtid_executed table. */
-    gtid_state->update_on_rollback(thd);
-    ret = -1;
-  } else if (need_clear_owned_gtid_ptr) {
-    gtid_state->update_on_commit(thd);
-    ret = 0;
-  } else {
-    ret = 1;
-  }
-
-  return ret;
+  return std::make_pair(error, need_clear_owned_gtid);
 }
 
 /**
@@ -1567,14 +1592,14 @@ int commit_owned_gtid_by_partial_command(THD *thd) {
 int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
   int error = 0;
   THD_STAGE_INFO(thd, stage_waiting_for_handler_commit);
-  bool need_clear_owned_gtid = false;
   bool run_slave_post_commit = false;
+  bool need_clear_owned_gtid = false;
   /*
     Save transaction owned gtid into table before transaction prepare
     if binlog is disabled, or binlog is enabled and log_slave_updates
     is disabled with slave SQL thread or slave worker thread.
   */
-  error = commit_owned_gtids(thd, all, &need_clear_owned_gtid);
+  std::tie(error, need_clear_owned_gtid) = commit_owned_gtids(thd, all);
 
   /*
     'all' means that this is either an explicit commit issued by
@@ -1606,29 +1631,31 @@ int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
     flags will not get propagated to its normal transaction's
     counterpart.
   */
-  DBUG_ASSERT(!trn_ctx->is_active(Transaction_ctx::STMT) || !all);
+  assert(!trn_ctx->is_active(Transaction_ctx::STMT) || !all);
+
+  DBUG_EXECUTE_IF("pre_commit_error", {
+    error = true;
+    my_error(ER_UNKNOWN_ERROR, MYF(0));
+  });
 
   /*
     When atomic DDL is executed on the slave, we would like to
     to update slave applier state as part of DDL's transaction.
     Call Relay_log_info::pre_commit() hook to do this before DDL
     gets committed in the following block.
+    Failed atomic DDL statements should've been marked as executed/committed
+    during statement rollback, though some like GRANT may continue until
+    this point.
+    When applying a DDL statement on a slave and the statement is filtered
+    out by a table filter, we report an error "ER_SLAVE_IGNORED_TABLE" to
+    warn slave applier thread. We need to save the DDL statement's gtid
+    into mysql.gtid_executed system table if the binary log is disabled
+    on the slave and gtids are enabled.
   */
-  if (is_real_trans && is_atomic_ddl_commit_on_slave(thd)) {
-    /*
-      Failed atomic DDL statements should've been marked as executed/committed
-      during statement rollback.
-      When applying a DDL statement on a slave and the statement is filtered
-      out by a table filter, we report an error "ER_SLAVE_IGNORED_TABLE" to
-      warn slave applier thread. We need to save the DDL statement's gtid
-      into mysql.gtid_executed system table if the binary log is disabled
-      on the slave and gtids are enabled. It is not necessary to assert that
-      there is no error when committing the DDL statement's gtid into table.
-    */
-    DBUG_ASSERT(!thd->is_error() ||
-                (thd->is_operating_gtid_table_implicitly &&
-                 thd->get_stmt_da()->mysql_errno() == ER_SLAVE_IGNORED_TABLE));
-
+  if (is_real_trans && is_atomic_ddl_commit_on_slave(thd) &&
+      (!thd->is_error() ||
+       (thd->is_operating_gtid_table_implicitly &&
+        thd->get_stmt_da()->mysql_errno() == ER_SLAVE_IGNORED_TABLE))) {
     run_slave_post_commit = true;
     error = error || thd->rli_slave->pre_commit();
 
@@ -1643,7 +1670,7 @@ int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
   }
 
   if (thd->in_sub_stmt) {
-    DBUG_ASSERT(0);
+    assert(0);
     /*
       Since we don't support nested statement transactions in 5.0,
       we can't commit or rollback stmt transactions while we are inside
@@ -1681,7 +1708,7 @@ int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
 
     DBUG_EXECUTE_IF("dbug.enabled_commit", {
       const char act[] = "now signal Reached wait_for signal.commit_continue";
-      DBUG_ASSERT(!debug_sync_set_action(thd, STRING_WITH_LEN(act)));
+      assert(!debug_sync_set_action(thd, STRING_WITH_LEN(act)));
     };);
     DEBUG_SYNC(thd, "ha_commit_trans_before_acquire_commit_lock");
     if (rw_trans && !ignore_global_read_lock) {
@@ -1723,7 +1750,7 @@ int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
     The fact of the Prepared state is of interest to binary logger.
   */
   if (!error && all && xid_state->has_state(XID_STATE::XA_IDLE)) {
-    DBUG_ASSERT(
+    assert(
         thd->lex->sql_command == SQLCOM_XA_COMMIT &&
         static_cast<Sql_cmd_xa_commit *>(thd->lex->m_sql_cmd)->get_xa_opt() ==
             XA_ONE_PHASE);
@@ -1740,9 +1767,9 @@ int ha_commit_trans(THD *thd, bool all, bool ignore_global_read_lock) {
   (autocommit=1) transaction as rolled back
 */
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
-  if (is_real_trans && thd->m_transaction_psi != NULL) {
+  if (is_real_trans && thd->m_transaction_psi != nullptr) {
     MYSQL_COMMIT_TRANSACTION(thd->m_transaction_psi);
-    thd->m_transaction_psi = NULL;
+    thd->m_transaction_psi = nullptr;
   }
 #endif
   DBUG_EXECUTE_IF("crash_commit_after",
@@ -1776,6 +1803,10 @@ end:
       gtid_state->update_on_rollback(thd);
     else
       gtid_state->update_on_commit(thd);
+  } else {
+    if (has_commit_order_manager(thd) && error) {
+      gtid_state->update_on_rollback(thd);
+    }
   }
   if (run_slave_post_commit) {
     DBUG_EXECUTE_IF("slave_crash_after_commit", DBUG_SUICIDE(););
@@ -1840,13 +1871,67 @@ int ha_commit_low(THD *thd, bool all, bool run_after_commit) {
       At execution of XA COMMIT ONE PHASE binlog or slave applier
       reattaches the engine ha_data to THD, previously saved at XA START.
     */
-    if (all && thd->rpl_unflag_detached_engine_ha_data()) {
+    if (all && thd->is_engine_ha_data_detached()) {
       DBUG_PRINT("info", ("query='%s'", thd->query().str));
-      DBUG_ASSERT(thd->lex->sql_command == SQLCOM_XA_COMMIT);
-      DBUG_ASSERT(
+      assert(thd->lex->sql_command == SQLCOM_XA_COMMIT);
+      assert(
           static_cast<Sql_cmd_xa_commit *>(thd->lex->m_sql_cmd)->get_xa_opt() ==
           XA_ONE_PHASE);
       restore_backup_ha_data = true;
+    }
+
+    bool is_applier_wait_enabled = false;
+
+    /*
+      Preserve externalization and persistence order for applier threads.
+
+      The conditions should be understood as follows:
+
+      - When the binlog is enabled, this will be done from
+        MYSQL_BIN_LOG::ordered_commit and should not be done here.
+        Therefore, we have the condition
+        thd->is_current_stmt_binlog_disabled().
+
+      - This function is usually called once per statement, with
+        all=false.  We should not preserve the commit order when this
+        function is called in that context.  Therefore, we have the
+        condition ending_trans(thd, all).
+
+      - Statements such as ANALYZE/OPTIMIZE/REPAIR TABLE will call
+        ha_commit_low multiple times with all=true from within
+        mysql_admin_table, mysql_recreate_table, and
+        handle_histogram_command. After returing to
+        mysql_execute_command, it will call ha_commit_low a final
+        time.  It is only in this final call that we should preserve
+        the commit order. Therefore, we set the flag
+        thd->is_operating_substatement_implicitly while executing
+        mysql_admin_table, mysql_recreate_table, and
+        handle_histogram_command, clear it when returning from those
+        functions, and check the flag here in ha_commit_low().
+
+      - In all the above cases, we should make the current transaction
+        fail early in case a previous transaction has rolled back.
+        Therefore, we also invoke the commit order manager in case
+        get_rollback_status returns true.
+
+      Note: the calls to Commit_order_manager::wait/wait_and_finish() will be
+            no-op for threads other than replication applier threads.
+    */
+    if ((!thd->is_operating_substatement_implicitly &&
+         !thd->is_operating_gtid_table_implicitly &&
+         thd->is_current_stmt_binlog_log_slave_updates_disabled() &&
+         ending_trans(thd, all)) ||
+        Commit_order_manager::get_rollback_status(thd)) {
+      if (Commit_order_manager::wait(thd)) {
+        error = 1;
+        /*
+          Remove applier thread from waiting in Commit Order Queue and
+          allow next applier thread to be ordered.
+        */
+        Commit_order_manager::wait_and_finish(thd, error);
+        goto err;
+      }
+      is_applier_wait_enabled = true;
     }
 
     for (; ha_info; ha_info = ha_info_next) {
@@ -1858,14 +1943,28 @@ int ha_commit_low(THD *thd, bool all, bool run_after_commit) {
                  my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
         error = 1;
       }
-      DBUG_ASSERT(!thd->status_var_aggregated);
+      assert(!thd->status_var_aggregated);
       thd->status_var.ha_commit_count++;
       ha_info_next = ha_info->next();
-      if (restore_backup_ha_data) reattach_engine_ha_data_to_thd(thd, ht);
       ha_info->reset(); /* keep it conveniently zero-filled */
     }
+    if (restore_backup_ha_data) thd->rpl_reattach_engine_ha_data();
     trn_ctx->reset_scope(trx_scope);
+
+    /*
+      After ensuring externalization order for applier thread, remove it
+      from waiting (Commit Order Queue) and allow next applier thread to
+      be ordered.
+
+      Note: the calls to Commit_order_manager::wait_and_finish() will be
+            no-op for threads other than replication applier threads.
+    */
+    if (is_applier_wait_enabled) {
+      Commit_order_manager::wait_and_finish(thd, error);
+    }
   }
+
+err:
   /* Free resources and perform other cleanup even for 'empty' transactions. */
   if (all) trn_ctx->cleanup();
   /*
@@ -1903,9 +2002,9 @@ int ha_rollback_low(THD *thd, bool all) {
       Similarly to the commit case, the binlog or slave applier
       reattaches the engine ha_data to THD.
     */
-    if (all && thd->rpl_unflag_detached_engine_ha_data()) {
-      DBUG_ASSERT(trn_ctx->xid_state()->get_state() != XID_STATE::XA_NOTR ||
-                  thd->killed == THD::KILL_CONNECTION);
+    if (all && thd->is_engine_ha_data_detached()) {
+      assert(trn_ctx->xid_state()->get_state() != XID_STATE::XA_NOTR ||
+             thd->killed == THD::KILL_CONNECTION);
 
       restore_backup_ha_data = true;
     }
@@ -1919,12 +2018,12 @@ int ha_rollback_low(THD *thd, bool all) {
                  my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
         error = 1;
       }
-      DBUG_ASSERT(!thd->status_var_aggregated);
+      assert(!thd->status_var_aggregated);
       thd->status_var.ha_rollback_count++;
       ha_info_next = ha_info->next();
-      if (restore_backup_ha_data) reattach_engine_ha_data_to_thd(thd, ht);
       ha_info->reset(); /* keep it conveniently zero-filled */
     }
+    if (restore_backup_ha_data) thd->rpl_reattach_engine_ha_data();
     trn_ctx->reset_scope(trx_scope);
   }
 
@@ -1933,18 +2032,18 @@ int ha_rollback_low(THD *thd, bool all) {
     transaction hasn't been started in any transactional storage engine.
 
     It is possible to have a call of ha_rollback_low() while handling
-    failure from ha_prepare() and an error in Daignostics_area still
+    failure from ha_xa_prepare() and an error in Daignostics_area still
     wasn't set. Therefore it is required to check that an error in
     Diagnostics_area is set before calling the method XID_STATE::set_error().
 
     If it wasn't done it would lead to failure of the assertion
-      DBUG_ASSERT(m_status == DA_ERROR)
+      assert(m_status == DA_ERROR)
     in the method Diagnostics_area::mysql_errno().
 
-    In case ha_prepare is failed and an error wasn't set in Diagnostics_area
+    In case ha_xa_prepare is failed and an error wasn't set in Diagnostics_area
     the error ER_XA_RBROLLBACK is set in the Diagnostics_area from
     the method Sql_cmd_xa_prepare::trans_xa_prepare() when non-zero result code
-    returned by ha_prepare() is handled.
+    returned by ha_xa_prepare() is handled.
   */
   if (all && thd->transaction_rollback_request && thd->is_error())
     trn_ctx->xid_state()->set_error(thd);
@@ -1979,10 +2078,10 @@ int ha_rollback_trans(THD *thd, bool all) {
     We must not rollback the normal transaction if a statement
     transaction is pending.
   */
-  DBUG_ASSERT(!trn_ctx->is_active(Transaction_ctx::STMT) || !all);
+  assert(!trn_ctx->is_active(Transaction_ctx::STMT) || !all);
 
   if (thd->in_sub_stmt) {
-    DBUG_ASSERT(0);
+    assert(0);
     /*
       If we are inside stored function or trigger we should not commit or
       rollback current statement transaction. See comment in ha_commit_trans()
@@ -2001,7 +2100,7 @@ int ha_rollback_trans(THD *thd, bool all) {
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
   if (all || !thd->in_active_multi_stmt_transaction()) {
     MYSQL_ROLLBACK_TRANSACTION(thd->m_transaction_psi);
-    thd->m_transaction_psi = NULL;
+    thd->m_transaction_psi = nullptr;
   }
 #endif
 
@@ -2059,17 +2158,17 @@ int ha_commit_attachable(THD *thd) {
   Ha_trx_info *ha_info_next;
 
   /* This function only handles attachable transactions. */
-  DBUG_ASSERT(thd->is_attachable_ro_transaction_active());
+  assert(thd->is_attachable_ro_transaction_active());
   /*
     Since the attachable transaction is AUTOCOMMIT we only need
     to care about statement transaction.
   */
-  DBUG_ASSERT(!trn_ctx->is_active(Transaction_ctx::SESSION));
+  assert(!trn_ctx->is_active(Transaction_ctx::SESSION));
 
   if (ha_info) {
     for (; ha_info; ha_info = ha_info_next) {
       /* Attachable transaction is not supposed to modify anything. */
-      DBUG_ASSERT(!ha_info->is_trx_read_write());
+      assert(!ha_info->is_trx_read_write());
 
       handlerton *ht = ha_info->ht();
       if (ht->commit(ht, thd, false)) {
@@ -2079,10 +2178,10 @@ int ha_commit_attachable(THD *thd) {
           resources/cleanup state. Even if this happens we will simply
           continue committing attachable transaction in other SEs.
         */
-        DBUG_ASSERT(false);
+        assert(false);
         error = 1;
       }
-      DBUG_ASSERT(!thd->status_var_aggregated);
+      assert(!thd->status_var_aggregated);
       thd->status_var.ha_commit_count++;
       ha_info_next = ha_info->next();
 
@@ -2095,9 +2194,9 @@ int ha_commit_attachable(THD *thd) {
     Mark transaction as commited in PSI.
   */
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
-  if (thd->m_transaction_psi != NULL) {
+  if (thd->m_transaction_psi != nullptr) {
     MYSQL_COMMIT_TRANSACTION(thd->m_transaction_psi);
-    thd->m_transaction_psi = NULL;
+    thd->m_transaction_psi = nullptr;
   }
 #endif
 
@@ -2132,9 +2231,9 @@ bool ha_rollback_to_savepoint_can_release_mdl(THD *thd) {
   for (ha_info = trn_ctx->ha_trx_info(trx_scope); ha_info;
        ha_info = ha_info->next()) {
     handlerton *ht = ha_info->ht();
-    DBUG_ASSERT(ht);
+    assert(ht);
 
-    if (ht->savepoint_rollback_can_release_mdl == 0 ||
+    if (ht->savepoint_rollback_can_release_mdl == nullptr ||
         ht->savepoint_rollback_can_release_mdl(ht, thd) == false)
       return false;
   }
@@ -2153,7 +2252,7 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv) {
   DBUG_TRACE;
 
   trn_ctx->set_rw_ha_count(trx_scope, 0);
-  trn_ctx->set_no_2pc(trx_scope, 0);
+  trn_ctx->set_no_2pc(trx_scope, false);
   /*
     rolling back to savepoint in all storage engines that were part of the
     transaction when the savepoint was set
@@ -2161,8 +2260,8 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv) {
   for (ha_info = sv->ha_list; ha_info; ha_info = ha_info->next()) {
     int err;
     handlerton *ht = ha_info->ht();
-    DBUG_ASSERT(ht);
-    DBUG_ASSERT(ht->savepoint_set != 0);
+    assert(ht);
+    assert(ht->savepoint_set != nullptr);
     if ((err = ht->savepoint_rollback(
              ht, thd,
              (uchar *)(sv + 1) + ht->savepoint_offset))) {  // cannot happen
@@ -2171,9 +2270,9 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv) {
                my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
       error = 1;
     }
-    DBUG_ASSERT(!thd->status_var_aggregated);
+    assert(!thd->status_var_aggregated);
     thd->status_var.ha_savepoint_rollback_count++;
-    if (ht->prepare == 0) trn_ctx->set_no_2pc(trx_scope, true);
+    if (ht->prepare == nullptr) trn_ctx->set_no_2pc(trx_scope, true);
   }
 
   /*
@@ -2190,7 +2289,7 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv) {
                my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
       error = 1;
     }
-    DBUG_ASSERT(!thd->status_var_aggregated);
+    assert(!thd->status_var_aggregated);
     thd->status_var.ha_rollback_count++;
     ha_info_next = ha_info->next();
     ha_info->reset(); /* keep it conveniently zero-filled */
@@ -2198,7 +2297,7 @@ int ha_rollback_to_savepoint(THD *thd, SAVEPOINT *sv) {
   trn_ctx->set_ha_trx_info(trx_scope, sv->ha_list);
 
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
-  if (thd->m_transaction_psi != NULL)
+  if (thd->m_transaction_psi != nullptr)
     MYSQL_INC_TRANSACTION_ROLLBACK_TO_SAVEPOINT(thd->m_transaction_psi, 1);
 #endif
 
@@ -2229,7 +2328,7 @@ int ha_prepare_low(THD *thd, bool all) {
                  my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
         error = 1;
       }
-      DBUG_ASSERT(!thd->status_var_aggregated);
+      assert(!thd->status_var_aggregated);
       thd->status_var.ha_prepare_count++;
     }
     DBUG_EXECUTE_IF("crash_commit_after_prepare", DBUG_SUICIDE(););
@@ -2256,7 +2355,7 @@ int ha_savepoint(THD *thd, SAVEPOINT *sv) {
   for (; ha_info; ha_info = ha_info->next()) {
     int err;
     handlerton *ht = ha_info->ht();
-    DBUG_ASSERT(ht);
+    assert(ht);
     if (!ht->savepoint_set) {
       my_error(ER_CHECK_NOT_IMPLEMENTED, MYF(0), "SAVEPOINT");
       error = 1;
@@ -2270,7 +2369,7 @@ int ha_savepoint(THD *thd, SAVEPOINT *sv) {
                my_strerror(errbuf, MYSQL_ERRMSG_SIZE, err));
       error = 1;
     }
-    DBUG_ASSERT(!thd->status_var_aggregated);
+    assert(!thd->status_var_aggregated);
     thd->status_var.ha_savepoint_count++;
   }
   /*
@@ -2280,7 +2379,7 @@ int ha_savepoint(THD *thd, SAVEPOINT *sv) {
   sv->ha_list = begin_ha_info;
 
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
-  if (!error && thd->m_transaction_psi != NULL)
+  if (!error && thd->m_transaction_psi != nullptr)
     MYSQL_INC_TRANSACTION_SAVEPOINTS(thd->m_transaction_psi, 1);
 #endif
 
@@ -2296,7 +2395,7 @@ int ha_release_savepoint(THD *thd, SAVEPOINT *sv) {
     int err;
     handlerton *ht = ha_info->ht();
     /* Savepoint life time is enclosed into transaction life time. */
-    DBUG_ASSERT(ht);
+    assert(ht);
     if (!ht->savepoint_release) continue;
     if ((err = ht->savepoint_release(
              ht, thd,
@@ -2313,7 +2412,7 @@ int ha_release_savepoint(THD *thd, SAVEPOINT *sv) {
   });
 
 #ifdef HAVE_PSI_TRANSACTION_INTERFACE
-  if (thd->m_transaction_psi != NULL)
+  if (thd->m_transaction_psi != nullptr)
     MYSQL_INC_TRANSACTION_RELEASE_SAVEPOINT(thd->m_transaction_psi, 1);
 #endif
   return error;
@@ -2353,7 +2452,7 @@ static bool flush_handlerton(THD *, plugin_ref plugin, void *arg) {
 }
 
 bool ha_flush_logs(bool binlog_group_flush) {
-  if (plugin_foreach(NULL, flush_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
+  if (plugin_foreach(nullptr, flush_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
                      static_cast<void *>(&binlog_group_flush))) {
     return true;
   }
@@ -2405,9 +2504,9 @@ const char *get_canonical_filename(handler *file, const char *path,
 
 class Ha_delete_table_error_handler : public Internal_error_handler {
  public:
-  virtual bool handle_condition(THD *, uint, const char *,
-                                Sql_condition::enum_severity_level *level,
-                                const char *) {
+  bool handle_condition(THD *, uint, const char *,
+                        Sql_condition::enum_severity_level *level,
+                        const char *) override {
     /* Downgrade errors to warnings. */
     if (*level == Sql_condition::SL_ERROR) *level = Sql_condition::SL_WARNING;
     return false;
@@ -2442,10 +2541,11 @@ int ha_delete_table(THD *thd, handlerton *table_type, const char *path,
   dummy_table.s = &dummy_share;
 
   /* DB_TYPE_UNKNOWN is used in ALTER TABLE when renaming only .frm files */
-  if (table_type == NULL ||
-      !(file = get_new_handler(
-            (TABLE_SHARE *)0, table_def->partition_type() != dd::Table::PT_NONE,
-            thd->mem_root, table_type))) {
+  if (table_type == nullptr ||
+      !(file =
+            get_new_handler((TABLE_SHARE *)nullptr,
+                            table_def->partition_type() != dd::Table::PT_NONE,
+                            thd->mem_root, table_type))) {
     return ENOENT;
   }
 
@@ -2486,7 +2586,7 @@ int ha_delete_table(THD *thd, handlerton *table_type, const char *path,
 #ifdef HAVE_PSI_TABLE_INTERFACE
   if (likely(error == 0)) {
     /* Table share not available, so check path for temp_table prefix. */
-    bool temp_table = (strstr(path, tmp_file_prefix) != NULL);
+    bool temp_table = (strstr(path, tmp_file_prefix) != nullptr);
     PSI_TABLE_CALL(drop_table_share)
     (temp_table, db, strlen(db), alias, strlen(alias));
   }
@@ -2497,7 +2597,7 @@ int ha_delete_table(THD *thd, handlerton *table_type, const char *path,
 
 // Prepare HA_CREATE_INFO to be used by ALTER as well as upgrade code.
 void HA_CREATE_INFO::init_create_options_from_share(const TABLE_SHARE *share,
-                                                    uint used_fields) {
+                                                    uint64_t used_fields) {
   if (!(used_fields & HA_CREATE_USED_MIN_ROWS)) min_rows = share->min_rows;
 
   if (!(used_fields & HA_CREATE_USED_MAX_ROWS)) max_rows = share->max_rows;
@@ -2529,26 +2629,39 @@ void HA_CREATE_INFO::init_create_options_from_share(const TABLE_SHARE *share,
 
   if (!(used_fields & HA_CREATE_USED_COMMENT)) {
     // Assert to check that used_fields flag and comment are in sync.
-    DBUG_ASSERT(!comment.str);
+    assert(!comment.str);
     comment = share->comment;
   }
 
   if (!(used_fields & HA_CREATE_USED_COMPRESS)) {
     // Assert to check that used_fields flag and compress are in sync
-    DBUG_ASSERT(!compress.str);
+    assert(!compress.str);
     compress = share->compress;
   }
 
   if (!(used_fields & (HA_CREATE_USED_ENCRYPT))) {
     // Assert to check that used_fields flag and encrypt_type are in sync
-    DBUG_ASSERT(!encrypt_type.str);
+    assert(!encrypt_type.str);
     encrypt_type = share->encrypt_type;
   }
 
   if (!(used_fields & HA_CREATE_USED_SECONDARY_ENGINE)) {
-    DBUG_ASSERT(secondary_engine.str == nullptr);
+    assert(secondary_engine.str == nullptr);
     secondary_engine = share->secondary_engine;
   }
+
+  if (!(used_fields & HA_CREATE_USED_AUTOEXTEND_SIZE)) {
+    /* m_implicit_tablespace_autoextend_size = 0 is a valid value. Hence,
+    we need a mechanism to indicate the value change. */
+    m_implicit_tablespace_autoextend_size = share->autoextend_size;
+    m_implicit_tablespace_autoextend_size_change = false;
+  }
+
+  if (engine_attribute.str == nullptr)
+    engine_attribute = share->engine_attribute;
+
+  if (secondary_engine_attribute.str == nullptr)
+    secondary_engine_attribute = share->secondary_engine_attribute;
 }
 
 /****************************************************************************
@@ -2557,10 +2670,10 @@ void HA_CREATE_INFO::init_create_options_from_share(const TABLE_SHARE *share,
 handler *handler::clone(const char *name, MEM_ROOT *mem_root) {
   DBUG_TRACE;
 
-  handler *new_handler =
-      get_new_handler(table->s, (table->s->m_part_info != NULL), mem_root, ht);
+  handler *new_handler = get_new_handler(
+      table->s, (table->s->m_part_info != nullptr), mem_root, ht);
 
-  if (!new_handler) return NULL;
+  if (!new_handler) return nullptr;
   if (new_handler->set_ha_share_ref(ha_share)) goto err;
 
   /*
@@ -2576,14 +2689,14 @@ handler *handler::clone(const char *name, MEM_ROOT *mem_root) {
     the same table instance. The ha_open call is not cachable for clone.
   */
   if (new_handler->ha_open(table, name, table->db_stat,
-                           HA_OPEN_IGNORE_IF_LOCKED, NULL))
+                           HA_OPEN_IGNORE_IF_LOCKED, nullptr))
     goto err;
 
   return new_handler;
 
 err:
   destroy(new_handler);
-  return NULL;
+  return nullptr;
 }
 
 void handler::ha_statistic_increment(
@@ -2591,15 +2704,17 @@ void handler::ha_statistic_increment(
   if (table && table->in_use) (table->in_use->status_var.*offset)++;
 }
 
-THD *handler::ha_thd(void) const {
-  DBUG_ASSERT(!table || !table->in_use || table->in_use == current_thd);
-  return (table && table->in_use) ? table->in_use : current_thd;
+THD *handler::ha_thd() const {
+  assert(table == nullptr || table->in_use == nullptr ||
+         table->in_use == current_thd);
+  return table != nullptr && table->in_use != nullptr ? table->in_use
+                                                      : current_thd;
 }
 
 void handler::unbind_psi() {
 #ifdef HAVE_PSI_TABLE_INTERFACE
-  DBUG_ASSERT(m_lock_type == F_UNLCK);
-  DBUG_ASSERT(inited == NONE);
+  assert(m_lock_type == F_UNLCK);
+  assert(inited == NONE);
   /*
     Notify the instrumentation that this table is not owned
     by this thread any more.
@@ -2610,8 +2725,8 @@ void handler::unbind_psi() {
 
 void handler::rebind_psi() {
 #ifdef HAVE_PSI_TABLE_INTERFACE
-  DBUG_ASSERT(m_lock_type == F_UNLCK);
-  DBUG_ASSERT(inited == NONE);
+  assert(m_lock_type == F_UNLCK);
+  assert(inited == NONE);
   /*
     Notify the instrumentation that this table is now owned
     by this thread.
@@ -2623,8 +2738,8 @@ void handler::rebind_psi() {
 
 void handler::start_psi_batch_mode() {
 #ifdef HAVE_PSI_TABLE_INTERFACE
-  DBUG_ASSERT(m_psi_batch_mode == PSI_BATCH_MODE_NONE);
-  DBUG_ASSERT(m_psi_locker == NULL);
+  assert(m_psi_batch_mode == PSI_BATCH_MODE_NONE);
+  assert(m_psi_locker == nullptr);
   m_psi_batch_mode = PSI_BATCH_MODE_STARTING;
   m_psi_numrows = 0;
 #endif
@@ -2632,11 +2747,11 @@ void handler::start_psi_batch_mode() {
 
 void handler::end_psi_batch_mode() {
 #ifdef HAVE_PSI_TABLE_INTERFACE
-  DBUG_ASSERT(m_psi_batch_mode != PSI_BATCH_MODE_NONE);
-  if (m_psi_locker != NULL) {
-    DBUG_ASSERT(m_psi_batch_mode == PSI_BATCH_MODE_STARTED);
+  assert(m_psi_batch_mode != PSI_BATCH_MODE_NONE);
+  if (m_psi_locker != nullptr) {
+    assert(m_psi_batch_mode == PSI_BATCH_MODE_STARTED);
     PSI_TABLE_CALL(end_table_io_wait)(m_psi_locker, m_psi_numrows);
-    m_psi_locker = NULL;
+    m_psi_locker = nullptr;
   }
   m_psi_batch_mode = PSI_BATCH_MODE_NONE;
 #endif
@@ -2681,13 +2796,13 @@ int handler::ha_open(TABLE *table_arg, const char *name, int mode,
               name, ht->db_type, table_arg->db_stat, mode, test_if_locked));
 
   table = table_arg;
-  DBUG_ASSERT(table->s == table_share);
-  DBUG_ASSERT(m_lock_type == F_UNLCK);
+  assert(table->s == table_share);
+  assert(m_lock_type == F_UNLCK);
   DBUG_PRINT("info", ("old m_lock_type: %d F_UNLCK %d", m_lock_type, F_UNLCK));
   MEM_ROOT *mem_root = (test_if_locked & HA_OPEN_TMP_TABLE)
                            ? &table->s->mem_root
                            : &table->mem_root;
-  DBUG_ASSERT(alloc_root_inited(mem_root));
+  assert(alloc_root_inited(mem_root));
 
   if ((error = open(name, mode, test_if_locked, table_def))) {
     if ((error == EACCES || error == EROFS) && mode == O_RDWR &&
@@ -2700,8 +2815,8 @@ int handler::ha_open(TABLE *table_arg, const char *name, int mode,
     set_my_errno(error); /* Safeguard */
     DBUG_PRINT("error", ("error: %d  errno: %d", error, errno));
   } else {
-    DBUG_ASSERT(m_psi == NULL);
-    DBUG_ASSERT(table_share != NULL);
+    assert(m_psi == nullptr);
+    assert(table_share != nullptr);
 #ifdef HAVE_PSI_TABLE_INTERFACE
     PSI_table_share *share_psi = ha_table_share_psi(table_share);
     m_psi = PSI_TABLE_CALL(open_table)(share_psi, this);
@@ -2746,14 +2861,14 @@ int handler::ha_close(void) {
   DBUG_TRACE;
 #ifdef HAVE_PSI_TABLE_INTERFACE
   PSI_TABLE_CALL(close_table)(table_share, m_psi);
-  m_psi = NULL; /* instrumentation handle, invalid after close_table() */
-  DBUG_ASSERT(m_psi_batch_mode == PSI_BATCH_MODE_NONE);
-  DBUG_ASSERT(m_psi_locker == NULL);
+  m_psi = nullptr; /* instrumentation handle, invalid after close_table() */
+  assert(m_psi_batch_mode == PSI_BATCH_MODE_NONE);
+  assert(m_psi_locker == nullptr);
 #endif
   // TODO: set table= NULL to mark the handler as closed?
-  DBUG_ASSERT(m_psi == NULL);
-  DBUG_ASSERT(m_lock_type == F_UNLCK);
-  DBUG_ASSERT(inited == NONE);
+  assert(m_psi == nullptr);
+  assert(m_lock_type == F_UNLCK);
+  assert(inited == NONE);
   if (m_unique) {
     // It's allocated on memroot and will be freed along with it
     m_unique->cleanup();
@@ -2777,10 +2892,10 @@ int handler::ha_index_init(uint idx, bool sorted) {
   DBUG_EXECUTE_IF("ha_index_init_fail", return HA_ERR_TABLE_DEF_CHANGED;);
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == NONE);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == NONE);
   if (!(result = index_init(idx, sorted))) inited = INDEX;
-  end_range = NULL;
+  end_range = nullptr;
   return result;
 }
 
@@ -2795,11 +2910,11 @@ int handler::ha_index_init(uint idx, bool sorted) {
 int handler::ha_index_end() {
   DBUG_TRACE;
   /* SQL HANDLER function can call this without having it locked. */
-  DBUG_ASSERT(table->open_by_handler ||
-              table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == INDEX);
+  assert(table->open_by_handler || table_share->tmp_table != NO_TMP_TABLE ||
+         m_lock_type != F_UNLCK);
+  assert(inited == INDEX);
   inited = NONE;
-  end_range = NULL;
+  end_range = nullptr;
   m_record_buffer = nullptr;
   if (m_unique) m_unique->reset(false);
   return index_end();
@@ -2820,10 +2935,10 @@ int handler::ha_rnd_init(bool scan) {
   DBUG_EXECUTE_IF("ha_rnd_init_fail", return HA_ERR_TABLE_DEF_CHANGED;);
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == NONE || (inited == RND && scan));
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == NONE || (inited == RND && scan));
   inited = (result = rnd_init(scan)) ? NONE : RND;
-  end_range = NULL;
+  end_range = nullptr;
   return result;
 }
 
@@ -2838,11 +2953,11 @@ int handler::ha_rnd_init(bool scan) {
 int handler::ha_rnd_end() {
   DBUG_TRACE;
   /* SQL HANDLER function can call this without having it locked. */
-  DBUG_ASSERT(table->open_by_handler ||
-              table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == RND);
+  assert(table->open_by_handler || table_share->tmp_table != NO_TMP_TABLE ||
+         m_lock_type != F_UNLCK);
+  assert(inited == RND);
   inited = NONE;
-  end_range = NULL;
+  end_range = nullptr;
   m_record_buffer = nullptr;
   return rnd_end();
 }
@@ -2861,8 +2976,8 @@ int handler::ha_rnd_next(uchar *buf) {
   int result;
   DBUG_EXECUTE_IF("ha_rnd_next_deadlock", return HA_ERR_LOCK_DEADLOCK;);
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == RND);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == RND);
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -2891,9 +3006,9 @@ int handler::ha_rnd_next(uchar *buf) {
 int handler::ha_rnd_pos(uchar *buf, uchar *pos) {
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
   /* TODO: Find out how to solve ha_rnd_pos when finding duplicate update. */
-  /* DBUG_ASSERT(inited == RND); */
+  /* assert(inited == RND); */
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -2924,33 +3039,35 @@ int handler::ha_ft_read(uchar *buf) {
   return result;
 }
 
-int handler::ha_sample_init(double sampling_percentage, int sampling_seed,
-                            enum_sampling_method) {
+int handler::ha_sample_init(void *&scan_ctx, double sampling_percentage,
+                            int sampling_seed,
+                            enum_sampling_method sampling_method) {
   DBUG_TRACE;
-  DBUG_ASSERT(sampling_percentage >= 0.0);
-  DBUG_ASSERT(sampling_percentage <= 100.0);
-  DBUG_ASSERT(inited == NONE);
+  assert(sampling_percentage >= 0.0);
+  assert(sampling_percentage <= 100.0);
+  assert(inited == NONE);
 
   // Initialise the random number generator.
   m_random_number_engine.seed(sampling_seed);
   m_sampling_percentage = sampling_percentage;
 
-  int result = sample_init();
+  int result = sample_init(scan_ctx, sampling_percentage, sampling_seed,
+                           sampling_method);
   inited = (result != 0) ? NONE : SAMPLING;
   return result;
 }
 
-int handler::ha_sample_end() {
+int handler::ha_sample_end(void *scan_ctx) {
   DBUG_TRACE;
-  DBUG_ASSERT(inited == SAMPLING);
+  assert(inited == SAMPLING);
   inited = NONE;
-  int result = sample_end();
+  int result = sample_end(scan_ctx);
   return result;
 }
 
-int handler::ha_sample_next(uchar *buf) {
+int handler::ha_sample_next(void *scan_ctx, uchar *buf) {
   DBUG_TRACE;
-  DBUG_ASSERT(inited == SAMPLING);
+  assert(inited == SAMPLING);
 
   if (m_sampling_percentage == 0.0) return HA_ERR_END_OF_FILE;
 
@@ -2958,7 +3075,7 @@ int handler::ha_sample_next(uchar *buf) {
 
   int result;
   MYSQL_TABLE_IO_WAIT(PSI_TABLE_FETCH_ROW, MAX_KEY, result,
-                      { result = sample_next(buf); })
+                      { result = sample_next(scan_ctx, buf); })
 
   if (result == 0 && m_update_generated_read_fields) {
     result = update_generated_read_fields(buf, table);
@@ -2969,11 +3086,16 @@ int handler::ha_sample_next(uchar *buf) {
   return result;
 }
 
-int handler::sample_init() { return rnd_init(true); }
+int handler::sample_init(void *&scan_ctx MY_ATTRIBUTE((unused)), double, int,
+                         enum_sampling_method) {
+  return rnd_init(true);
+}
 
-int handler::sample_end() { return rnd_end(); }
+int handler::sample_end(void *scan_ctx MY_ATTRIBUTE((unused))) {
+  return rnd_end();
+}
 
-int handler::sample_next(uchar *buf) {
+int handler::sample_next(void *scan_ctx MY_ATTRIBUTE((unused)), uchar *buf) {
   // Temporary set inited to RND, since we are calling rnd_next().
   int res = rnd_next(buf);
 
@@ -2985,7 +3107,7 @@ int handler::sample_next(uchar *buf) {
 }
 
 int handler::records(ha_rows *num_rows) {
-  if (MY_TEST((ha_table_flags() & HA_COUNT_ROWS_INSTANT))) {
+  if (ha_table_flags() & HA_COUNT_ROWS_INSTANT) {
     *num_rows = stats.records;
     return 0;
   }
@@ -3019,7 +3141,7 @@ int handler::records(ha_rows *num_rows) {
 }
 
 int handler::records_from_index(ha_rows *num_rows, uint index) {
-  if (MY_TEST((ha_table_flags() & HA_COUNT_ROWS_INSTANT))) {
+  if (ha_table_flags() & HA_COUNT_ROWS_INSTANT) {
     *num_rows = stats.records;
     return 0;
   }
@@ -3065,8 +3187,8 @@ int handler::handle_records_error(int error, ha_rows *num_rows) {
     if (error == 0) error = HA_ERR_QUERY_INTERRUPTED;
   }
 
-  if (error != 0) DBUG_ASSERT(*num_rows == HA_POS_ERROR);
-  if (*num_rows == HA_POS_ERROR) DBUG_ASSERT(error != 0);
+  if (error != 0) assert(*num_rows == HA_POS_ERROR);
+  if (*num_rows == HA_POS_ERROR) assert(error != 0);
   if (error != 0) {
     /*
       ha_innobase::records may have rolled back internally.
@@ -3117,9 +3239,9 @@ int handler::ha_index_read_map(uchar *buf, const uchar *key,
                                enum ha_rkey_function find_flag) {
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == INDEX);
-  DBUG_ASSERT(!pushed_idx_cond || buf == table->record[0]);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == INDEX);
+  assert(!pushed_idx_cond || buf == table->record[0]);
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -3139,9 +3261,9 @@ int handler::ha_index_read_last_map(uchar *buf, const uchar *key,
                                     key_part_map keypart_map) {
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == INDEX);
-  DBUG_ASSERT(!pushed_idx_cond || buf == table->record[0]);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == INDEX);
+  assert(!pushed_idx_cond || buf == table->record[0]);
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -3167,9 +3289,9 @@ int handler::ha_index_read_idx_map(uchar *buf, uint index, const uchar *key,
                                    enum ha_rkey_function find_flag) {
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(end_range == NULL);
-  DBUG_ASSERT(!pushed_idx_cond || buf == table->record[0]);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(end_range == nullptr);
+  assert(!pushed_idx_cond || buf == table->record[0]);
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -3199,9 +3321,9 @@ int handler::ha_index_read_idx_map(uchar *buf, uint index, const uchar *key,
 int handler::ha_index_next(uchar *buf) {
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == INDEX);
-  DBUG_ASSERT(!pushed_idx_cond || buf == table->record[0]);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == INDEX);
+  assert(!pushed_idx_cond || buf == table->record[0]);
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -3230,9 +3352,9 @@ int handler::ha_index_next(uchar *buf) {
 int handler::ha_index_prev(uchar *buf) {
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == INDEX);
-  DBUG_ASSERT(!pushed_idx_cond || buf == table->record[0]);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == INDEX);
+  assert(!pushed_idx_cond || buf == table->record[0]);
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -3261,9 +3383,9 @@ int handler::ha_index_prev(uchar *buf) {
 int handler::ha_index_first(uchar *buf) {
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == INDEX);
-  DBUG_ASSERT(!pushed_idx_cond || buf == table->record[0]);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == INDEX);
+  assert(!pushed_idx_cond || buf == table->record[0]);
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -3292,9 +3414,9 @@ int handler::ha_index_first(uchar *buf) {
 int handler::ha_index_last(uchar *buf) {
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == INDEX);
-  DBUG_ASSERT(!pushed_idx_cond || buf == table->record[0]);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == INDEX);
+  assert(!pushed_idx_cond || buf == table->record[0]);
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -3325,9 +3447,9 @@ int handler::ha_index_last(uchar *buf) {
 int handler::ha_index_next_same(uchar *buf, const uchar *key, uint keylen) {
   int result;
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
-  DBUG_ASSERT(inited == INDEX);
-  DBUG_ASSERT(!pushed_idx_cond || buf == table->record[0]);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(inited == INDEX);
+  assert(!pushed_idx_cond || buf == table->record[0]);
 
   // Set status for the need to update generated fields
   m_update_generated_read_fields = table->has_gcol();
@@ -3367,8 +3489,8 @@ int handler::ha_read_first_row(uchar *buf, uint primary_key) {
     TODO remove the test for HA_READ_ORDER
   */
   if (stats.deleted < 10 || primary_key >= MAX_KEY ||
-      !(index_flags(primary_key, 0, 0) & HA_READ_ORDER)) {
-    if (!(error = ha_rnd_init(1))) {
+      !(index_flags(primary_key, 0, false) & HA_READ_ORDER)) {
+    if (!(error = ha_rnd_init(true))) {
       while ((error = ha_rnd_next(buf)) == HA_ERR_RECORD_DELETED)
         /* skip deleted row */;
       const int end_error = ha_rnd_end();
@@ -3376,7 +3498,7 @@ int handler::ha_read_first_row(uchar *buf, uint primary_key) {
     }
   } else {
     /* Find the first row through the primary key */
-    if (!(error = ha_index_init(primary_key, 0))) {
+    if (!(error = ha_index_init(primary_key, false))) {
       error = ha_index_first(buf);
       const int end_error = ha_index_end();
       if (!error) error = end_error;
@@ -3577,14 +3699,14 @@ int handler::update_auto_increment() {
   bool append = false;
   THD *thd = table->in_use;
   struct System_variables *variables = &thd->variables;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
   DBUG_TRACE;
 
   /*
     next_insert_id is a "cursor" into the reserved interval, it may go greater
     than the interval, but not smaller.
   */
-  DBUG_ASSERT(next_insert_id >= auto_inc_interval_for_cur_row.minimum());
+  assert(next_insert_id >= auto_inc_interval_for_cur_row.minimum());
 
   if ((nr = table->next_number_field->val_int()) != 0 ||
       (table->autoinc_field_has_explicit_non_null_value &&
@@ -3614,8 +3736,7 @@ int handler::update_auto_increment() {
       we should call adjust_next_insert_id_after_explicit_value()
       and result row will be (1, 333, 334).
     */
-    if (((Field_num *)table->next_number_field)->unsigned_flag ||
-        ((longlong)nr) > 0)
+    if (table->next_number_field->is_unsigned() || ((longlong)nr) > 0)
       adjust_next_insert_id_after_explicit_value(nr);
 
     insert_id_for_cur_row = 0;  // didn't generate anything
@@ -3628,7 +3749,7 @@ int handler::update_auto_increment() {
   if ((nr = next_insert_id) >= auto_inc_interval_for_cur_row.maximum()) {
     /* next_insert_id is beyond what is reserved, so we reserve more. */
     const Discrete_interval *forced = thd->auto_inc_intervals_forced.get_next();
-    if (forced != NULL) {
+    if (forced != nullptr) {
       nr = forced->minimum();
       /*
         In a multi insert statement when the number of affected rows is known
@@ -3674,7 +3795,8 @@ int handler::update_auto_increment() {
         if (auto_inc_intervals_count <= AUTO_INC_DEFAULT_NB_MAX_BITS) {
           nb_desired_values =
               AUTO_INC_DEFAULT_NB_ROWS * (1 << auto_inc_intervals_count);
-          set_if_smaller(nb_desired_values, AUTO_INC_DEFAULT_NB_MAX);
+          nb_desired_values =
+              std::min(nb_desired_values, ulonglong(AUTO_INC_DEFAULT_NB_MAX));
         } else
           nb_desired_values = AUTO_INC_DEFAULT_NB_MAX;
       }
@@ -3811,9 +3933,9 @@ void handler::get_auto_increment(
                                              table->read_set);
   column_bitmaps_signal();
 
-  if (ha_index_init(table->s->next_number_index, 1)) {
+  if (ha_index_init(table->s->next_number_index, true)) {
     /* This should never happen, assert in debug, and fail in release build */
-    DBUG_ASSERT(0);
+    assert(0);
     *first_value = ULLONG_MAX;
     return;
   }
@@ -3849,7 +3971,7 @@ void handler::get_auto_increment(
       /* No entry found, start with 1. */
       nr = 1;
     } else {
-      DBUG_ASSERT(0);
+      assert(0);
       nr = ULLONG_MAX;
     }
   } else
@@ -3862,9 +3984,8 @@ void handler::get_auto_increment(
 }
 
 void handler::ha_release_auto_increment() {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE ||
-              m_lock_type != F_UNLCK ||
-              (!next_insert_id && !insert_id_for_cur_row));
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK ||
+         (!next_insert_id && !insert_id_for_cur_row));
   DEBUG_SYNC(ha_thd(), "release_auto_increment");
   release_auto_increment();
   insert_id_for_cur_row = 0;
@@ -3876,7 +3997,7 @@ void handler::ha_release_auto_increment() {
       this statement used forced auto_increment values if there were some,
       wipe them away for other statements.
     */
-    table->in_use->auto_inc_intervals_forced.empty();
+    table->in_use->auto_inc_intervals_forced.clear();
   }
 }
 
@@ -3894,17 +4015,21 @@ const char *table_case_name(const HA_CREATE_INFO *info, const char *name) {
   @param msg      Error message template to which key value should be
                   added.
   @param errflag  Flags for my_error() call.
+  @param org_table_name  The original table name (if any)
 */
 
-void print_keydup_error(TABLE *table, KEY *key, const char *msg, myf errflag) {
+void print_keydup_error(TABLE *table, KEY *key, const char *msg, myf errflag,
+                        const char *org_table_name) {
   /* Write the duplicated key in the error message */
   char key_buff[MAX_KEY_LENGTH];
   String str(key_buff, sizeof(key_buff), system_charset_info);
+  std::string key_name;
 
-  if (key == NULL) {
+  if (key == nullptr) {
     /* Key is unknown */
+    key_name = "*UNKNOWN*";
     str.copy("", 0, system_charset_info);
-    my_printf_error(ER_DUP_ENTRY, msg, errflag, str.c_ptr(), "*UNKNOWN*");
+
   } else {
     /* Table is opened and defined at this point */
     key_unpack(&str, table, key);
@@ -3913,8 +4038,17 @@ void print_keydup_error(TABLE *table, KEY *key, const char *msg, myf errflag) {
       str.length(max_length - 4);
       str.append(STRING_WITH_LEN("..."));
     }
-    my_printf_error(ER_DUP_ENTRY, msg, errflag, str.c_ptr_safe(), key->name);
+    str[str.length()] = 0;
+    if (org_table_name != nullptr)
+      key_name = org_table_name;
+    else
+      key_name = table->s->table_name.str;
+    key_name += ".";
+
+    key_name += key->name;
   }
+
+  my_printf_error(ER_DUP_ENTRY, msg, errflag, str.c_ptr(), key_name.c_str());
 }
 
 /**
@@ -3924,9 +4058,11 @@ void print_keydup_error(TABLE *table, KEY *key, const char *msg, myf errflag) {
   @sa print_keydup_error(table, key, msg, errflag).
 */
 
-void print_keydup_error(TABLE *table, KEY *key, myf errflag) {
+void print_keydup_error(TABLE *table, KEY *key, myf errflag,
+                        const char *org_table_name) {
   print_keydup_error(table, key,
-                     ER_THD(current_thd, ER_DUP_ENTRY_WITH_KEY_NAME), errflag);
+                     ER_THD(current_thd, ER_DUP_ENTRY_WITH_KEY_NAME), errflag,
+                     org_table_name);
 }
 
 /**
@@ -4027,17 +4163,16 @@ void handler::print_error(int error, myf errflag) {
     case HA_ERR_FOUND_DUPP_KEY: {
       uint key_nr = table ? get_dup_key(error) : -1;
       if ((int)key_nr >= 0) {
-        print_keydup_error(table,
-                           key_nr == MAX_KEY ? NULL : &table->key_info[key_nr],
-                           errflag);
+        print_keydup_error(
+            table, key_nr == MAX_KEY ? nullptr : &table->key_info[key_nr],
+            errflag);
         return;
       }
       textno = ER_DUP_KEY;
       break;
     }
     case HA_ERR_FOREIGN_DUPLICATE_KEY: {
-      DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE ||
-                  m_lock_type != F_UNLCK);
+      assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
 
       char rec_buf[MAX_KEY_LENGTH];
       String rec(rec_buf, sizeof(rec_buf), system_charset_info);
@@ -4411,7 +4546,7 @@ int check_table_for_old_types(const TABLE *table, bool check_temporal_upgrade) {
     key if error because of duplicated keys
 */
 uint handler::get_dup_key(int error) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
   DBUG_TRACE;
   table->file->errkey = (uint)-1;
   if (error == HA_ERR_FOUND_DUPP_KEY || error == HA_ERR_FOUND_DUPP_UNIQUE ||
@@ -4421,25 +4556,10 @@ uint handler::get_dup_key(int error) {
 }
 
 bool handler::get_foreign_dup_key(char *, uint, char *, uint) {
-  DBUG_ASSERT(false);
+  assert(false);
   return (false);
 }
 
-/**
-  Delete all files with extension from handlerton::file_extensions.
-
-  @param name		Base name of table
-
-  @note
-    We assume that the handler may return more extensions than
-    was actually used for the file.
-
-  @retval
-    0   If we successfully deleted at least one file from base_ext and
-    didn't get any other errors than ENOENT
-  @retval
-    !0  Error
-*/
 int handler::delete_table(const char *name, const dd::Table *) {
   int saved_error = 0;
   int error = 0;
@@ -4447,7 +4567,7 @@ int handler::delete_table(const char *name, const dd::Table *) {
   char buff[FN_REFLEN];
   const char **start_ext;
 
-  DBUG_ASSERT(m_lock_type == F_UNLCK);
+  assert(m_lock_type == F_UNLCK);
 
   if (!(start_ext = ht->file_extensions)) return 0;
   for (const char **ext = start_ext; *ext; ext++) {
@@ -4492,7 +4612,7 @@ int handler::rename_table(const char *from, const char *to,
 
 void handler::drop_table(const char *name) {
   close();
-  delete_table(name, NULL);
+  delete_table(name, nullptr);
 }
 
 /**
@@ -4512,7 +4632,7 @@ void handler::drop_table(const char *name) {
 */
 int handler::ha_check(THD *thd, HA_CHECK_OPT *check_opt) {
   int error;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
 
   if ((table->s->mysql_version >= MYSQL_VERSION_ID) &&
       (check_opt->sql_flags & TT_FOR_UPGRADE))
@@ -4549,12 +4669,12 @@ void handler::mark_trx_read_write() {
     has registered the transaction or not, so we must check.
   */
   if (ha_info->is_started()) {
-    DBUG_ASSERT(has_transactions());
+    assert(has_transactions());
     /*
       table_share can be NULL in ha_delete_table(). See implementation
       of standalone function ha_delete_table() in sql_base.cc.
     */
-    if (table_share == NULL || table_share->tmp_table == NO_TMP_TABLE) {
+    if (table_share == nullptr || table_share->tmp_table == NO_TMP_TABLE) {
       /* TempTable and Heap tables don't use/support transactions. */
       ha_info->set_trx_read_write();
     }
@@ -4572,8 +4692,8 @@ int handler::ha_repair(THD *thd, HA_CHECK_OPT *check_opt) {
   mark_trx_read_write();
 
   result = repair(thd, check_opt);
-  DBUG_ASSERT(result == HA_ADMIN_NOT_IMPLEMENTED ||
-              ha_table_flags() & HA_CAN_REPAIR);
+  assert(result == HA_ADMIN_NOT_IMPLEMENTED ||
+         ha_table_flags() & HA_CAN_REPAIR);
 
   // TODO: Check if table version in DD needs to be updated.
   // Previously we checked/updated FRM version here.
@@ -4592,7 +4712,7 @@ int handler::ha_repair(THD *thd, HA_CHECK_OPT *check_opt) {
 
 void handler::ha_start_bulk_insert(ha_rows rows) {
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
   estimation_rows_to_insert = rows;
   start_bulk_insert(rows);
 }
@@ -4607,7 +4727,7 @@ void handler::ha_start_bulk_insert(ha_rows rows) {
 
 int handler::ha_end_bulk_insert() {
   DBUG_TRACE;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
   estimation_rows_to_insert = 0;
   return end_bulk_insert();
 }
@@ -4620,7 +4740,7 @@ int handler::ha_end_bulk_insert() {
 
 int handler::ha_bulk_update_row(const uchar *old_data, uchar *new_data,
                                 uint *dup_key_found) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
   mark_trx_read_write();
 
   return bulk_update_row(old_data, new_data, dup_key_found);
@@ -4633,7 +4753,7 @@ int handler::ha_bulk_update_row(const uchar *old_data, uchar *new_data,
 */
 
 int handler::ha_delete_all_rows() {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
   mark_trx_read_write();
 
   return delete_all_rows();
@@ -4646,7 +4766,7 @@ int handler::ha_delete_all_rows() {
 */
 
 int handler::ha_truncate(dd::Table *table_def) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
   mark_trx_read_write();
 
   return truncate(table_def);
@@ -4659,7 +4779,7 @@ int handler::ha_truncate(dd::Table *table_def) {
 */
 
 int handler::ha_optimize(THD *thd, HA_CHECK_OPT *check_opt) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
   mark_trx_read_write();
 
   return optimize(thd, check_opt);
@@ -4672,7 +4792,7 @@ int handler::ha_optimize(THD *thd, HA_CHECK_OPT *check_opt) {
 */
 
 int handler::ha_analyze(THD *thd, HA_CHECK_OPT *check_opt) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
   mark_trx_read_write();
 
   return analyze(thd, check_opt);
@@ -4685,7 +4805,7 @@ int handler::ha_analyze(THD *thd, HA_CHECK_OPT *check_opt) {
 */
 
 bool handler::ha_check_and_repair(THD *thd) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_UNLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_UNLCK);
   mark_trx_read_write();
 
   return check_and_repair(thd);
@@ -4698,7 +4818,7 @@ bool handler::ha_check_and_repair(THD *thd) {
 */
 
 int handler::ha_disable_indexes(uint mode) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
   mark_trx_read_write();
 
   return disable_indexes(mode);
@@ -4711,7 +4831,7 @@ int handler::ha_disable_indexes(uint mode) {
 */
 
 int handler::ha_enable_indexes(uint mode) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
   mark_trx_read_write();
 
   return enable_indexes(mode);
@@ -4725,7 +4845,7 @@ int handler::ha_enable_indexes(uint mode) {
 
 int handler::ha_discard_or_import_tablespace(bool discard,
                                              dd::Table *table_def) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
   mark_trx_read_write();
 
   return discard_or_import_tablespace(discard, table_def);
@@ -4735,7 +4855,7 @@ bool handler::ha_prepare_inplace_alter_table(TABLE *altered_table,
                                              Alter_inplace_info *ha_alter_info,
                                              const dd::Table *old_table_def,
                                              dd::Table *new_table_def) {
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type != F_UNLCK);
   mark_trx_read_write();
 
   return prepare_inplace_alter_table(altered_table, ha_alter_info,
@@ -4753,10 +4873,10 @@ bool handler::ha_commit_inplace_alter_table(TABLE *altered_table,
     In this case, we might be rolling back after a failed lock upgrade,
     so we could be holding the same lock level as for inplace_alter_table().
   */
-  DBUG_ASSERT(ha_thd()->mdl_context.owns_equal_or_stronger_lock(
-                  MDL_key::TABLE, table->s->db.str, table->s->table_name.str,
-                  MDL_EXCLUSIVE) ||
-              !commit);
+  assert(ha_thd()->mdl_context.owns_equal_or_stronger_lock(
+             MDL_key::TABLE, table->s->db.str, table->s->table_name.str,
+             MDL_EXCLUSIVE) ||
+         !commit);
 
   return commit_inplace_alter_table(altered_table, ha_alter_info, commit,
                                     old_table_def, new_table_def);
@@ -4803,6 +4923,12 @@ enum_alter_inplace_result handler::check_if_supported_inplace_alter(
       (table->s->row_type != create_info->row_type))
     return HA_ALTER_INPLACE_NOT_SUPPORTED;
 
+  // The presence of engine attributes does not prevent inplace so
+  // that we get the same behavior as COMMENT. If SEs support engine
+  // attribute values which are incompatible with INPLACE the need to
+  // check for that when overriding (as they must do for parsed
+  // comments).
+
   uint table_changes = (ha_alter_info->handler_flags &
                         Alter_inplace_info::ALTER_COLUMN_EQUAL_PACK_LENGTH)
                            ? IS_EQUAL_PACK_LENGTH
@@ -4816,7 +4942,7 @@ enum_alter_inplace_result handler::check_if_supported_inplace_alter(
 
 void Alter_inplace_info::report_unsupported_error(const char *not_supported,
                                                   const char *try_instead) {
-  if (unsupported_reason == NULL)
+  if (unsupported_reason == nullptr)
     my_error(ER_ALTER_OPERATION_NOT_SUPPORTED, MYF(0), not_supported,
              try_instead);
   else
@@ -4833,7 +4959,7 @@ void Alter_inplace_info::report_unsupported_error(const char *not_supported,
 int handler::ha_rename_table(const char *from, const char *to,
                              const dd::Table *from_table_def,
                              dd::Table *to_table_def) {
-  DBUG_ASSERT(m_lock_type == F_UNLCK);
+  assert(m_lock_type == F_UNLCK);
   mark_trx_read_write();
 
   return rename_table(from, to, from_table_def, to_table_def);
@@ -4846,7 +4972,7 @@ int handler::ha_rename_table(const char *from, const char *to,
 */
 
 int handler::ha_delete_table(const char *name, const dd::Table *table_def) {
-  DBUG_ASSERT(m_lock_type == F_UNLCK);
+  assert(m_lock_type == F_UNLCK);
   mark_trx_read_write();
 
   return delete_table(name, table_def);
@@ -4859,7 +4985,7 @@ int handler::ha_delete_table(const char *name, const dd::Table *table_def) {
 */
 
 void handler::ha_drop_table(const char *name) {
-  DBUG_ASSERT(m_lock_type == F_UNLCK);
+  assert(m_lock_type == F_UNLCK);
   mark_trx_read_write();
 
   return drop_table(name);
@@ -4873,22 +4999,10 @@ void handler::ha_drop_table(const char *name) {
 
 int handler::ha_create(const char *name, TABLE *form, HA_CREATE_INFO *info,
                        dd::Table *table_def) {
-  DBUG_ASSERT(m_lock_type == F_UNLCK);
+  assert(m_lock_type == F_UNLCK);
   mark_trx_read_write();
 
   return create(name, form, info, table_def);
-}
-
-/**
- * Prepares the secondary engine for table load.
- *
- * @param table The table to load into the secondary engine. Its read_set tells
- * which columns to load.
- *
- * @sa handler::prepare_load_table()
- */
-int handler::ha_prepare_load_table(const TABLE &table) {
-  return prepare_load_table(table);
 }
 
 /**
@@ -4940,7 +5054,8 @@ int ha_enable_transaction(THD *thd, bool on) {
       is an optimization hint that storage engine is free to ignore.
       So, let's commit an open transaction (if any) now.
     */
-    if (!(error = ha_commit_trans(thd, 0))) error = trans_commit_implicit(thd);
+    if (!(error = ha_commit_trans(thd, false)))
+      error = trans_commit_implicit(thd);
   }
   return error;
 }
@@ -4950,10 +5065,10 @@ int handler::index_next_same(uchar *buf, const uchar *key, uint keylen) {
   DBUG_TRACE;
   if (!(error = index_next(buf))) {
     ptrdiff_t ptrdiff = buf - table->record[0];
-    uchar *save_record_0 = NULL;
-    KEY *key_info = NULL;
-    KEY_PART_INFO *key_part = NULL;
-    KEY_PART_INFO *key_part_end = NULL;
+    uchar *save_record_0 = nullptr;
+    KEY *key_info = nullptr;
+    KEY_PART_INFO *key_part = nullptr;
+    KEY_PART_INFO *key_part_end = nullptr;
 
     /*
       key_cmp_if_same() compares table->record[0] against 'key'.
@@ -4970,7 +5085,7 @@ int handler::index_next_same(uchar *buf, const uchar *key, uint keylen) {
       key_part = key_info->key_part;
       key_part_end = key_part + key_info->user_defined_key_parts;
       for (; key_part < key_part_end; key_part++) {
-        DBUG_ASSERT(key_part->field);
+        assert(key_part->field);
         key_part->field->move_field_offset(ptrdiff);
       }
     }
@@ -5028,7 +5143,7 @@ int ha_create_table(THD *thd, const char *path, const char *db,
 #ifdef HAVE_PSI_TABLE_INTERFACE
   bool temp_table = is_temp_table ||
                     (create_info->options & HA_LEX_CREATE_TMP_TABLE) ||
-                    (strstr(path, tmp_file_prefix) != NULL);
+                    (strstr(path, tmp_file_prefix) != nullptr);
 #endif
   DBUG_TRACE;
 
@@ -5079,7 +5194,7 @@ int ha_create_table(THD *thd, const char *path, const char *db,
       if (thd->dd_client()->update<dd::Table>(table_def)) error = 1;
     }
   }
-  (void)closefrm(&table, 0);
+  (void)closefrm(&table, false);
 err:
   free_table_share(&share);
   return error != 0;
@@ -5161,7 +5276,7 @@ int ha_create_table_from_engine(THD *thd, const char *db, const char *name) {
     necessary changes to the table_def should already have
     been done in ha_discover/import_serialized_meta_data.
   */
-  (void)closefrm(&table, 1);
+  (void)closefrm(&table, true);
 
   return error != 0;
 }
@@ -5180,7 +5295,7 @@ int ha_create_table_from_engine(THD *thd, const char *db, const char *name) {
 
 bool ha_check_if_table_exists(THD *thd, const char *db, const char *name,
                               bool *exists) {
-  uchar *frmblob = NULL;
+  uchar *frmblob = nullptr;
   size_t frmlen;
   DBUG_TRACE;
 
@@ -5193,33 +5308,24 @@ bool ha_check_if_table_exists(THD *thd, const char *db, const char *name,
 /**
   Check if a table specified by name is a system table.
 
-  @param db                    Database name for the table.
-  @param table_name            Table name to be checked.
-  @param [out] is_sql_layer_system_table  True if a system table belongs to
-  sql_layer.
+  @param       db                         Database name for the table.
+  @param       table_name                 Table name to be checked.
+  @param[out]  is_sql_layer_system_table  True if a system table belongs to
+                                          sql_layer.
 
   @return Operation status
-    @retval  true              If the table name is a system table.
-    @retval  false             If the table name is a user-level table.
+    @retval    true              If the table name is a system table.
+    @retval    false             If the table name is a user-level table.
 */
 
 static bool check_if_system_table(const char *db, const char *table_name,
                                   bool *is_sql_layer_system_table) {
-  st_handler_tablename *systab;
-
   // Check if we have the system database name in the command.
   if (!dd::get_dictionary()->is_dd_schema_name(db)) return false;
 
   // Check if this is SQL layer system tables.
-  systab = mysqld_system_tables;
-  while (systab && systab->db) {
-    if (strcmp(systab->tablename, table_name) == 0) {
-      *is_sql_layer_system_table = true;
-      break;
-    }
-
-    systab++;
-  }
+  if (dd::get_dictionary()->is_system_table_name(db, table_name))
+    *is_sql_layer_system_table = true;
 
   return true;
 }
@@ -5267,7 +5373,7 @@ bool ha_check_if_supported_system_table(handlerton *hton, const char *db,
   check_params.db_type = hton->db_type;
   check_params.table_name = table_name;
   check_params.db = db;
-  plugin_foreach(NULL, check_engine_system_table_handlerton,
+  plugin_foreach(nullptr, check_engine_system_table_handlerton,
                  MYSQL_STORAGE_ENGINE_PLUGIN, &check_params);
 
   // SE does not support this system table.
@@ -5386,14 +5492,14 @@ bool default_rm_tmp_tables(handlerton *hton, THD *, List<LEX_STRING> *files) {
   List_iterator<LEX_STRING> files_it(*files);
   LEX_STRING *file_path;
 
-  if (!hton->file_extensions) return 0;
+  if (!hton->file_extensions) return false;
 
   while ((file_path = files_it++)) {
     const char *file_ext = fn_ext(file_path->str);
 
     for (const char **ext = hton->file_extensions; *ext; ext++) {
       if (strcmp(file_ext, *ext) == 0) {
-        if (my_is_symlink(file_path->str, NULL) &&
+        if (my_is_symlink(file_path->str, nullptr) &&
             test_if_data_home_dir(file_path->str)) {
           /*
             For safety reasons, if temporary table file is a symlink pointing
@@ -5413,8 +5519,6 @@ bool default_rm_tmp_tables(handlerton *hton, THD *, List<LEX_STRING> *files) {
   }
   return false;
 }
-
-void HA_CHECK_OPT::init() { flags = sql_flags = 0; }
 
 /*****************************************************************************
   Key cache handling.
@@ -5474,6 +5578,24 @@ int ha_change_key_cache(KEY_CACHE *old_key_cache, KEY_CACHE *new_key_cache) {
   return 0;
 }
 
+struct st_discover_args {
+  const char *db;
+  const char *name;
+  uchar **frmblob;
+  size_t *frmlen;
+};
+
+static bool discover_handlerton(THD *thd, plugin_ref plugin, void *arg) {
+  st_discover_args *vargs = (st_discover_args *)arg;
+  handlerton *hton = plugin_data<handlerton *>(plugin);
+  if (hton->state == SHOW_OPTION_YES && hton->discover &&
+      (!(hton->discover(hton, thd, vargs->db, vargs->name, vargs->frmblob,
+                        vargs->frmlen))))
+    return true;
+
+  return false;
+}
+
 /**
   Try to discover one table from handler(s).
 
@@ -5495,24 +5617,6 @@ int ha_change_key_cache(KEY_CACHE *old_key_cache, KEY_CACHE *new_key_cache) {
     >0   error.  frmblob and frmlen may not be set
 
 */
-struct st_discover_args {
-  const char *db;
-  const char *name;
-  uchar **frmblob;
-  size_t *frmlen;
-};
-
-static bool discover_handlerton(THD *thd, plugin_ref plugin, void *arg) {
-  st_discover_args *vargs = (st_discover_args *)arg;
-  handlerton *hton = plugin_data<handlerton *>(plugin);
-  if (hton->state == SHOW_OPTION_YES && hton->discover &&
-      (!(hton->discover(hton, thd, vargs->db, vargs->name, vargs->frmblob,
-                        vargs->frmlen))))
-    return true;
-
-  return false;
-}
-
 static int ha_discover(THD *thd, const char *db, const char *name,
                        uchar **frmblob, size_t *frmlen) {
   int error = -1;  // Table does not exist in any handler
@@ -5528,7 +5632,7 @@ static int ha_discover(THD *thd, const char *db, const char *name,
     error = 0;
 
   if (!error) {
-    DBUG_ASSERT(!thd->status_var_aggregated);
+    assert(!thd->status_var_aggregated);
     thd->status_var.ha_discover_count++;
   }
   return error;
@@ -5612,39 +5716,6 @@ int ha_table_exists_in_engine(THD *thd, const char *db, const char *name) {
   return args.err;
 }
 
-/**
-  Prepare (sub-) sequences of joins in this statement
-  which may be pushed to each storage engine for execution.
-*/
-struct st_make_pushed_join_args {
-  const AQP::Join_plan *plan;  // Query plan provided by optimizer
-  int err;                     // Error code to return.
-};
-
-static bool make_pushed_join_handlerton(THD *thd, plugin_ref plugin,
-                                        void *arg) {
-  st_make_pushed_join_args *vargs = (st_make_pushed_join_args *)arg;
-  handlerton *hton = plugin_data<handlerton *>(plugin);
-
-  if (hton && hton->make_pushed_join) {
-    const int error = hton->make_pushed_join(hton, thd, vargs->plan);
-    if (unlikely(error)) {
-      vargs->err = error;
-      return true;
-    }
-  }
-  return false;
-}
-
-int ha_make_pushed_joins(THD *thd, const AQP::Join_plan *plan) {
-  DBUG_TRACE;
-  st_make_pushed_join_args args = {plan, 0};
-  plugin_foreach(thd, make_pushed_join_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
-                 &args);
-  DBUG_PRINT("exit", ("error: %d", args.err));
-  return args.err;
-}
-
 /*
   TODO: change this into a dynamic struct
   List<handlerton> does not work as
@@ -5694,18 +5765,18 @@ static bool binlog_func_foreach(THD *thd, binlog_func_st *bfn) {
 }
 
 int ha_reset_logs(THD *thd) {
-  binlog_func_st bfn = {BFN_RESET_LOGS, 0};
+  binlog_func_st bfn = {BFN_RESET_LOGS, nullptr};
   binlog_func_foreach(thd, &bfn);
   return 0;
 }
 
 void ha_reset_slave(THD *thd) {
-  binlog_func_st bfn = {BFN_RESET_SLAVE, 0};
+  binlog_func_st bfn = {BFN_RESET_SLAVE, nullptr};
   binlog_func_foreach(thd, &bfn);
 }
 
 void ha_binlog_wait(THD *thd) {
-  binlog_func_st bfn = {BFN_BINLOG_WAIT, 0};
+  binlog_func_st bfn = {BFN_BINLOG_WAIT, nullptr};
   binlog_func_foreach(thd, &bfn);
 }
 
@@ -5748,7 +5819,7 @@ void ha_binlog_log_query(THD *thd, handlerton *hton,
   b.query_length = query_length;
   b.db = db;
   b.table_name = table_name;
-  if (hton == 0)
+  if (hton == nullptr)
     plugin_foreach(thd, binlog_log_query_handlerton,
                    MYSQL_STORAGE_ENGINE_PLUGIN, &b);
   else
@@ -5756,7 +5827,7 @@ void ha_binlog_log_query(THD *thd, handlerton *hton,
 }
 
 int ha_binlog_end(THD *thd) {
-  binlog_func_st bfn = {BFN_BINLOG_END, 0};
+  binlog_func_st bfn = {BFN_BINLOG_END, nullptr};
   binlog_func_foreach(thd, &bfn);
   return 0;
 }
@@ -5801,9 +5872,9 @@ double handler::index_only_read_time(uint keynr, double records) {
 }
 
 double handler::table_in_memory_estimate() const {
-  DBUG_ASSERT(stats.table_in_mem_estimate == IN_MEMORY_ESTIMATE_UNKNOWN ||
-              (stats.table_in_mem_estimate >= 0.0 &&
-               stats.table_in_mem_estimate <= 1.0));
+  assert(stats.table_in_mem_estimate == IN_MEMORY_ESTIMATE_UNKNOWN ||
+         (stats.table_in_mem_estimate >= 0.0 &&
+          stats.table_in_mem_estimate <= 1.0));
 
   /*
     If the storage engine has supplied information about how much of the
@@ -5899,7 +5970,7 @@ double handler::estimate_in_memory_buffer(ulonglong table_index_size) const {
     in_mem_est = 1.0 - (percent_of_mem - table_index_in_memory_limit) /
                            (1.0 - table_index_in_memory_limit);
   }
-  DBUG_ASSERT(in_mem_est >= 0.0 && in_mem_est <= 1.0);
+  assert(in_mem_est >= 0.0 && in_mem_est <= 1.0);
 
   return in_mem_est;
 }
@@ -5928,8 +5999,8 @@ Cost_estimate handler::index_scan_cost(uint index,
     and use of the copy constructor.
   */
 
-  DBUG_ASSERT(ranges >= 0.0);
-  DBUG_ASSERT(rows >= 0.0);
+  assert(ranges >= 0.0);
+  assert(rows >= 0.0);
 
   const double io_cost = index_only_read_time(index, rows) *
                          table->cost_model()->page_read_cost_index(index, 1.0);
@@ -5946,8 +6017,8 @@ Cost_estimate handler::read_cost(uint index, double ranges, double rows) {
     and use of the copy constructor.
   */
 
-  DBUG_ASSERT(ranges >= 0.0);
-  DBUG_ASSERT(rows >= 0.0);
+  assert(ranges >= 0.0);
+  assert(rows >= 0.0);
 
   const double io_cost =
       read_time(index, static_cast<uint>(ranges), static_cast<ha_rows>(rows)) *
@@ -6043,10 +6114,10 @@ ha_rows handler::multi_range_read_info_const(
     key_range *min_endp, *max_endp;
     if (range.range_flag & GEOM_FLAG) {
       min_endp = &range.start_key;
-      max_endp = NULL;
+      max_endp = nullptr;
     } else {
-      min_endp = range.start_key.length ? &range.start_key : NULL;
-      max_endp = range.end_key.length ? &range.end_key : NULL;
+      min_endp = range.start_key.length ? &range.start_key : nullptr;
+      max_endp = range.end_key.length ? &range.end_key : nullptr;
     }
     /*
       Get the number of rows in the range. This is done by calling
@@ -6082,6 +6153,17 @@ ha_rows handler::multi_range_read_info_const(
             table->key_info[keyno].records_per_key(keyparts_used - 1));
       } else {
         /*
+          Return HA_POS_ERROR if the range does not use all key parts and
+          the key cannot use partial key searches.
+        */
+        if ((index_flags(keyno, 0, false) & HA_ONLY_WHOLE_INDEX)) {
+          assert(
+              (range.range_flag & EQ_RANGE) &&
+              !table->key_info[keyno].has_records_per_key(keyparts_used - 1));
+          total_rows = HA_POS_ERROR;
+          break;
+        }
+        /*
           Since records_in_range has not been called, set the rows to 1.
           FORCE INDEX has been used, cost model values will be ignored anyway.
         */
@@ -6089,7 +6171,7 @@ ha_rows handler::multi_range_read_info_const(
       }
     } else {
       DBUG_EXECUTE_IF("crash_records_in_range", DBUG_SUICIDE(););
-      DBUG_ASSERT(min_endp || max_endp);
+      assert(min_endp || max_endp);
       if (HA_POS_ERROR ==
           (rows = this->records_in_range(keyno, min_endp, max_endp))) {
         /* Can't scan one range => can't do MRR scan at all */
@@ -6106,7 +6188,7 @@ ha_rows handler::multi_range_read_info_const(
     /* The following calculation is the same as in multi_range_read_info(): */
     *flags |= (HA_MRR_USE_DEFAULT_IMPL | HA_MRR_SUPPORT_SORTED);
 
-    DBUG_ASSERT(cost->is_zero());
+    assert(cost->is_zero());
     if (*flags & HA_MRR_INDEX_ONLY)
       *cost = index_scan_cost(keyno, static_cast<double>(n_ranges),
                               static_cast<double>(total_rows));
@@ -6161,7 +6243,7 @@ ha_rows handler::multi_range_read_info(uint keyno, uint n_ranges, uint n_rows,
   *flags |= HA_MRR_USE_DEFAULT_IMPL;
   *flags |= HA_MRR_SUPPORT_SORTED;
 
-  DBUG_ASSERT(cost->is_zero());
+  assert(cost->is_zero());
 
   /* Produce the same cost as non-MRR code does */
   if (*flags & HA_MRR_INDEX_ONLY)
@@ -6261,8 +6343,8 @@ int handler::multi_range_read_next(char **range_info) {
   DBUG_TRACE;
   // For a multi-valued index the unique filter have to be used for correct
   // result
-  DBUG_ASSERT(!(table->key_info[active_index].flags & HA_MULTI_VALUED_KEY) ||
-              m_unique);
+  assert(!(table->key_info[active_index].flags & HA_MULTI_VALUED_KEY) ||
+         m_unique);
 
   if (!mrr_have_range) {
     mrr_have_range = true;
@@ -6276,12 +6358,15 @@ int handler::multi_range_read_next(char **range_info) {
     */
     if (!((mrr_cur_range.range_flag & UNIQUE_RANGE) &&
           (mrr_cur_range.range_flag & EQ_RANGE))) {
+      assert(!result || result == HA_ERR_END_OF_FILE);
       result = read_range_next();
+      DBUG_EXECUTE_IF("bug20162055_DEADLOCK", result = HA_ERR_LOCK_DEADLOCK;);
       /*
-        On success or non-EOF errors check loop condition to filter
-        duplicates, if needed.
+        On success check loop condition to filter duplicates, if needed.
+        Exit on non-EOF error. Use next range on EOF error.
       */
-      if (result != HA_ERR_END_OF_FILE) continue;
+      if (!result) continue;
+      if (result != HA_ERR_END_OF_FILE) break;
     } else {
       if (was_semi_consistent_read()) goto scan_it_again;
     }
@@ -6291,8 +6376,9 @@ int handler::multi_range_read_next(char **range_info) {
     while (!(range_res = mrr_funcs.next(mrr_iter, &mrr_cur_range))) {
     scan_it_again:
       result = read_range_first(
-          mrr_cur_range.start_key.keypart_map ? &mrr_cur_range.start_key : 0,
-          mrr_cur_range.end_key.keypart_map ? &mrr_cur_range.end_key : 0,
+          mrr_cur_range.start_key.keypart_map ? &mrr_cur_range.start_key
+                                              : nullptr,
+          mrr_cur_range.end_key.keypart_map ? &mrr_cur_range.end_key : nullptr,
           mrr_cur_range.range_flag & EQ_RANGE, mrr_is_output_sorted);
       if (result != HA_ERR_END_OF_FILE) break;
     }
@@ -6353,7 +6439,7 @@ int handler::multi_range_read_next(char **range_info) {
 
 int DsMrr_impl::dsmrr_init(RANGE_SEQ_IF *seq_funcs, void *seq_init_param,
                            uint n_ranges, uint mode, HANDLER_BUFFER *buf) {
-  DBUG_ASSERT(table != NULL);  // Verify init() called
+  assert(table != nullptr);  // Verify init() called
 
   uint elem_size;
   int retval = 0;
@@ -6382,17 +6468,16 @@ int DsMrr_impl::dsmrr_init(RANGE_SEQ_IF *seq_funcs, void *seq_init_param,
       4. We have pushed an index condition and this has been transferred to
          the clone (h2) of the handler object.
   */
-  DBUG_ASSERT(!h->pushed_idx_cond ||
-              h->pushed_idx_cond_keyno == h->active_index ||
-              h->pushed_idx_cond_keyno != table->s->primary_key ||
-              (h2 && h->pushed_idx_cond_keyno == h2->active_index));
+  assert(!h->pushed_idx_cond || h->pushed_idx_cond_keyno == h->active_index ||
+         h->pushed_idx_cond_keyno != table->s->primary_key ||
+         (h2 && h->pushed_idx_cond_keyno == h2->active_index));
 
   rowids_buf = buf->buffer;
 
   is_mrr_assoc = !(mode & HA_MRR_NO_ASSOCIATION);
 
   if (is_mrr_assoc) {
-    DBUG_ASSERT(!thd->status_var_aggregated);
+    assert(!thd->status_var_aggregated);
     table->in_use->status_var.ha_multi_range_read_init_count++;
   }
 
@@ -6429,7 +6514,7 @@ int DsMrr_impl::dsmrr_init(RANGE_SEQ_IF *seq_funcs, void *seq_init_param,
     Open the index scan on h2 using the key from the primary handler.
   */
   if (h2->active_index == MAX_KEY) {
-    DBUG_ASSERT(h->active_index != MAX_KEY);
+    assert(h->active_index != MAX_KEY);
     const uint mrr_keyno = h->active_index;
 
     if ((retval = h2->ha_external_lock(thd, h->get_lock_type()))) goto error;
@@ -6460,9 +6545,9 @@ int DsMrr_impl::dsmrr_init(RANGE_SEQ_IF *seq_funcs, void *seq_init_param,
       must not be opened for doing a new range scan. In this case
       the active_index must either not be set or be the primary key.
     */
-    DBUG_ASSERT(h->inited == handler::RND);
-    DBUG_ASSERT(h->active_index == MAX_KEY ||
-                h->active_index == table->s->primary_key);
+    assert(h->inited == handler::RND);
+    assert(h->active_index == MAX_KEY ||
+           h->active_index == table->s->primary_key);
   }
 
   /*
@@ -6476,7 +6561,7 @@ int DsMrr_impl::dsmrr_init(RANGE_SEQ_IF *seq_funcs, void *seq_init_param,
       temporarily move h2 out of the DsMrr object.
     */
     handler *save_h2 = h2;
-    h2 = NULL;
+    h2 = nullptr;
     retval = h->ha_index_end();
     h2 = save_h2;
     if (retval) goto error;
@@ -6485,12 +6570,12 @@ int DsMrr_impl::dsmrr_init(RANGE_SEQ_IF *seq_funcs, void *seq_init_param,
   /*
     Verify consistency between h and h2.
   */
-  DBUG_ASSERT(h->inited != handler::INDEX);
-  DBUG_ASSERT(h->active_index == MAX_KEY ||
-              h->active_index == table->s->primary_key);
-  DBUG_ASSERT(h2->inited == handler::INDEX);
-  DBUG_ASSERT(h2->active_index != MAX_KEY);
-  DBUG_ASSERT(h->get_lock_type() == h2->get_lock_type());
+  assert(h->inited != handler::INDEX);
+  assert(h->active_index == MAX_KEY ||
+         h->active_index == table->s->primary_key);
+  assert(h2->inited == handler::INDEX);
+  assert(h2->active_index != MAX_KEY);
+  assert(h->get_lock_type() == h2->get_lock_type());
 
   if ((retval = h2->handler::multi_range_read_init(seq_funcs, seq_init_param,
                                                    n_ranges, mode, buf)))
@@ -6524,8 +6609,8 @@ error:
   h2->ha_external_lock(thd, F_UNLCK);
   h2->ha_close();
   destroy(h2);
-  h2 = NULL;
-  DBUG_ASSERT(retval != 0);
+  h2 = nullptr;
+  assert(retval != 0);
   return retval;
 }
 
@@ -6550,7 +6635,7 @@ void DsMrr_impl::reset() {
     // Close and delete the h2 handler
     h2->ha_close();
     destroy(h2);
-    h2 = NULL;
+    h2 = nullptr;
   }
 }
 
@@ -6573,7 +6658,7 @@ int DsMrr_impl::dsmrr_fill_buffer() {
   char *range_info;
   int res = 0;
   DBUG_TRACE;
-  DBUG_ASSERT(rowids_buf < rowids_buf_end);
+  assert(rowids_buf < rowids_buf_end);
 
   /*
     Set key_read to true since we only read fields from the index.
@@ -6584,7 +6669,7 @@ int DsMrr_impl::dsmrr_fill_buffer() {
     property of the wrong handler. MRR sets the handlers' keyread properties
     when initializing the MRR operation, independent of this call).
   */
-  DBUG_ASSERT(table->key_read == false);
+  assert(table->key_read == false);
   table->key_read = true;
 
   rowids_buf_cur = rowids_buf;
@@ -6618,7 +6703,7 @@ int DsMrr_impl::dsmrr_fill_buffer() {
 
   /* Sort the buffer contents by rowid */
   uint elem_size = h->ref_length + (int)is_mrr_assoc * sizeof(void *);
-  DBUG_ASSERT((rowids_buf_cur - rowids_buf) % elem_size == 0);
+  assert((rowids_buf_cur - rowids_buf) % elem_size == 0);
 
   varlen_sort(
       rowids_buf, rowids_buf_cur, elem_size,
@@ -6634,7 +6719,7 @@ int DsMrr_impl::dsmrr_fill_buffer() {
 
 int DsMrr_impl::dsmrr_next(char **range_info) {
   int res;
-  uchar *cur_range_info = 0;
+  uchar *cur_range_info = nullptr;
   uchar *rowid;
 
   if (use_default_impl) return h->handler::multi_range_read_next(range_info);
@@ -6687,7 +6772,7 @@ ha_rows DsMrr_impl::dsmrr_info(uint keyno, uint n_ranges, uint rows,
   /* Get cost/flags/mem_usage of default MRR implementation */
   res = h->handler::multi_range_read_info(keyno, n_ranges, rows, &def_bufsz,
                                           &def_flags, cost);
-  DBUG_ASSERT(!res);
+  assert(!res);
 
   if ((*flags & HA_MRR_USE_DEFAULT_IMPL) ||
       choose_mrr_impl(keyno, rows, flags, bufsz, cost)) {
@@ -6695,7 +6780,7 @@ ha_rows DsMrr_impl::dsmrr_info(uint keyno, uint n_ranges, uint rows,
     DBUG_PRINT("info", ("Default MRR implementation choosen"));
     *flags = def_flags;
     *bufsz = def_bufsz;
-    DBUG_ASSERT(*flags & HA_MRR_USE_DEFAULT_IMPL);
+    assert(*flags & HA_MRR_USE_DEFAULT_IMPL);
   } else {
     /* *flags and *bufsz were set by choose_mrr_impl */
     DBUG_PRINT("info", ("DS-MRR implementation choosen"));
@@ -6733,7 +6818,7 @@ ha_rows DsMrr_impl::dsmrr_info_const(uint keyno, RANGE_SEQ_IF *seq,
     DBUG_PRINT("info", ("Default MRR implementation choosen"));
     *flags = def_flags;
     *bufsz = def_bufsz;
-    DBUG_ASSERT(*flags & HA_MRR_USE_DEFAULT_IMPL);
+    assert(*flags & HA_MRR_USE_DEFAULT_IMPL);
   } else {
     /* *flags and *bufsz were set by choose_mrr_impl */
     DBUG_PRINT("info", ("DS-MRR implementation choosen"));
@@ -6883,7 +6968,7 @@ bool DsMrr_impl::get_disk_sweep_mrr_cost(uint keynr, ha_rows rows, uint flags,
   */
   rows_in_last_step = rows % max_buff_entries;
 
-  DBUG_ASSERT(cost->is_zero());
+  assert(cost->is_zero());
 
   if (n_full_steps) {
     get_sort_and_sweep_cost(table, max_buff_entries, cost);
@@ -6943,7 +7028,7 @@ bool DsMrr_impl::get_disk_sweep_mrr_cost(uint keynr, ha_rows rows, uint flags,
 
 static void get_sort_and_sweep_cost(TABLE *table, ha_rows nrows,
                                     Cost_estimate *cost) {
-  DBUG_ASSERT(cost->is_zero());
+  assert(cost->is_zero());
   if (nrows) {
     get_sweep_read_cost(table, nrows, false, cost);
 
@@ -7033,7 +7118,7 @@ void get_sweep_read_cost(TABLE *table, ha_rows nrows, bool interrupted,
                          Cost_estimate *cost) {
   DBUG_TRACE;
 
-  DBUG_ASSERT(cost->is_zero());
+  assert(cost->is_zero());
   if (nrows > 0) {
     const Cost_model_table *const cost_model = table->cost_model();
 
@@ -7072,7 +7157,7 @@ void get_sweep_read_cost(TABLE *table, ha_rows nrows, bool interrupted,
       const double busy_blocks_mem =
           busy_blocks * table->file->table_in_memory_estimate();
       const double busy_blocks_disk = busy_blocks - busy_blocks_mem;
-      DBUG_ASSERT(busy_blocks_disk >= 0.0);
+      assert(busy_blocks_disk >= 0.0);
 
       // Cost of accessing blocks in main memory buffer
       sweep_cost.add_io(cost_model->buffer_block_read_cost(busy_blocks_mem));
@@ -7246,7 +7331,7 @@ void handler::set_end_range(const key_range *range,
              : (range->flag == HA_READ_AFTER_KEY) ? -1 : 0);
     m_virt_gcol_in_end_range = key_has_vcol(range_key_part, range->length);
   } else
-    end_range = NULL;
+    end_range = nullptr;
 
   /*
     Clear the out-of-range flag in the record buffer when a new range is
@@ -7341,14 +7426,14 @@ static inline void move_key_field_offsets(const key_range *range,
   @retval  1 if the key is outside the range
 */
 int handler::compare_key_in_buffer(const uchar *buf) const {
-  DBUG_ASSERT(end_range != nullptr && (m_record_buffer == nullptr ||
-                                       !m_record_buffer->is_out_of_range()));
+  assert(end_range != nullptr &&
+         (m_record_buffer == nullptr || !m_record_buffer->is_out_of_range()));
 
   /*
     End range on descending scans is only checked with ICP for now, and then we
     check it with compare_key_icp() instead of this function.
   */
-  DBUG_ASSERT(range_scan_direction == RANGE_SCAN_ASC);
+  assert(range_scan_direction == RANGE_SCAN_ASC);
 
   // Make the fields in the key point into the buffer instead of record[0].
   const ptrdiff_t diff = buf - table->record[0];
@@ -7368,7 +7453,7 @@ int handler::index_read_idx_map(uchar *buf, uint index, const uchar *key,
                                 key_part_map keypart_map,
                                 enum ha_rkey_function find_flag) {
   int error, error1 = 0;
-  error = index_init(index, 0);
+  error = index_init(index, false);
   if (!error) {
     error = index_read_map(buf, key, keypart_map, find_flag);
     error1 = index_end();
@@ -7378,7 +7463,7 @@ int handler::index_read_idx_map(uchar *buf, uint index, const uchar *key,
 
 uint calculate_key_len(TABLE *table, uint key, key_part_map keypart_map) {
   /* works only with key prefixes */
-  DBUG_ASSERT(((keypart_map + 1) & keypart_map) == 0);
+  assert(((keypart_map + 1) & keypart_map) == 0);
 
   KEY *key_info = table->key_info + key;
   KEY_PART_INFO *key_part = key_info->key_part;
@@ -7425,24 +7510,24 @@ static bool exts_handlerton(THD *, plugin_ref plugin, void *arg) {
 TYPELIB *ha_known_exts() {
   TYPELIB *known_extensions = (TYPELIB *)(*THR_MALLOC)->Alloc(sizeof(TYPELIB));
   known_extensions->name = "known_exts";
-  known_extensions->type_lengths = NULL;
+  known_extensions->type_lengths = nullptr;
 
   List<const char> found_exts;
   const char **ext, *old_ext;
 
-  plugin_foreach(NULL, exts_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
+  plugin_foreach(nullptr, exts_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN,
                  &found_exts);
 
   size_t arr_length = sizeof(char *) * (found_exts.elements + 1);
   ext = (const char **)(*THR_MALLOC)->Alloc(arr_length);
 
-  DBUG_ASSERT(NULL != ext);
+  assert(nullptr != ext);
   known_extensions->count = found_exts.elements;
   known_extensions->type_names = ext;
 
   List_iterator_fast<const char> it(found_exts);
   while ((old_ext = it++)) *ext++ = old_ext;
-  *ext = NULL;
+  *ext = nullptr;
   return known_extensions;
 }
 
@@ -7468,33 +7553,32 @@ static bool showstat_handlerton(THD *thd, plugin_ref plugin, void *arg) {
 }
 
 bool ha_show_status(THD *thd, handlerton *db_type, enum ha_stat_type stat) {
-  List<Item> field_list;
-  bool result;
-
+  mem_root_deque<Item *> field_list(thd->mem_root);
   field_list.push_back(new Item_empty_string("Type", 10));
   field_list.push_back(new Item_empty_string("Name", FN_REFLEN));
   field_list.push_back(new Item_empty_string("Status", 10));
 
-  if (thd->send_result_metadata(&field_list,
+  if (thd->send_result_metadata(field_list,
                                 Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
     return true;
 
-  if (db_type == NULL) {
+  bool result;
+  if (db_type == nullptr) {
     result = plugin_foreach(thd, showstat_handlerton,
                             MYSQL_STORAGE_ENGINE_PLUGIN, &stat);
   } else {
     if (db_type->state != SHOW_OPTION_YES) {
       const LEX_CSTRING *name = &se_plugin_array[db_type->slot]->name;
       result = stat_print(thd, name->str, name->length, "", 0, "DISABLED", 8)
-                   ? 1
-                   : 0;
+                   ? true
+                   : false;
     } else {
       DBUG_EXECUTE_IF("simulate_show_status_failure",
                       DBUG_SET("+d,simulate_net_write_failure"););
       result = db_type->show_status &&
                        db_type->show_status(db_type, thd, stat_print, stat)
-                   ? 1
-                   : 0;
+                   ? true
+                   : false;
       DBUG_EXECUTE_IF("simulate_show_status_failure",
                       DBUG_SET("-d,simulate_net_write_failure"););
     }
@@ -7525,8 +7609,8 @@ static bool check_table_binlog_row_based(THD *thd, TABLE *table) {
     table->s->cached_row_logging_check = check;
   }
 
-  DBUG_ASSERT(table->s->cached_row_logging_check == 0 ||
-              table->s->cached_row_logging_check == 1);
+  assert(table->s->cached_row_logging_check == 0 ||
+         table->s->cached_row_logging_check == 1);
 
   return (thd->is_current_stmt_binlog_format_row() &&
           table->s->cached_row_logging_check &&
@@ -7565,7 +7649,7 @@ static int write_locked_table_maps(THD *thd) {
 
   if (thd->get_binlog_table_maps() == 0) {
     for (MYSQL_LOCK *lock : {thd->extra_lock, thd->lock}) {
-      if (lock == NULL) continue;
+      if (lock == nullptr) continue;
 
       bool need_binlog_rows_query = thd->variables.binlog_rows_query_log_events;
       TABLE **const end_ptr = lock->table + lock->table_count;
@@ -7608,17 +7692,26 @@ static int write_locked_table_maps(THD *thd) {
 
 int binlog_log_row(TABLE *table, const uchar *before_record,
                    const uchar *after_record, Log_func *log_func) {
-  bool error = 0;
+  bool error = false;
   THD *const thd = table->in_use;
 
   if (check_table_binlog_row_based(thd, table)) {
     if (thd->variables.transaction_write_set_extraction != HASH_ALGORITHM_OFF) {
-      if (before_record && after_record) {
-        /* capture both images pke */
-        add_pke(table, thd, table->record[0]);
-        add_pke(table, thd, table->record[1]);
-      } else {
-        add_pke(table, thd, table->record[0]);
+      try {
+        if (before_record && after_record) {
+          /* capture both images pke */
+          if (add_pke(table, thd, table->record[0]) ||
+              add_pke(table, thd, table->record[1])) {
+            return HA_ERR_RBR_LOGGING_FAILED;
+          }
+        } else {
+          if (add_pke(table, thd, table->record[0])) {
+            return HA_ERR_RBR_LOGGING_FAILED;
+          }
+        }
+      } catch (const std::bad_alloc &) {
+        my_error(ER_OUT_OF_RESOURCES, MYF(0));
+        return HA_ERR_RBR_LOGGING_FAILED;
       }
     }
     if (table->in_use->is_error()) return error ? HA_ERR_RBR_LOGGING_FAILED : 0;
@@ -7657,13 +7750,13 @@ int handler::ha_external_lock(THD *thd, int lock_type) {
     if get_auto_increment() was called (thus may have reserved intervals or
     taken a table lock), ha_release_auto_increment() was too.
   */
-  DBUG_ASSERT(next_insert_id == 0);
+  assert(next_insert_id == 0);
   /* Consecutive calls for lock without unlocking in between is not allowed */
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE ||
-              ((lock_type != F_UNLCK && m_lock_type == F_UNLCK) ||
-               lock_type == F_UNLCK));
+  assert(table_share->tmp_table != NO_TMP_TABLE ||
+         ((lock_type != F_UNLCK && m_lock_type == F_UNLCK) ||
+          lock_type == F_UNLCK));
   /* SQL HANDLER call locks/unlock while scanning (RND/INDEX). */
-  DBUG_ASSERT(inited == NONE || table->open_by_handler);
+  assert(inited == NONE || table->open_by_handler);
 
   ha_statistic_increment(&System_status_var::ha_external_lock_count);
 
@@ -7695,13 +7788,12 @@ int handler::ha_external_lock(THD *thd, int lock_type) {
 int handler::ha_reset() {
   DBUG_TRACE;
   /* Check that we have called all proper deallocation functions */
-  DBUG_ASSERT((uchar *)table->def_read_set.bitmap +
-                  table->s->column_bitmap_size ==
-              (uchar *)table->def_write_set.bitmap);
-  DBUG_ASSERT(bitmap_is_set_all(&table->s->all_set));
-  DBUG_ASSERT(table->key_read == 0);
+  assert((uchar *)table->def_read_set.bitmap + table->s->column_bitmap_size ==
+         (uchar *)table->def_write_set.bitmap);
+  assert(bitmap_is_set_all(&table->s->all_set));
+  assert(table->key_read == 0);
   /* ensure that ha_index_end / ha_rnd_end has been called */
-  DBUG_ASSERT(inited == NONE);
+  assert(inited == NONE);
   /* Free cache used by filesort */
   free_io_cache(table);
   /* reset the bitmaps to point to defaults */
@@ -7710,7 +7802,7 @@ int handler::ha_reset() {
   table->file->extra(HA_EXTRA_NO_IGNORE_DUP_KEY);
   table->file->extra(HA_EXTRA_WRITE_CANNOT_REPLACE);
   /* Reset information about pushed engine conditions */
-  pushed_cond = NULL;
+  pushed_cond = nullptr;
   /* Reset information about pushed index conditions */
   cancel_pushed_idx_cond();
   // Forget the record buffer.
@@ -7724,7 +7816,7 @@ int handler::ha_reset() {
 int handler::ha_write_row(uchar *buf) {
   int error;
   Log_func *log_func = Write_rows_log_event::binlog_row_logging_function;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
 
   DBUG_TRACE;
   DBUG_EXECUTE_IF("inject_error_ha_write_row", return HA_ERR_INTERNAL_ERROR;);
@@ -7742,7 +7834,7 @@ int handler::ha_write_row(uchar *buf) {
 
   if (unlikely(error)) return error;
 
-  if (unlikely((error = binlog_log_row(table, 0, buf, log_func))))
+  if (unlikely((error = binlog_log_row(table, nullptr, buf, log_func))))
     return error; /* purecov: inspected */
 
   DEBUG_SYNC_C("ha_write_row_end");
@@ -7751,15 +7843,15 @@ int handler::ha_write_row(uchar *buf) {
 
 int handler::ha_update_row(const uchar *old_data, uchar *new_data) {
   int error;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
   Log_func *log_func = Update_rows_log_event::binlog_row_logging_function;
 
   /*
     Some storage engines require that the new record is in record[0]
     (and the old record is in record[1]).
    */
-  DBUG_ASSERT(new_data == table->record[0]);
-  DBUG_ASSERT(old_data == table->record[1]);
+  assert(new_data == table->record[0]);
+  assert(old_data == table->record[1]);
 
   mark_trx_read_write();
 
@@ -7779,12 +7871,12 @@ int handler::ha_update_row(const uchar *old_data, uchar *new_data) {
 
 int handler::ha_delete_row(const uchar *buf) {
   int error;
-  DBUG_ASSERT(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
+  assert(table_share->tmp_table != NO_TMP_TABLE || m_lock_type == F_WRLCK);
   Log_func *log_func = Delete_rows_log_event::binlog_row_logging_function;
   /*
     Normally table->record[0] is used, but sometimes table->record[1] is used.
   */
-  DBUG_ASSERT(buf == table->record[0] || buf == table->record[1]);
+  assert(buf == table->record[0] || buf == table->record[1]);
   DBUG_EXECUTE_IF("inject_error_ha_delete_row", return HA_ERR_INTERNAL_ERROR;);
 
   DBUG_EXECUTE_IF(
@@ -7798,7 +7890,8 @@ int handler::ha_delete_row(const uchar *buf) {
                       { error = delete_row(buf); })
 
   if (unlikely(error)) return error;
-  if (unlikely((error = binlog_log_row(table, buf, 0, log_func)))) return error;
+  if (unlikely((error = binlog_log_row(table, buf, nullptr, log_func))))
+    return error;
   return 0;
 }
 
@@ -7825,9 +7918,9 @@ void handler::use_hidden_primary_key() {
 
 Handler_share *handler::get_ha_share_ptr() {
   DBUG_TRACE;
-  DBUG_ASSERT(ha_share && table_share);
+  assert(ha_share && table_share);
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (table_share->tmp_table == NO_TMP_TABLE)
     mysql_mutex_assert_owner(&table_share->LOCK_ha_data);
 #endif
@@ -7846,8 +7939,8 @@ Handler_share *handler::get_ha_share_ptr() {
 
 void handler::set_ha_share_ptr(Handler_share *arg_ha_share) {
   DBUG_TRACE;
-  DBUG_ASSERT(ha_share);
-#ifndef DBUG_OFF
+  assert(ha_share);
+#ifndef NDEBUG
   if (table_share->tmp_table == NO_TMP_TABLE)
     mysql_mutex_assert_owner(&table_share->LOCK_ha_data);
 #endif
@@ -7860,7 +7953,7 @@ void handler::set_ha_share_ptr(Handler_share *arg_ha_share) {
 */
 
 void handler::lock_shared_ha_data() {
-  DBUG_ASSERT(table_share);
+  assert(table_share);
   if (table_share->tmp_table == NO_TMP_TABLE)
     mysql_mutex_lock(&table_share->LOCK_ha_data);
 }
@@ -7870,7 +7963,7 @@ void handler::lock_shared_ha_data() {
 */
 
 void handler::unlock_shared_ha_data() {
-  DBUG_ASSERT(table_share);
+  assert(table_share);
   if (table_share->tmp_table == NO_TMP_TABLE)
     mysql_mutex_unlock(&table_share->LOCK_ha_data);
 }
@@ -7910,14 +8003,14 @@ static void extract_blob_space_and_length_from_record_buff(
   int num = 0;
   for (Field **vfield = table->vfield; *vfield; vfield++) {
     // Check if this field should be included
-    if (bitmap_is_set(fields, (*vfield)->field_index) &&
+    if (bitmap_is_set(fields, (*vfield)->field_index()) &&
         (*vfield)->is_virtual_gcol() && (*vfield)->type() == MYSQL_TYPE_BLOB) {
       auto field = down_cast<Field_blob *>(*vfield);
       blob_len_ptr_array[num].length = field->data_length();
       // TODO: The following check is only for Innodb.
-      DBUG_ASSERT(blob_len_ptr_array[num].length == 255 ||
-                  blob_len_ptr_array[num].length == 768 ||
-                  blob_len_ptr_array[num].length == 3073);
+      assert(blob_len_ptr_array[num].length == 255 ||
+             blob_len_ptr_array[num].length == 768 ||
+             blob_len_ptr_array[num].length == 3073);
 
       blob_len_ptr_array[num].ptr = field->get_blob_data();
 
@@ -7925,7 +8018,7 @@ static void extract_blob_space_and_length_from_record_buff(
       field->reset();
 
       num++;
-      DBUG_ASSERT(num <= MAX_FIELDS);
+      assert(num <= MAX_FIELDS);
     }
   }
 }
@@ -7949,10 +8042,10 @@ static void copy_blob_data(const TABLE *table, const MY_BITMAP *const fields,
   uint num = 0;
   for (Field **vfield = table->vfield; *vfield; vfield++) {
     // Check if this field should be included
-    if (bitmap_is_set(fields, (*vfield)->field_index) &&
+    if (bitmap_is_set(fields, (*vfield)->field_index()) &&
         (*vfield)->is_virtual_gcol() && (*vfield)->type() == MYSQL_TYPE_BLOB) {
-      DBUG_ASSERT(blob_len_ptr_array[num].length > 0);
-      DBUG_ASSERT(blob_len_ptr_array[num].ptr != NULL);
+      assert(blob_len_ptr_array[num].length > 0);
+      assert(blob_len_ptr_array[num].ptr != nullptr);
 
       /*
         Only copy as much of the blob as the storage engine has
@@ -7964,12 +8057,12 @@ static void copy_blob_data(const TABLE *table, const MY_BITMAP *const fields,
       const uint alloc_len = blob_len_ptr_array[num].length;
       length = length > alloc_len ? alloc_len : length;
 
-      memcpy(blob_len_ptr_array[num].ptr, (*vfield)->get_ptr(), length);
-      (down_cast<Field_blob *>(*vfield))
-          ->store_in_allocated_space(
-              pointer_cast<char *>(blob_len_ptr_array[num].ptr), length);
+      Field_blob *blob_field = down_cast<Field_blob *>(*vfield);
+      memcpy(blob_len_ptr_array[num].ptr, blob_field->get_blob_data(), length);
+      blob_field->store_in_allocated_space(
+          pointer_cast<char *>(blob_len_ptr_array[num].ptr), length);
       num++;
-      DBUG_ASSERT(num <= MAX_FIELDS);
+      assert(num <= MAX_FIELDS);
     }
   }
 }
@@ -7996,8 +8089,8 @@ static bool my_eval_gcolumn_expr_helper(THD *thd, TABLE *table,
                                         const char **mv_data_ptr,
                                         ulong *mv_length) {
   DBUG_TRACE;
-  DBUG_ASSERT(table && table->vfield);
-  DBUG_ASSERT(!thd->is_error());
+  assert(table && table->vfield);
+  assert(!thd->is_error());
 
   uchar *old_buf = table->record[0];
   repoint_field_to_record(table, old_buf, record);
@@ -8016,7 +8109,7 @@ static bool my_eval_gcolumn_expr_helper(THD *thd, TABLE *table,
   Field *mv_field = nullptr;
   MY_BITMAP fields_to_evaluate;
   my_bitmap_map bitbuf[bitmap_buffer_size(MAX_FIELDS) / sizeof(my_bitmap_map)];
-  bitmap_init(&fields_to_evaluate, bitbuf, table->s->fields, 0);
+  bitmap_init(&fields_to_evaluate, bitbuf, table->s->fields);
   bitmap_set_all(&fields_to_evaluate);
   bitmap_intersect(&fields_to_evaluate, fields);
   /*
@@ -8030,9 +8123,9 @@ static bool my_eval_gcolumn_expr_helper(THD *thd, TABLE *table,
   for (Field **vfield_ptr = table->vfield; *vfield_ptr; vfield_ptr++) {
     Field *field = *vfield_ptr;
     // Validate that the field number is less than the bit map size
-    DBUG_ASSERT(field->field_index < fields->n_bits);
+    assert(field->field_index() < fields->n_bits);
 
-    if (bitmap_is_set(fields, field->field_index)) {
+    if (bitmap_is_set(fields, field->field_index())) {
       bitmap_union(&fields_to_evaluate, &field->gcol_info->base_columns_map);
       if (field->is_array()) {
         mv_field = field;
@@ -8053,7 +8146,7 @@ static bool my_eval_gcolumn_expr_helper(THD *thd, TABLE *table,
     that match key fields in the used secondary index. So we trust that the
     engine has filled all base columns necessary to requested computations,
     and we ignore read_set/write_set.
- */
+*/
 
   my_bitmap_map *old_maps[2];
   dbug_tmp_use_all_columns(table, old_maps, table->read_set, table->write_set);
@@ -8062,13 +8155,13 @@ static bool my_eval_gcolumn_expr_helper(THD *thd, TABLE *table,
     Field *field = *vfield_ptr;
 
     // Check if we should evaluate this field
-    if (bitmap_is_set(&fields_to_evaluate, field->field_index) &&
+    if (bitmap_is_set(&fields_to_evaluate, field->field_index()) &&
         field->is_virtual_gcol()) {
-      DBUG_ASSERT(field->gcol_info && field->gcol_info->expr_item->fixed);
+      assert(field->gcol_info && field->gcol_info->expr_item->fixed);
 
       const type_conversion_status save_in_field_status =
-          field->gcol_info->expr_item->save_in_field(field, 0);
-      DBUG_ASSERT(!thd->is_error() || save_in_field_status != TYPE_OK);
+          field->gcol_info->expr_item->save_in_field(field, false);
+      assert(!thd->is_error() || save_in_field_status != TYPE_OK);
 
       /*
         save_in_field() may return non-zero even if there was no
@@ -8094,7 +8187,7 @@ static bool my_eval_gcolumn_expr_helper(THD *thd, TABLE *table,
   if (in_purge) copy_blob_data(table, fields, blob_len_ptr_array);
 
   if (mv_field) {
-    DBUG_ASSERT(mv_data_ptr);
+    assert(mv_data_ptr);
     Field_json *fld = down_cast<Field_json *>(mv_field);
     // Save calculated value
     *mv_data_ptr = fld->get_binary();
@@ -8138,10 +8231,10 @@ bool handler::my_prepare_gcolumn_template(THD *thd, const char *db_name,
   bool was_truncated;
   build_table_filename(path, sizeof(path) - 1 - reg_ext_length, db_name,
                        table_name, "", 0, &was_truncated);
-  DBUG_ASSERT(!was_truncated);
+  assert(!was_truncated);
   bool rc = true;
 
-  MDL_ticket *mdl_ticket = NULL;
+  MDL_ticket *mdl_ticket = nullptr;
   if (dd::acquire_shared_table_mdl(thd, db_name, table_name, false,
                                    &mdl_ticket))
     return true;
@@ -8151,7 +8244,7 @@ bool handler::my_prepare_gcolumn_template(THD *thd, const char *db_name,
     dd::cache::Dictionary_client::Auto_releaser releaser(thd->dd_client());
     const dd::Table *tab_obj = nullptr;
     if (thd->dd_client()->acquire(db_name, table_name, &tab_obj)) return true;
-    DBUG_ASSERT(tab_obj);
+    assert(tab_obj);
 
     // Note! The second-to-last argument to open_table_uncached() must be false,
     // since the table already exists in the TDC. Allowing the table to
@@ -8206,9 +8299,9 @@ bool handler::my_eval_gcolumn_expr_with_open(THD *thd, const char *db_name,
   bool was_truncated;
   build_table_filename(path, sizeof(path) - 1 - reg_ext_length, db_name,
                        table_name, "", 0, &was_truncated);
-  DBUG_ASSERT(!was_truncated);
+  assert(!was_truncated);
 
-  MDL_ticket *mdl_ticket = NULL;
+  MDL_ticket *mdl_ticket = nullptr;
   if (dd::acquire_shared_table_mdl(thd, db_name, table_name, false,
                                    &mdl_ticket))
     return true;
@@ -8218,7 +8311,7 @@ bool handler::my_eval_gcolumn_expr_with_open(THD *thd, const char *db_name,
     dd::cache::Dictionary_client::Auto_releaser releaser(thd->dd_client());
     const dd::Table *tab_obj = nullptr;
     if (thd->dd_client()->acquire(db_name, table_name, &tab_obj)) return true;
-    DBUG_ASSERT(tab_obj);
+    assert(tab_obj);
 
     table = open_table_uncached(thd, path, db_name, table_name, false, false,
                                 *tab_obj);
@@ -8246,7 +8339,7 @@ bool handler::my_eval_gcolumn_expr(THD *thd, TABLE *table,
 }
 
 bool handler::filter_dup_records() {
-  DBUG_ASSERT(inited == INDEX && m_unique);
+  assert(inited == INDEX && m_unique);
   position(table->record[0]);
   return m_unique->unique_add(ref);
 }
@@ -8254,8 +8347,8 @@ bool handler::filter_dup_records() {
 int handler::ha_extra(enum ha_extra_function operation) {
   if (operation == HA_EXTRA_ENABLE_UNIQUE_RECORD_FILTER) {
     // This operation should be called only for active multi-valued index
-    DBUG_ASSERT(inited == INDEX &&
-                (table->key_info[active_index].flags & HA_MULTI_VALUED_KEY));
+    assert(inited == INDEX &&
+           (table->key_info[active_index].flags & HA_MULTI_VALUED_KEY));
     // This unique filter uses only row id to weed out duplicates. Due to that
     // it will work with any active index.
     if (!m_unique &&
@@ -8411,317 +8504,6 @@ bool ha_notify_alter_table(THD *thd, const MDL_key *mdl_key,
   return false;
 }
 
-const char *ha_rkey_function_to_str(enum ha_rkey_function r) {
-  switch (r) {
-    case HA_READ_KEY_EXACT:
-      return ("HA_READ_KEY_EXACT");
-    case HA_READ_KEY_OR_NEXT:
-      return ("HA_READ_KEY_OR_NEXT");
-    case HA_READ_KEY_OR_PREV:
-      return ("HA_READ_KEY_OR_PREV");
-    case HA_READ_AFTER_KEY:
-      return ("HA_READ_AFTER_KEY");
-    case HA_READ_BEFORE_KEY:
-      return ("HA_READ_BEFORE_KEY");
-    case HA_READ_PREFIX:
-      return ("HA_READ_PREFIX");
-    case HA_READ_PREFIX_LAST:
-      return ("HA_READ_PREFIX_LAST");
-    case HA_READ_PREFIX_LAST_OR_PREV:
-      return ("HA_READ_PREFIX_LAST_OR_PREV");
-    case HA_READ_MBR_CONTAIN:
-      return ("HA_READ_MBR_CONTAIN");
-    case HA_READ_MBR_INTERSECT:
-      return ("HA_READ_MBR_INTERSECT");
-    case HA_READ_MBR_WITHIN:
-      return ("HA_READ_MBR_WITHIN");
-    case HA_READ_MBR_DISJOINT:
-      return ("HA_READ_MBR_DISJOINT");
-    case HA_READ_MBR_EQUAL:
-      return ("HA_READ_MBR_EQUAL");
-    case HA_READ_INVALID:
-      return ("HA_READ_INVALID");
-  }
-  return ("UNKNOWN");
-}
-
-std::string table_definition(const char *table_name, const TABLE *mysql_table) {
-  std::string def = table_name;
-
-  def += " (";
-  for (uint i = 0; i < mysql_table->s->fields; i++) {
-    Field *field = mysql_table->field[i];
-    String type(128);
-
-    field->sql_type(type);
-
-    def += i == 0 ? "`" : ", `";
-    def += field->field_name;
-    def += "` ";
-    def.append(type.ptr(), type.length());
-
-    if (!field->real_maybe_null()) {
-      def += " not null";
-    }
-  }
-
-  for (uint i = 0; i < mysql_table->s->keys; i++) {
-    const KEY &key = mysql_table->key_info[i];
-
-    /* A string like "col1, col2, col3". */
-    std::string columns;
-
-    for (uint j = 0; j < key.user_defined_key_parts; j++) {
-      columns += j == 0 ? "`" : ", `";
-      columns += key.key_part[j].field->field_name;
-      columns += "`";
-    }
-
-    def += ", ";
-
-    switch (key.algorithm) {
-      case HA_KEY_ALG_BTREE:
-        def += "tree ";
-        break;
-      case HA_KEY_ALG_HASH:
-        def += "hash ";
-        break;
-      case HA_KEY_ALG_SE_SPECIFIC:
-        def += "se_specific ";
-        break;
-      case HA_KEY_ALG_RTREE:
-        def += "rtree ";
-        break;
-      case HA_KEY_ALG_FULLTEXT:
-        def += "fulltext ";
-        break;
-    }
-    def += key.flags & HA_NOSAME ? "unique " : "";
-    def += "index" + std::to_string(i) + "(" + columns + ")";
-  }
-  def += ")";
-
-  return def;
-}
-
-#ifndef DBUG_OFF
-/** Convert a binary buffer to a raw string, replacing non-printable characters
- * with a dot.
- * @param[in] buf buffer to convert
- * @param[in] buf_size_bytes length of the buffer in bytes
- * @return a printable string, e.g. "ab.d." for an input 0x61620064FF */
-static std::string buf_to_raw(const uchar *buf, uint buf_size_bytes) {
-  std::string r;
-  r.reserve(buf_size_bytes);
-  for (uint i = 0; i < buf_size_bytes; ++i) {
-    const uchar c = buf[i];
-    r += static_cast<char>(isprint(c) ? c : '.');
-  }
-  return r;
-}
-
-/** Convert a binary buffer to a hex string, replacing each character with its
- * hex number.
- * @param[in] buf buffer to convert
- * @param[in] buf_size_bytes length of the buffer in bytes
- * @return a hex string, e.g. "61 62 63" for an input "abc" */
-static std::string buf_to_hex(const uchar *buf, uint buf_size_bytes) {
-  std::string r;
-  r.reserve(buf_size_bytes * 3 -
-            1 /* the first hex byte has no leading space */);
-  char hex[3];
-  for (uint i = 0; i < buf_size_bytes; ++i) {
-    snprintf(hex, sizeof(hex), "%02x", buf[i]);
-    if (i > 0) {
-      r.append(" ", 1);
-    }
-    r.append(hex, 2);
-  }
-  return r;
-}
-
-std::string row_to_string(const uchar *mysql_row, TABLE *mysql_table) {
-  /* MySQL can either use handler::table->record[0] or handler::table->record[1]
-   * for buffers to store rows. We need each field in mysql_table->field[] to
-   * point inside the buffer which was used (either record[0] or record[1]). */
-
-  uchar *buf0 = mysql_table->record[0];
-  uchar *buf1 = mysql_table->record[1];
-  const uint mysql_row_length = mysql_table->s->rec_buff_length;
-
-  /* See which of the two buffers is being used. */
-  uchar *buf_used_by_mysql;
-  if (mysql_row == buf0) {
-    buf_used_by_mysql = buf0;
-  } else {
-    DBUG_ASSERT(mysql_row == buf1);
-    buf_used_by_mysql = buf1;
-  }
-
-  const uint number_of_fields = mysql_table->s->fields;
-
-  /* See where the fields currently point to. */
-  uchar *fields_orig_buf;
-  if (number_of_fields == 0) {
-    fields_orig_buf = buf_used_by_mysql;
-  } else {
-    Field *first_field = mysql_table->field[0];
-    if (first_field->ptr >= buf0 &&
-        first_field->ptr < buf0 + mysql_row_length) {
-      fields_orig_buf = buf0;
-    } else {
-      DBUG_ASSERT(first_field->ptr >= buf1);
-      DBUG_ASSERT(first_field->ptr < buf1 + mysql_row_length);
-      fields_orig_buf = buf1;
-    }
-  }
-
-  /* Repoint if necessary. */
-  if (buf_used_by_mysql != fields_orig_buf) {
-    repoint_field_to_record(mysql_table, fields_orig_buf, buf_used_by_mysql);
-  }
-
-  bool skip_raw_and_hex = false;
-
-#ifdef HAVE_VALGRIND
-  /* It is expected that here not all bits in (mysql_row, mysql_row_length) are
-   * initialized. For example in the first byte (the null-byte) we only set
-   * the bits of the corresponding columns to 0 or 1 (is null). And leave the
-   * remaining bits uninitialized for performance reasons. Thus Valgrind is
-   * right to complain below when we print everything. We do not want to
-   * memset() everything, so that Valgrind does not complain here and we do
-   * not want to MEM_DEFINED_IF_ADDRESSABLE(mysql_row, mysql_row_length) either
-   * because that would silence Valgrind in other possible places where the
-   * uninitialized bits should not be read. In other words - we want the
-   * Valgrind warnings if somebody tries to use the uninitialized bits,
-   * except here in this function. */
-  uchar *mysql_row_copy = static_cast<uchar *>(malloc(mysql_row_length));
-  memcpy(mysql_row_copy, mysql_row, mysql_row_length);
-  MEM_DEFINED_IF_ADDRESSABLE(mysql_row_copy, mysql_row_length);
-#else
-  const uchar *mysql_row_copy = mysql_row;
-  const char *running_valgrind = getenv("VALGRIND_SERVER_TEST");
-  int error = 0;
-  /* If testing with Valgrind, and MySQL isn't compiled for it, printing
-     would produce misleading errors, see comments for HAVE_VALGRIND above.
-  */
-  skip_raw_and_hex =
-      (nullptr != running_valgrind &&
-       0 != my_strtoll10(running_valgrind, nullptr, &error) && 0 == error);
-#endif /* HAVE_VALGRIND */
-
-  std::string r;
-
-  r += "len=" + std::to_string(mysql_row_length);
-
-  if (skip_raw_and_hex) {
-    r += ", raw=<skipped because of valgrind>";
-    r += ", hex=<skipped because of valgrind>";
-  } else {
-    r += ", raw=" + buf_to_raw(mysql_row_copy, mysql_row_length);
-    r += ", hex=" + buf_to_hex(mysql_row_copy, mysql_row_length);
-  }
-#ifdef HAVE_VALGRIND
-  free(mysql_row_copy);
-#endif /* HAVE_VALGRIND */
-
-  r += ", human=(";
-  for (uint i = 0; i < number_of_fields; ++i) {
-    Field *field = mysql_table->field[i];
-
-    DBUG_ASSERT(field->field_index == i);
-    DBUG_ASSERT(field->ptr >= mysql_row);
-    DBUG_ASSERT(field->ptr < mysql_row + mysql_row_length);
-
-    std::string val;
-
-    if (bitmap_is_set(mysql_table->read_set, i)) {
-      String s;
-      field->val_str(&s);
-      val = std::string(s.ptr(), s.length());
-    } else {
-      /* Field::val_str() asserts in ASSERT_COLUMN_MARKED_FOR_READ() if
-       * the read bit is not set. */
-      val = "read_bit_not_set";
-    }
-
-    r += std::string(i == 0 ? "`" : ", `") + field->field_name + "`=" + val;
-  }
-  r += ")";
-
-  /* Revert the above repoint_field_to_record(). */
-  if (buf_used_by_mysql != fields_orig_buf) {
-    repoint_field_to_record(mysql_table, buf_used_by_mysql, fields_orig_buf);
-  }
-
-  return r;
-}
-
-std::string indexed_cells_to_string(const uchar *indexed_cells,
-                                    uint indexed_cells_len,
-                                    const KEY &mysql_index) {
-  std::string r = "raw=" + buf_to_raw(indexed_cells, indexed_cells_len);
-
-  r += ", hex=" + buf_to_hex(indexed_cells, indexed_cells_len);
-
-  r += ", human=(";
-  uint key_len_so_far = 0;
-  for (uint i = 0; i < mysql_index.user_defined_key_parts; i++) {
-    const KEY_PART_INFO &key_part = mysql_index.key_part[i];
-    Field *field = key_part.field;
-
-    // Check if this field should be included
-    if (!bitmap_is_set(mysql_index.table->read_set, field->field_index)) {
-      continue;
-    }
-    if (key_len_so_far == indexed_cells_len) {
-      break;
-    }
-    DBUG_ASSERT(key_len_so_far < indexed_cells_len);
-
-    uchar *orig_ptr = field->ptr;
-    bool is_null = false;
-    field->ptr = const_cast<uchar *>(indexed_cells + key_len_so_far);
-
-    if (field->real_maybe_null()) {
-      if (field->ptr[0] != '\0') {
-        is_null = true;
-      } else {
-        field->ptr++;
-      }
-    }
-
-    uint32 orig_length_bytes;
-
-    String val;
-    if (!is_null) {
-      switch (field->type()) {
-        case MYSQL_TYPE_VARCHAR:
-          orig_length_bytes =
-              reinterpret_cast<Field_varstring *>(field)->length_bytes;
-          reinterpret_cast<Field_varstring *>(field)->length_bytes = 2;
-          field->val_str(&val);
-          reinterpret_cast<Field_varstring *>(field)->length_bytes =
-              orig_length_bytes;
-          break;
-        default:
-          field->val_str(&val);
-          break;
-      }
-    }
-
-    field->ptr = orig_ptr;
-
-    r += std::string(i > 0 ? ", `" : "`") + field->field_name +
-         "`=" + (is_null ? "NULL" : std::string(val.ptr(), val.length()));
-
-    key_len_so_far += key_part.store_length;
-  }
-  r += ")";
-  return r;
-}
-#endif /* DBUG_OFF */
-
 /**
   Set the transaction isolation level for the next transaction and update
   session tracker information about the transaction isolation level.
@@ -8732,17 +8514,16 @@ std::string indexed_cells_to_string(const uchar *indexed_cells,
                        session default after finishing the transaction.
 */
 bool set_tx_isolation(THD *thd, enum_tx_isolation tx_isolation, bool one_shot) {
-  Transaction_state_tracker *tst = NULL;
+  TX_TRACKER_GET(tst);
 
-  if (thd->variables.session_track_transaction_info > TX_TRACK_NONE)
-    tst = (Transaction_state_tracker *)thd->session_tracker.get_tracker(
-        TRANSACTION_INFO_TRACKER);
+  if (thd->variables.session_track_transaction_info <= TX_TRACK_NONE)
+    tst = nullptr;
 
   thd->tx_isolation = tx_isolation;
 
   if (one_shot) {
-    DBUG_ASSERT(!thd->in_active_multi_stmt_transaction());
-    DBUG_ASSERT(!thd->in_sub_stmt);
+    assert(!thd->in_active_multi_stmt_transaction());
+    assert(!thd->in_sub_stmt);
     enum enum_tx_isol_level l;
     switch (thd->tx_isolation) {
       case ISO_READ_UNCOMMITTED:
@@ -8758,7 +8539,7 @@ bool set_tx_isolation(THD *thd, enum_tx_isolation tx_isolation, bool one_shot) {
         l = TX_ISOL_SERIALIZABLE;
         break;
       default:
-        DBUG_ASSERT(0);
+        assert(0);
         return true;
     }
     if (tst) tst->set_isol_level(thd, l);
@@ -8783,8 +8564,8 @@ void ha_post_recover(void) {
 }
 
 void handler::ha_set_primary_handler(handler *primary_handler) {
-  DBUG_ASSERT((ht->flags & HTON_IS_SECONDARY_ENGINE) != 0);
-  DBUG_ASSERT(primary_handler->table->s->has_secondary_engine());
+  assert((ht->flags & HTON_IS_SECONDARY_ENGINE) != 0);
+  assert(primary_handler->table->s->has_secondary_engine());
   m_primary_handler = primary_handler;
 }
 
@@ -8815,7 +8596,22 @@ static bool is_reserved_db_name_handlerton(THD *, plugin_ref plugin,
    @retval false   If the name is not a reserved word.
 */
 bool ha_check_reserved_db_name(const char *name) {
-  return (plugin_foreach(NULL, is_reserved_db_name_handlerton,
+  return (plugin_foreach(nullptr, is_reserved_db_name_handlerton,
                          MYSQL_STORAGE_ENGINE_PLUGIN,
                          const_cast<char *>(name)));
+}
+
+/**
+   Check whether an error is index access error or not
+   after an index read. Error other than HA_ERR_END_OF_FILE
+   or HA_ERR_KEY_NOT_FOUND will stop next index read.
+
+   @param  error    Handler error code.
+
+   @retval true     if error is different from HA_ERR_END_OF_FILE or
+                    HA_ERR_KEY_NOT_FOUND.
+   @retval false    if error is HA_ERR_END_OF_FILE or HA_ERR_KEY_NOT_FOUND.
+*/
+bool is_index_access_error(int error) {
+  return (error != HA_ERR_END_OF_FILE && error != HA_ERR_KEY_NOT_FOUND);
 }

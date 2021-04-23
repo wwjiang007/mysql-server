@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1994, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1994, 2021, Oracle and/or its affiliates.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -89,11 +89,11 @@ typedef time_t ib_time_t;
 typedef int64_t ib_time_monotonic_t;
 
 /** Number of milliseconds read from the monotonic clock (returned by
- * ut_time_monotonic_ms()). */
+ ut_time_monotonic_ms()). */
 typedef int64_t ib_time_monotonic_ms_t;
 
 /** Number of microseconds read from the monotonic clock (returned by
- * ut_time_monotonic_us()). */
+ ut_time_monotonic_us()). */
 typedef int64_t ib_time_monotonic_us_t;
 
 #ifndef UNIV_HOTBACKUP
@@ -115,6 +115,14 @@ to memory). */
 the YieldProcessor macro defined in WinNT.h. It is a CPU architecture-
 independent way by using YieldProcessor. */
 #define UT_RELAX_CPU() YieldProcessor()
+#elif defined(__aarch64__)
+/* A "yield" instruction in aarch64 is essentially a nop, and does not cause
+enough delay to help backoff. "isb" is a barrier that, especially inside a
+loop, creates a small delay without consuming ALU resources.
+Experiments shown that adding the isb instruction improves stability and reduces
+result jitter. Adding more delay to the UT_RELAX_CPU than a single isb reduces
+performance. */
+#define UT_RELAX_CPU() __asm__ __volatile__("isb" ::: "memory")
 #else
 #define UT_RELAX_CPU() __asm__ __volatile__("" ::: "memory")
 #endif
@@ -140,12 +148,21 @@ independent way by using YieldProcessor. */
       if (limit <= 0 || (diff > 0 && ((uint64_t)diff) > ((uint64_t)limit))) { \
         break;                                                                \
       }                                                                       \
-      os_thread_sleep(2000 /* 2 ms */);                                       \
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));              \
     }                                                                         \
   } while (0)
 #else                  /* !UNIV_HOTBACKUP */
 #define UT_RELAX_CPU() /* No op */
 #endif                 /* !UNIV_HOTBACKUP */
+
+namespace ut {
+struct Location {
+  const char *filename;
+  size_t line;
+};
+}  // namespace ut
+
+#define UT_LOCATION_HERE (ut::Location{__FILE__, __LINE__})
 
 #define ut_max std::max
 #define ut_min std::min
@@ -216,9 +233,9 @@ UNIV_INLINE
 uint32_t ut_2_exp(uint32_t n);
 
 /** Calculates fast the number rounded up to the nearest power of 2.
- @return first power of 2 which is >= n */
-ulint ut_2_power_up(ulint n) /*!< in: number != 0 */
-    MY_ATTRIBUTE((const));
+@param[in]  n   number != 0
+@return first power of 2 which is >= n */
+ulint ut_2_power_up(ulint n);
 
 /** Determine how many bytes (groups of 8 bits) are needed to
 store the given number of bits.
@@ -313,9 +330,10 @@ database_name.table_name.
 @return pointer to 'formatted' */
 char *ut_format_name(const char *name, char *formatted, ulint formatted_size);
 
-/** Catenate files. */
-void ut_copy_file(FILE *dest, /*!< in: output file */
-                  FILE *src); /*!< in: input file to be appended to output */
+/** Catenate files.
+@param[in] dest Output file
+@param[in] src Input file to be appended to output */
+void ut_copy_file(FILE *dest, FILE *src);
 
 /** Convert byte value to string with unit
 @param[in]      data_bytes      byte value
@@ -647,7 +665,7 @@ class info : public logger {
       : logger(INFORMATION_LEVEL, err, std::forward<Args>(args)...) {}
 #else
   /** Destructor */
-  ~info();
+  ~info() override;
 #endif /* !UNIV_NO_ERR_MSGS */
 };
 
@@ -668,7 +686,7 @@ class warn : public logger {
 
 #else
   /** Destructor */
-  ~warn();
+  ~warn() override;
 #endif /* !UNIV_NO_ERR_MSGS */
 };
 
@@ -689,7 +707,7 @@ class error : public logger {
 
 #else
   /** Destructor */
-  ~error();
+  ~error() override;
 #endif /* !UNIV_NO_ERR_MSGS */
 };
 
@@ -710,10 +728,10 @@ class fatal : public logger {
       : logger(ERROR_LEVEL, err, std::forward<Args>(args)...) {}
 
   /** Destructor. */
-  virtual ~fatal();
+  ~fatal() override;
 #else
   /** Destructor. */
-  ~fatal();
+  ~fatal() override;
 #endif /* !UNIV_NO_ERR_MSGS */
 };
 
@@ -757,7 +775,7 @@ class fatal_or_error : public logger {
       : logger(ERROR_LEVEL, err, std::forward<Args>(args)...), m_fatal(fatal) {}
 
   /** Destructor */
-  virtual ~fatal_or_error();
+  ~fatal_or_error() override;
 #else
   /** Constructor */
   fatal_or_error(bool fatal) : m_fatal(fatal) {}
@@ -836,6 +854,41 @@ class trace_3 : public logger {
 #endif /* !UNIV_NO_ERR_MSGS */
 };
 #endif /* UNIV_HOTBACKUP */
+
+/** For measuring time elapsed. Since std::chrono::high_resolution_clock
+may be influenced by a change in system time, it might not be steady.
+So we use std::chrono::steady_clock for ellapsed time. */
+class Timer {
+ public:
+  using SC = std::chrono::steady_clock;
+
+ public:
+  /** Constructor. Starts/resets the timer to the current time. */
+  Timer() noexcept { reset(); }
+
+  /** Reset the timer to the current time. */
+  void reset() { m_start = SC::now(); }
+
+  /** @return the time elapsed in milliseconds. */
+  template <typename T = std::chrono::milliseconds>
+  int64_t elapsed() const noexcept {
+    return std::chrono::duration_cast<T>(SC::now() - m_start).count();
+  }
+
+  /** Print time elapsed since last reset (in milliseconds) to the stream.
+  @param[in,out] out  Stream to write to.
+  @param[in] timer Timer to write to the stream.
+  @return stream instance that was passed in. */
+  template <typename T, typename Traits>
+  friend std::basic_ostream<T, Traits> &operator<<(
+      std::basic_ostream<T, Traits> &out, const Timer &timer) noexcept {
+    return out << timer.elapsed();
+  }
+
+ private:
+  /** High resolution timer instance used for timimg. */
+  SC::time_point m_start;
+};
 
 }  // namespace ib
 

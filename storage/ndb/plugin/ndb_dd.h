@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2017, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -28,6 +28,7 @@
 #include <string>
 
 #include "sql/dd/string_type.h"
+#include "storage/ndb/include/ndbapi/NdbApi.hpp"
 
 namespace dd {
 class Table;
@@ -50,5 +51,13 @@ bool ndb_dd_has_local_tables_in_schema(THD *thd, const char *schema_name,
                                        bool &tables_exist_in_database);
 
 const std::string ndb_dd_fs_name_case(const dd::String_type &name);
+
+bool ndb_dd_get_schema_uuid(THD *thd, dd::String_type *schema_uuid);
+
+bool ndb_dd_update_schema_uuid(THD *thd, const std::string &ndb_schema_uuid);
+
+bool ndb_dd_upgrade_foreign_keys(dd::Table *dd_table_def, Ndb *ndb,
+                                 const char *schema_name,
+                                 const NdbDictionary::Table *ndb_table);
 
 #endif

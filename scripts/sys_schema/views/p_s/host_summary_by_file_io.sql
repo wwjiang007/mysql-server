@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -40,7 +40,7 @@ VIEW host_summary_by_file_io (
 ) AS
 SELECT IF(host IS NULL, 'background', host) AS host,
        SUM(count_star) AS ios,
-       sys.format_time(SUM(sum_timer_wait)) AS io_latency 
+       format_pico_time(SUM(sum_timer_wait)) AS io_latency 
   FROM performance_schema.events_waits_summary_by_host_by_event_name
  WHERE event_name LIKE 'wait/io/file/%'
  GROUP BY IF(host IS NULL, 'background', host)

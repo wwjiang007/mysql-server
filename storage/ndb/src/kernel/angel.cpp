@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2009, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -38,6 +38,7 @@
 #include <ConfigRetriever.hpp>
 
 #include <EventLogger.hpp>
+#include <NdbTCP.h>
 extern EventLogger * g_eventLogger;
 
 static void
@@ -90,7 +91,7 @@ reportShutdown(const ndb_mgm_configuration* config,
                      rep->getNodeId(), 0);
 
   // Log event to cluster log
-  ndb_mgm_configuration_iterator iter(*config, CFG_SECTION_NODE);
+  ndb_mgm_configuration_iterator iter(config, CFG_SECTION_NODE);
   for (iter.first(); iter.valid(); iter.next())
   {
     Uint32 type;
@@ -107,7 +108,7 @@ reportShutdown(const ndb_mgm_configuration* config,
       continue;
 
     BaseString connect_str;
-    connect_str.assfmt("%s:%d", hostname, port);
+    connect_str.assfmt("%s %d", hostname, port);
 
 
     NdbMgmHandle h = ndb_mgm_create_handle();
@@ -497,7 +498,7 @@ static bool
 configure(const ndb_mgm_configuration* conf, NodeId nodeid)
 {
   Uint32 generation = 0;
-  ndb_mgm_configuration_iterator sys_iter(*conf, CFG_SECTION_SYSTEM);
+  ndb_mgm_configuration_iterator sys_iter(conf, CFG_SECTION_SYSTEM);
   if (sys_iter.get(CFG_SYS_CONFIG_GENERATION, &generation))
   {
     g_eventLogger->warning("Configuration didn't contain generation "
@@ -505,7 +506,7 @@ configure(const ndb_mgm_configuration* conf, NodeId nodeid)
   }
   g_eventLogger->debug("Using configuration with generation %u", generation);
 
-  ndb_mgm_configuration_iterator iter(*conf, CFG_SECTION_NODE);
+  ndb_mgm_configuration_iterator iter(conf, CFG_SECTION_NODE);
   if (iter.find(CFG_NODE_ID, nodeid))
   {
     g_eventLogger->error("Invalid configuration fetched, could not "
@@ -587,9 +588,11 @@ angel_run(const char* progname,
                          "error: '%s'", retriever.getErrorString());
     angel_exit(1);
   }
-  g_eventLogger->info("Angel connected to '%s:%d'",
-                      retriever.get_mgmd_host(),
-                      retriever.get_mgmd_port());
+
+  char buf[512];
+  char* sockaddr_string = Ndb_combine_address_port(buf, sizeof(buf), retriever.get_mgmd_host(),
+                           retriever.get_mgmd_port());
+  g_eventLogger->info("Angel connected to '%s'", sockaddr_string);
 
   const int alloc_retries = 10;
   const int alloc_delay = 3;
@@ -602,11 +605,8 @@ angel_run(const char* progname,
   }
   g_eventLogger->info("Angel allocated nodeid: %u", nodeid);
 
-  std::unique_ptr<ndb_mgm_configuration, ConfigRetriever::ConfigDeleter>
-      config_autoptr{retriever.getConfig(nodeid)};
-  ndb_mgm_configuration* config{config_autoptr.get()};
-
-  if (config == 0)
+  ndb_mgm_config_unique_ptr config(retriever.getConfig(nodeid));
+  if (!config)
   {
     g_eventLogger->error("Could not fetch configuration/invalid "
                          "configuration, error: '%s'",
@@ -614,7 +614,7 @@ angel_run(const char* progname,
     angel_exit(1);
   }
 
-  if (!configure(config, nodeid))
+  if (!configure(config.get(), nodeid))
   {
     // Failed to configure, error already printed
     angel_exit(1);
@@ -750,7 +750,7 @@ angel_run(const char* progname,
       switch (WEXITSTATUS(status)) {
       case NRT_Default:
         g_eventLogger->info("Angel shutting down");
-        reportShutdown(config, nodeid, 0, 0, false, false,
+        reportShutdown(config.get(), nodeid, 0, 0, false, false,
                        child_error, child_signal, child_sphase);
         angel_exit(0);
         break;
@@ -773,7 +773,7 @@ angel_run(const char* progname,
           /**
            * Error shutdown && stopOnError()
            */
-          reportShutdown(config, nodeid,
+          reportShutdown(config.get(), nodeid,
                          error_exit, 0, false, false,
                          child_error, child_signal, child_sphase);
           angel_exit(0);
@@ -802,7 +802,7 @@ angel_run(const char* progname,
         /**
          * Error shutdown && stopOnError()
          */
-        reportShutdown(config, nodeid,
+        reportShutdown(config.get(), nodeid,
                        error_exit, 0, false, false,
                        child_error, child_signal, child_sphase);
         angel_exit(0);
@@ -827,7 +827,7 @@ angel_run(const char* progname,
       {
         g_eventLogger->alert("Angel detected too many startup failures(%d), "
                              "not restarting again", failed_startups_counter);
-        reportShutdown(config, nodeid,
+        reportShutdown(config.get(), nodeid,
                        error_exit, 0, false, false,
                        child_error, child_signal, child_sphase);
         angel_exit(0);
@@ -843,7 +843,7 @@ angel_run(const char* progname,
       failed_startups_counter = 0;
     }
 
-    reportShutdown(config, nodeid,
+    reportShutdown(config.get(), nodeid,
                    error_exit, 1,
                    no_start,
                    initial,

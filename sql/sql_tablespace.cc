@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -103,15 +103,19 @@ st_alter_tablespace::st_alter_tablespace(
       undo_buffer_size{opts.undo_buffer_size},
       redo_buffer_size{opts.redo_buffer_size},
       initial_size{opts.initial_size},
-      autoextend_size{opts.autoextend_size},
       max_size{opts.max_size},
       file_block_size{opts.file_block_size},
       nodegroup_id{opts.nodegroup_id},
       wait_until_completed{opts.wait_until_completed},
-      ts_comment{opts.ts_comment.str} {}
+      ts_comment{opts.ts_comment.str},
+      encryption{opts.encryption.str} {
+  if (opts.autoextend_size.has_value()) {
+    autoextend_size = opts.autoextend_size.value();
+  }
+}
 
 bool validate_tablespace_name_length(const char *tablespace_name) {
-  DBUG_ASSERT(tablespace_name != nullptr);
+  assert(tablespace_name != nullptr);
   LEX_CSTRING tspname = {tablespace_name, strlen(tablespace_name)};
   return validate_tspnamelen(tspname);
 }
@@ -119,8 +123,8 @@ bool validate_tablespace_name_length(const char *tablespace_name) {
 bool validate_tablespace_name(ts_command_type ts_cmd,
                               const char *tablespace_name,
                               const handlerton *engine) {
-  DBUG_ASSERT(tablespace_name != nullptr);
-  DBUG_ASSERT(engine != nullptr);
+  assert(tablespace_name != nullptr);
+  assert(engine != nullptr);
 
   // Length must be valid.
   if (validate_tablespace_name_length(tablespace_name)) {
@@ -172,12 +176,12 @@ bool complete_stmt(THD *thd, handlerton *hton, DISABLE_ROLLBACK &&dr,
       return true;
     }
 
-  dr();
-
   /* Commit the statement and call storage engine's post-DDL hook. */
   if (trans_commit_stmt(thd) || trans_commit(thd)) {
     return true;
   }
+
+  dr();
 
   if (hton && ddl_is_atomic(hton) && hton->post_ddl) {
     hton->post_ddl(thd);
@@ -207,7 +211,16 @@ bool lock_rec(THD *thd, MDL_request_list *rlst, const LEX_STRING &tsp) {
                    MDL_INTENTION_EXCLUSIVE, MDL_TRANSACTION);
   rlst->push_front(&backup_lock_request);
 
-  return thd->mdl_context.acquire_locks(rlst, thd->variables.lock_wait_timeout);
+  if (thd->mdl_context.acquire_locks(rlst, thd->variables.lock_wait_timeout))
+    return true;
+
+  /*
+    Now when we have protection against concurrent change of read_only
+    option we can safely re-check its value.
+  */
+  if (check_readonly(thd, true)) return true;
+
+  return false;
 }
 
 template <typename... Names>
@@ -265,7 +278,7 @@ Mod_pair<T> get_mod_pair(dd::cache::Dictionary_client *dcp,
   if (dcp->acquire_for_modification(name, &ret.second)) {
     return {nullptr, nullptr};
   }
-  DBUG_ASSERT(ret.second != nullptr);
+  assert(ret.second != nullptr);
   return ret;
 }
 
@@ -283,7 +296,7 @@ Mod_pair<T> get_mod_pair(dd::cache::Dictionary_client *dcp,
   if (dcp->acquire_for_modification(sch_name, name, &ret.second)) {
     return {nullptr, nullptr};
   }
-  DBUG_ASSERT(ret.second != nullptr);
+  assert(ret.second != nullptr);
   return ret;
 }
 
@@ -347,7 +360,7 @@ bool get_dd_hton(THD *thd, const dd::String_type &dd_engine,
     return true;
   }
 
-  DBUG_ASSERT(hton->alter_tablespace);
+  assert(hton->alter_tablespace);
   if (hton->alter_tablespace == nullptr) {
     my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0), dd_engine.c_str(), stmt);
     return true;
@@ -362,7 +375,7 @@ bool intermediate_commit_unless_atomic_ddl(THD *thd, handlerton *hton) {
     return false;
   }
   /* purecov: begin inspected */
-  Disable_gtid_state_update_guard disabler{thd};
+  Implicit_substatement_state_guard substatement_guard{thd};
   return (trans_commit_stmt(thd) || trans_commit(thd));
   /* purecov: end */
 }
@@ -421,7 +434,7 @@ Sql_cmd_tablespace::Sql_cmd_tablespace(const LEX_STRING &name,
 
 /* purecov: begin inspected */
 enum_sql_command Sql_cmd_tablespace::sql_command_code() const {
-  DBUG_ASSERT(false);
+  assert(false);
   return SQLCOM_ALTER_TABLESPACE;
 }
 /* purecov: end */
@@ -521,6 +534,9 @@ bool Sql_cmd_create_tablespace::execute(THD *thd) {
 
   tablespace->set_comment(dd::String_type{m_options->ts_comment.str, cl});
 
+  if (m_options->engine_attribute.str)
+    tablespace->set_engine_attribute(m_options->engine_attribute);
+
   LEX_STRING tblspc_datafile_name = {m_datafile_name.str,
                                      m_datafile_name.length};
   if (m_auto_generate_datafile_name) {
@@ -543,6 +559,11 @@ bool Sql_cmd_create_tablespace::execute(THD *thd) {
   // Add datafile
   tablespace->add_file()->set_filename(
       dd::make_string_type(tblspc_datafile_name));
+
+  tablespace->options().set("autoextend_size",
+                            m_options->autoextend_size.has_value()
+                                ? m_options->autoextend_size.value()
+                                : 0);
 
   // Write changes to dictionary.
   if (dc.store(tablespace.get())) {
@@ -588,7 +609,7 @@ bool Sql_cmd_create_tablespace::execute(THD *thd) {
         return true;
       }
 
-      Disable_gtid_state_update_guard disabler{thd};
+      Implicit_substatement_state_guard substatement_guard{thd};
       (void)trans_commit_stmt(thd);
       (void)trans_commit(thd);
       /* purecov: end */
@@ -687,7 +708,7 @@ bool Sql_cmd_drop_tablespace::execute(THD *thd) {
         return true;
       }
 
-      Disable_gtid_state_update_guard disabler{thd};
+      Implicit_substatement_state_guard substatement_guard{thd};
       (void)trans_commit_stmt(thd);
       (void)trans_commit(thd);
       /* purecov: end */
@@ -936,6 +957,15 @@ bool Sql_cmd_alter_tablespace::execute(THD *thd) {
                                     &table_mdl_reqs))
         return true;
     }
+  }
+
+  if (m_options->engine_attribute.str) {
+    tsmp.second->set_engine_attribute(m_options->engine_attribute);
+  }
+
+  if (m_options->autoextend_size.has_value()) {
+    tsmp.second->options().set("autoextend_size",
+                               m_options->autoextend_size.value());
   }
 
   /*
@@ -1279,9 +1309,9 @@ bool Sql_cmd_alter_tablespace_rename::execute(THD *thd) {
 
   // TODO WL#9536: Until crash-safe ddl is implemented we need to do
   // manual compensation in case of rollback
-  auto compensate_grd = dd::sdi_utils::make_guard(hton, [&](handlerton *hton) {
+  auto compensate_grd = dd::sdi_utils::make_guard(hton, [&](handlerton *ht) {
     std::unique_ptr<dd::Tablespace> comp{tsmp.first->clone()};
-    (void)hton->alter_tablespace(hton, thd, &ts_info, tsmp.second, comp.get());
+    (void)ht->alter_tablespace(ht, thd, &ts_info, tsmp.second, comp.get());
   });
 
   DBUG_EXECUTE_IF("tspr_post_se", {
@@ -1437,7 +1467,7 @@ bool Sql_cmd_create_undo_tablespace::execute(THD *thd) {
         return true;
       }
 
-      Disable_gtid_state_update_guard disabler{thd};
+      Implicit_substatement_state_guard substatement_guard{thd};
       (void)trans_commit_stmt(thd);
       (void)trans_commit(thd);
     }
@@ -1475,9 +1505,9 @@ Sql_cmd_alter_undo_tablespace::Sql_cmd_alter_undo_tablespace(
       m_at_type(at_type),
       m_options(options) {
   // These only at_type values that the syntax currently accepts
-  DBUG_ASSERT(at_type == TS_ALTER_TABLESPACE_TYPE_NOT_DEFINED ||
-              at_type == ALTER_UNDO_TABLESPACE_SET_ACTIVE ||
-              at_type == ALTER_UNDO_TABLESPACE_SET_INACTIVE);
+  assert(at_type == TS_ALTER_TABLESPACE_TYPE_NOT_DEFINED ||
+         at_type == ALTER_UNDO_TABLESPACE_SET_ACTIVE ||
+         at_type == ALTER_UNDO_TABLESPACE_SET_INACTIVE);
 }
 
 bool Sql_cmd_alter_undo_tablespace::execute(THD *thd) {
@@ -1535,7 +1565,7 @@ bool Sql_cmd_alter_undo_tablespace::execute(THD *thd) {
       hton->alter_tablespace(hton, thd, &ts_info, tsmp.first, tsmp.second);
   if (map_errors(ha_error, "ALTER UNDO TABLEPSPACE", &ts_info)) {
     if (!ddl_is_atomic(hton)) {
-      Disable_gtid_state_update_guard disabler{thd};
+      Implicit_substatement_state_guard substatement_guard{thd};
       (void)trans_commit_stmt(thd);
       (void)trans_commit(thd);
     }
@@ -1635,7 +1665,7 @@ bool Sql_cmd_drop_undo_tablespace::execute(THD *thd) {
         return true;
       }
 
-      Disable_gtid_state_update_guard disabler{thd};
+      Implicit_substatement_state_guard substatement_guard{thd};
       (void)trans_commit_stmt(thd);
       (void)trans_commit(thd);
     }

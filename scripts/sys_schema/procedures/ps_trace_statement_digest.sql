@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -240,8 +240,8 @@ BEGIN
     SELECT "SUMMARY STATISTICS";
 
     SELECT COUNT(*) executions,
-           sys.format_time(SUM(timer_wait)) AS exec_time,
-           sys.format_time(SUM(lock_time)) AS lock_time,
+           format_pico_time(SUM(timer_wait)) AS exec_time,
+           format_pico_time(SUM(lock_time)) AS lock_time,
            SUM(rows_sent) AS rows_sent,
            SUM(rows_affected) AS rows_affected,
            SUM(rows_examined) AS rows_examined,
@@ -251,7 +251,7 @@ BEGIN
 
     SELECT event_name,
            COUNT(*) as count,
-           sys.format_time(SUM(timer_wait)) as latency
+           format_pico_time(SUM(timer_wait)) as latency
       FROM stmt_stages
      GROUP BY event_name
      ORDER BY SUM(timer_wait) DESC;
@@ -259,8 +259,8 @@ BEGIN
     SELECT "LONGEST RUNNING STATEMENT";
 
     SELECT thread_id,
-           sys.format_time(timer_wait) AS exec_time,
-           sys.format_time(lock_time) AS lock_time,
+           format_pico_time(timer_wait) AS exec_time,
+           format_pico_time(lock_time) AS lock_time,
            rows_sent,
            rows_affected,
            rows_examined,
@@ -279,7 +279,7 @@ BEGIN
 
     IF (@sql_id IS NOT NULL) THEN
         SELECT event_name,
-               sys.format_time(timer_wait) as latency
+               format_pico_time(timer_wait) as latency
           FROM stmt_stages
          WHERE stmt_id = @sql_id
          ORDER BY event_id;

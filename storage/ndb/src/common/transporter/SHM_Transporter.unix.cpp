@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -68,6 +68,10 @@ SHM_Transporter::ndb_shm_create()
                    shmId,
                    errno,
                    strerror(errno)));
+    fprintf(stderr,
+      "ERROR: Failed to create SHM segment of size %u with errno: %d(%s)\n",
+      shmSize, errno, strerror(errno));
+    require(false);
     return false;
   }
   return true;
@@ -87,6 +91,13 @@ SHM_Transporter::ndb_shm_get()
                    shmId,
                    errno,
                    strerror(errno)));
+    if (errno != ENOENT)
+    {
+      fprintf(stderr,
+        "ERROR: Failed to get SHM segment of size %u with errno: %d(%s)\n",
+        shmSize, errno, strerror(errno));
+      require(false);
+    }
     return false;
   }
   return true;

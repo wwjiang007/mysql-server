@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2002, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2002, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -169,6 +169,7 @@ int findopt(const char *, uint, const struct my_option **);
 
 bool is_key_cache_variable_suffix(const char *suffix);
 
+bool get_bool_argument(const char *argument, bool *error);
 // Declared here, so we can unit test it.
 template <typename LLorULL>
 LLorULL eval_num_suffix(const char *argument, int *error,

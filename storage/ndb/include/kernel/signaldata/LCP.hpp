@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -256,8 +256,9 @@ struct SyncExtentPagesReq
   enum LcpOrder
   {
     FIRST_LCP = 0,
-    INTERMEDIATE_LCP = 1,
-    END_LCP = 2
+    END_LCP = 1,
+    RESTART_SYNC = 2,
+    FIRST_AND_END_LCP = 3
   };
   Uint32 senderData;
   Uint32 senderRef;

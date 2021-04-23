@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2008, 2021, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -96,7 +96,14 @@ struct PFS_instr {
 };
 
 /** Instrumented mutex implementation. @see PSI_mutex. */
-struct PFS_ALIGNED PFS_mutex : public PFS_instr {
+struct PFS_mutex : public PSI_mutex {
+  /** Internal lock. */
+  pfs_lock m_lock;
+  /** Timed flag. */
+  bool m_timed;
+  /** Container page. */
+  PFS_opaque_container_page *m_page;
+
   /** Mutex identity, typically a @c pthread_mutex_t. */
   const void *m_identity;
   /** Mutex class. */
@@ -105,15 +112,24 @@ struct PFS_ALIGNED PFS_mutex : public PFS_instr {
   PFS_mutex_stat m_mutex_stat;
   /** Current owner. */
   PFS_thread *m_owner;
+#ifdef LATER_WL2333
   /**
     Time stamp of the last lock.
     This statistic is not exposed in user visible tables yet.
   */
   ulonglong m_last_locked;
+#endif /* LATER_WL2333 */
 };
 
 /** Instrumented rwlock implementation. @see PSI_rwlock. */
-struct PFS_ALIGNED PFS_rwlock : public PFS_instr {
+struct PFS_rwlock : public PSI_rwlock {
+  /** Internal lock. */
+  pfs_lock m_lock;
+  /** Timed flag. */
+  bool m_timed;
+  /** Container page. */
+  PFS_opaque_container_page *m_page;
+
   /** RWLock identity, typically a @c pthread_rwlock_t. */
   const void *m_identity;
   /** RWLock class. */
@@ -124,6 +140,7 @@ struct PFS_ALIGNED PFS_rwlock : public PFS_instr {
   PFS_thread *m_writer;
   /** Current count of readers. */
   uint m_readers;
+#ifdef LATER_WL2333
   /**
     Time stamp of the last write.
     This statistic is not exposed in user visible tables yet.
@@ -134,10 +151,18 @@ struct PFS_ALIGNED PFS_rwlock : public PFS_instr {
     This statistic is not exposed in user visible tables yet.
   */
   ulonglong m_last_read;
+#endif /* LATER_WL2333 */
 };
 
 /** Instrumented condition implementation. @see PSI_cond. */
-struct PFS_ALIGNED PFS_cond : public PFS_instr {
+struct PFS_cond : public PSI_cond {
+  /** Internal lock. */
+  pfs_lock m_lock;
+  /** Timed flag. */
+  bool m_timed;
+  /** Container page. */
+  PFS_opaque_container_page *m_page;
+
   /** Condition identity, typically a @c pthread_cond_t. */
   const void *m_identity;
   /** Condition class. */
@@ -259,7 +284,14 @@ struct PFS_ALIGNED PFS_table {
 };
 
 /** Instrumented socket implementation. @see PSI_socket. */
-struct PFS_ALIGNED PFS_socket : public PFS_instr {
+struct PFS_socket : public PSI_socket {
+  /** Internal lock. */
+  pfs_lock m_lock;
+  /** Timed flag. */
+  bool m_timed;
+  /** Container page. */
+  PFS_opaque_container_page *m_page;
+
   uint32 get_version() { return m_lock.get_version(); }
 
   /** Socket identity, typically int */
@@ -267,7 +299,7 @@ struct PFS_ALIGNED PFS_socket : public PFS_instr {
   /** Owning thread, if applicable */
   PFS_thread *m_thread_owner;
   /** Socket file descriptor */
-  uint m_fd;
+  my_socket m_fd;
   /** Raw socket address */
   struct sockaddr_storage m_sock_addr;
   /** Length of address */
@@ -619,6 +651,8 @@ struct PFS_ALIGNED PFS_thread : PFS_connection_slice {
   PFS_user *m_user;
   PFS_account *m_account;
 
+  /** Remote (peer) port */
+  uint m_peer_port;
   /** Raw socket address */
   struct sockaddr_storage m_sock_addr;
   /** Length of address */
@@ -646,7 +680,10 @@ struct PFS_ALIGNED PFS_thread : PFS_connection_slice {
   /** Reset all memory statistics. */
   void rebase_memory_stats();
 
-  void carry_memory_stat_delta(PFS_memory_stat_delta *delta, uint index);
+  void carry_memory_stat_alloc_delta(PFS_memory_stat_alloc_delta *delta,
+                                     uint index);
+  void carry_memory_stat_free_delta(PFS_memory_stat_free_delta *delta,
+                                    uint index);
 
   void set_enabled(bool enabled) { m_enabled = enabled; }
 
@@ -672,7 +709,7 @@ struct PFS_ALIGNED PFS_thread : PFS_connection_slice {
 
   const PFS_memory_safe_stat *read_instr_class_memory_stats() const {
     if (!m_has_memory_stats) {
-      return NULL;
+      return nullptr;
     }
     return m_instr_class_memory_stats;
   }
@@ -686,7 +723,10 @@ struct PFS_ALIGNED PFS_thread : PFS_connection_slice {
   }
 };
 
-void carry_global_memory_stat_delta(PFS_memory_stat_delta *delta, uint index);
+void carry_global_memory_stat_alloc_delta(PFS_memory_stat_alloc_delta *delta,
+                                          uint index);
+void carry_global_memory_stat_free_delta(PFS_memory_stat_free_delta *delta,
+                                         uint index);
 
 extern PFS_stage_stat *global_instr_class_stages_array;
 extern PFS_statement_stat *global_instr_class_statements_array;
@@ -723,11 +763,15 @@ void destroy_thread(PFS_thread *pfs);
 PFS_file *find_or_create_file(PFS_thread *thread, PFS_file_class *klass,
                               const char *filename, uint len, bool create);
 
-void find_and_rename_file(PFS_thread *thread, const char *old_filename,
-                          uint old_len, const char *new_filename, uint new_len);
+PFS_file *start_file_rename(PFS_thread *thread, const char *old_name);
+int end_file_rename(PFS_thread *thread, PFS_file *pfs, const char *new_name,
+                    int rename_result);
 
+PFS_file *find_file(PFS_thread *thread, PFS_file_class *klass,
+                    const char *filename, uint len);
 void release_file(PFS_file *pfs);
-void destroy_file(PFS_thread *thread, PFS_file *pfs);
+void delete_file_name(PFS_thread *thread, PFS_file *pfs);
+void destroy_file(PFS_thread *thread, PFS_file *pfs, bool delete_name);
 PFS_table *create_table(PFS_table_share *share, PFS_thread *opening_thread,
                         const void *identity);
 void destroy_table(PFS_table *pfs);
@@ -794,13 +838,20 @@ void aggregate_all_errors(PFS_error_stat *from_array,
                           PFS_error_stat *to_array_1,
                           PFS_error_stat *to_array_2);
 
+void aggregate_all_memory_with_reassign(bool alive,
+                                        PFS_memory_safe_stat *from_array,
+                                        PFS_memory_shared_stat *to_array,
+                                        PFS_memory_shared_stat *global_array);
+void aggregate_all_memory_with_reassign(bool alive,
+                                        PFS_memory_safe_stat *from_array,
+                                        PFS_memory_shared_stat *to_array_1,
+                                        PFS_memory_shared_stat *to_array_2,
+                                        PFS_memory_shared_stat *global_array);
+
 void aggregate_all_memory(bool alive, PFS_memory_safe_stat *from_array,
                           PFS_memory_shared_stat *to_array);
 void aggregate_all_memory(bool alive, PFS_memory_shared_stat *from_array,
                           PFS_memory_shared_stat *to_array);
-void aggregate_all_memory(bool alive, PFS_memory_safe_stat *from_array,
-                          PFS_memory_shared_stat *to_array_1,
-                          PFS_memory_shared_stat *to_array_2);
 void aggregate_all_memory(bool alive, PFS_memory_shared_stat *from_array,
                           PFS_memory_shared_stat *to_array_1,
                           PFS_memory_shared_stat *to_array_2);

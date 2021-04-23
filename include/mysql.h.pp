@@ -23,6 +23,8 @@ enum enum_field_types
   MYSQL_TYPE_DATETIME2,
   MYSQL_TYPE_TIME2,
   MYSQL_TYPE_TYPED_ARRAY,
+  MYSQL_TYPE_INVALID = 243,
+  MYSQL_TYPE_BOOL = 244,
   MYSQL_TYPE_JSON = 245,
   MYSQL_TYPE_NEWDECIMAL = 246,
   MYSQL_TYPE_ENUM = 247,
@@ -188,7 +190,7 @@ bool my_net_init(struct NET *net, struct Vio * vio);
 void my_net_local_init(struct NET *net);
 void net_end(struct NET *net);
 void net_clear(struct NET *net, bool check_buffer);
-void net_claim_memory_ownership(struct NET *net);
+void net_claim_memory_ownership(struct NET *net, bool claim);
 bool net_realloc(struct NET *net, size_t length);
 bool net_flush(struct NET *net);
 bool my_net_write(struct NET *net, const unsigned char *packet, size_t len);
@@ -205,7 +207,7 @@ struct rand_struct {
   unsigned long seed1, seed2, max_value;
   double max_value_dbl;
 };
-#include <mysql/udf_registration_types.h>
+#include "mysql/udf_registration_types.h"
 enum Item_result {
   INVALID_RESULT = -1,
   STRING_RESULT = 0,
@@ -342,22 +344,24 @@ enum enum_mysql_timestamp_type {
   MYSQL_TIMESTAMP_ERROR = -1,
   MYSQL_TIMESTAMP_DATE = 0,
   MYSQL_TIMESTAMP_DATETIME = 1,
-  MYSQL_TIMESTAMP_TIME = 2
+  MYSQL_TIMESTAMP_TIME = 2,
+  MYSQL_TIMESTAMP_DATETIME_TZ = 3
 };
 typedef struct MYSQL_TIME {
   unsigned int year, month, day, hour, minute, second;
   unsigned long second_part;
   bool neg;
   enum enum_mysql_timestamp_type time_type;
+  int time_zone_displacement;
 } MYSQL_TIME;
 #include "errmsg.h"
 void init_client_errs(void);
 void finish_client_errs(void);
 extern const char *client_errors[];
 static inline const char *ER_CLIENT(int client_errno) {
-  if (client_errno >= 2000 && client_errno <= 2066)
+  if (client_errno >= 2000 && client_errno <= 2070)
     return client_errors[client_errno - 2000];
-  return client_errors[2000];
+  return client_errors[2000 - 2000];
 }
 extern unsigned int mysql_port;
 extern char *mysql_unix_port;
@@ -442,7 +446,8 @@ enum mysql_option {
   MYSQL_OPT_SSL_FIPS_MODE,
   MYSQL_OPT_TLS_CIPHERSUITES,
   MYSQL_OPT_COMPRESSION_ALGORITHMS,
-  MYSQL_OPT_ZSTD_COMPRESSION_LEVEL
+  MYSQL_OPT_ZSTD_COMPRESSION_LEVEL,
+  MYSQL_OPT_LOAD_DATA_LOCAL_DIR
 };
 struct st_mysql_options_extention;
 struct st_mysql_options {
@@ -756,6 +761,8 @@ enum enum_stmt_attr_type {
   STMT_ATTR_CURSOR_TYPE,
   STMT_ATTR_PREFETCH_ROWS
 };
+bool mysql_bind_param(MYSQL *mysql, unsigned n_params,
+                              MYSQL_BIND *binds, const char **names);
 MYSQL_STMT * mysql_stmt_init(MYSQL *mysql);
 int mysql_stmt_prepare(MYSQL_STMT *stmt, const char *query,
                                unsigned long length);
@@ -800,3 +807,8 @@ int mysql_next_result(MYSQL *mysql);
 int mysql_stmt_next_result(MYSQL_STMT *stmt);
 void mysql_close(MYSQL *sock);
 void mysql_reset_server_public_key(void);
+MYSQL * mysql_real_connect_dns_srv(MYSQL *mysql,
+                                          const char *dns_srv_name,
+                                          const char *user, const char *passwd,
+                                          const char *db,
+                                          unsigned long client_flag);

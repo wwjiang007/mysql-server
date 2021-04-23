@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -163,7 +163,7 @@ bool Rpl_info_factory::change_mi_repository(Master_info *mi, uint mi_option,
   Rpl_info_handler *handler_dest = nullptr;
   DBUG_TRACE;
 
-  DBUG_ASSERT(handler_src);
+  assert(handler_src);
 
   if (init_repositories(mi_table_data, mi_file_data, mi_option, nullptr,
                         &handler_dest, msg))
@@ -326,7 +326,7 @@ bool Rpl_info_factory::change_rli_repository(Relay_log_info *rli,
   Rpl_info_handler *handler_dest = nullptr;
   DBUG_TRACE;
 
-  DBUG_ASSERT(handler_src != nullptr);
+  assert(handler_src != nullptr);
 
   if (init_repositories(rli_table_data, rli_file_data, rli_option, nullptr,
                         &handler_dest, msg))
@@ -349,15 +349,16 @@ err:
    Delete all info from Worker info tables to render them useless in
    future MTS recovery, and indicate that in Coordinator info table.
 
-   @return false on success, true when a failure in deletion or writing
-           to Coordinator table fails.
+   @retval false on success
+   @retval true when a failure in deletion or writing to Coordinator table
+   fails.
 */
 bool Rpl_info_factory::reset_workers(Relay_log_info *rli) {
   bool error = true;
 
   DBUG_TRACE;
 
-  if (rli->recovery_parallel_workers == 0) return 0;
+  if (rli->recovery_parallel_workers == 0) return false;
 
   if (Rpl_info_file::do_reset_info(
           Slave_worker::get_number_worker_fields(), worker_file_data.pattern,
@@ -445,7 +446,7 @@ Slave_worker *Rpl_info_factory::create_worker(uint rli_option, uint worker_id,
 
   /* get_num_instances() requires channel_map lock */
   /*
-  DBUG_ASSERT(channel_map.get_num_instances() <= 1 ||
+  assert(channel_map.get_num_instances() <= 1 ||
               (rli_option == 1 && handler_dest->get_rpl_info_type() == 1));
   */
   if (decide_repository(worker, rli_option, &handler_src, &handler_dest, &msg))
@@ -488,7 +489,7 @@ err:
 
 static void build_worker_info_name(char *to, const char *path,
                                    const char *fname) {
-  DBUG_ASSERT(to);
+  assert(to);
   char *pos = to;
   if (path[0]) pos = my_stpcpy(pos, path);
   pos = my_stpcpy(pos, "worker-");
@@ -593,8 +594,8 @@ bool Rpl_info_factory::decide_repository(Rpl_info *info, uint option,
     goto err;
   }
 
-  DBUG_ASSERT((*handler_src) != nullptr && (*handler_dest) != nullptr &&
-              (*handler_src) != (*handler_dest));
+  assert((*handler_src) != nullptr && (*handler_dest) != nullptr &&
+         (*handler_src) != (*handler_dest));
 
   return_check_src = check_src_repository(info, option, handler_src);
   return_check_dst =
@@ -660,14 +661,14 @@ bool Rpl_info_factory::decide_repository(Rpl_info *info, uint option,
       }
     } else if (return_check_src == REPOSITORY_DOES_NOT_EXIST &&
                return_check_dst == REPOSITORY_EXISTS) {
-      DBUG_ASSERT(info->get_rpl_info_handler() == nullptr);
+      assert(info->get_rpl_info_handler() == nullptr);
       if ((*handler_dest)->do_init_info(info->get_internal_id())) {
         *msg = "Error reading repository";
         goto err;
       }
     } else {
-      DBUG_ASSERT(return_check_src == REPOSITORY_DOES_NOT_EXIST &&
-                  return_check_dst == REPOSITORY_DOES_NOT_EXIST);
+      assert(return_check_src == REPOSITORY_DOES_NOT_EXIST &&
+             return_check_dst == REPOSITORY_DOES_NOT_EXIST);
       info->inited = false;
     }
 
@@ -840,7 +841,7 @@ bool Rpl_info_factory::init_repositories(const struct_table_data &table_data,
 
   DBUG_TRACE;
 
-  DBUG_ASSERT(handler_dest != nullptr);
+  assert(handler_dest != nullptr);
   switch (rep_option) {
     case INFO_REPOSITORY_FILE:
       if (!(*handler_dest = new Rpl_info_file(
@@ -875,7 +876,7 @@ bool Rpl_info_factory::init_repositories(const struct_table_data &table_data,
       break;
 
     default:
-      DBUG_ASSERT(0);
+      assert(0);
   }
   error = false;
 
@@ -891,7 +892,7 @@ bool Rpl_info_factory::scan_repositories(uint *found_instances,
   bool error = false;
   uint file_instances = 0;
   uint table_instances = 0;
-  DBUG_ASSERT(found_rep_option != nullptr);
+  assert(found_rep_option != nullptr);
 
   DBUG_TRACE;
 
@@ -1054,16 +1055,14 @@ bool Rpl_info_factory::configure_channel_replication_filters(
         is handled in the upgrade script as usual.
 
 
-  @param[in]        mi_option        the user provided master_info_repository
+  @param[in]       mi_option         the user provided master_info_repository
   @param[in]       rli_option        the user provided relay_log_info_repository
   @param[in]       thread_mask       thread mask
   @param[in]       pchannel_map          the pointer to the multi source map
                                      (see, rpl_msr.h)
 
-  @return
-   @retval         false              success
-   @retval         true               fail
-
+  @retval          false             success
+  @retval          true              fail
 */
 
 bool Rpl_info_factory::create_slave_info_objects(
@@ -1151,9 +1150,10 @@ bool Rpl_info_factory::create_slave_info_objects(
     const char *cname = (*it).c_str();
     bool is_default_channel =
         !strcmp(cname, pchannel_map->get_default_channel());
-    channel_error = !(mi = create_mi_and_rli_objects(
-                          mi_option, rli_option, cname,
-                          (channel_list.size() == 1) ? 1 : 0, pchannel_map));
+    channel_error =
+        !(mi = create_mi_and_rli_objects(
+              mi_option, rli_option, cname,
+              (channel_list.size() == 1) ? true : false, pchannel_map));
     /*
       Read the channel configuration from the repository if the channel name
       was read from the repository.
@@ -1248,9 +1248,8 @@ Master_info *Rpl_info_factory::create_mi_and_rli_objects(
                                 Value filled with true if default channel
                                 existed previously. False if it is not.
 
-   @return
-     @retval        true             fail
-     @retval        false            success
+   @retval      true            fail
+   @retval      false           success
 
 */
 
@@ -1263,7 +1262,7 @@ bool Rpl_info_factory::load_channel_names_from_repository(
   *default_channel_existed_previously = false;
   switch (mi_repository) {
     case INFO_REPOSITORY_FILE:
-      DBUG_ASSERT(mi_instances == 1);
+      assert(mi_instances == 1);
       /* insert default channel */
       {
         std::string str(default_channel);
@@ -1280,7 +1279,7 @@ bool Rpl_info_factory::load_channel_names_from_repository(
       /* file and table instanaces are zero, nothing to be done*/
       break;
     default:
-      DBUG_ASSERT(0);
+      assert(0);
   }
 
   return false;

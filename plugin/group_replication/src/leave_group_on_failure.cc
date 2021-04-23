@@ -1,4 +1,4 @@
-/* Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2019, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -105,6 +105,7 @@ void leave_group_on_failure::leave(
   Replication_thread_api::rpl_channel_stop_all(
       CHANNEL_APPLIER_THREAD | CHANNEL_RECEIVER_THREAD,
       get_components_stop_timeout_var());
+  Replication_thread_api::rpl_binlog_dump_thread_kill();
 
   if (!actions[leave_group_on_failure::ALREADY_LEFT_GROUP]) {
     longlong errcode = 0;
@@ -156,7 +157,7 @@ void leave_group_on_failure::leave(
   DBUG_EXECUTE_IF(
       "group_replication_applier_thread_wait_kill_pending_transaction", {
         const char act[] = "now wait_for signal.gr_applier_early_failure";
-        DBUG_ASSERT(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+        assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
       });
 
   if (!already_locked) shared_plugin_stop_lock->release_write_lock();

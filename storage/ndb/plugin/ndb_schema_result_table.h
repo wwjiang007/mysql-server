@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2018, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -59,7 +59,7 @@ class Ndb_schema_result_table : public Ndb_util_table {
 
   std::string define_table_dd() const override;
 
-  bool pack_message(const char *message, char *buf);
+  void pack_message(const char *message, char *buf);
 
   std::string unpack_message(const std::string &packed_message);
 };

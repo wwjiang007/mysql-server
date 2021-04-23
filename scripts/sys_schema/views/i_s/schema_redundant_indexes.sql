@@ -1,4 +1,4 @@
--- Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2015, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -36,9 +36,9 @@
 -- *************************** 1. row ***************************
 --        Table: rkey
 -- Create Table: CREATE TABLE `rkey` (
---   `i` int(11) NOT NULL,
---   `j` int(11) DEFAULT NULL,
---   `k` int(11) DEFAULT NULL,
+--   `i` int NOT NULL,
+--   `j` int DEFAULT NULL,
+--   `k` int DEFAULT NULL,
 --   PRIMARY KEY (`i`),
 --   KEY `j` (`j`),
 --   KEY `j_2` (`j`,`k`)

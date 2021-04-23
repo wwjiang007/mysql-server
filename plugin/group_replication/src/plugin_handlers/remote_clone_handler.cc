@@ -1,4 +1,4 @@
-/* Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2019, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -19,9 +19,12 @@
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
-#include "plugin/group_replication/include/plugin_handlers/remote_clone_handler.h"
+#include <random>
+
 #include "plugin/group_replication/include/leave_group_on_failure.h"
 #include "plugin/group_replication/include/plugin.h"
+#include "plugin/group_replication/include/plugin_handlers/remote_clone_handler.h"
+#include "plugin/group_replication/include/plugin_variables/recovery_endpoints.h"
 
 [[noreturn]] void *Remote_clone_handler::launch_thread(void *arg) {
   Remote_clone_handler *thd = static_cast<Remote_clone_handler *>(arg);
@@ -147,23 +150,23 @@ Remote_clone_handler::check_clone_plugin_presence() {
 }
 
 int Remote_clone_handler::extract_donor_info(
-    std::tuple<uint, uint, uint, ulonglong> *donor_info) {
+    std::tuple<uint, uint, uint, bool> *donor_info) {
   int error = 0;
 
   uint valid_clone_donors = 0;
   uint valid_recovery_donors = 0;
   uint valid_recovering_donors = 0;
-  ulonglong number_gtids_missing = 0;
+  bool clone_activation_threshold_breach = false;
 
   std::vector<Group_member_info *> *all_members_info =
       group_member_mgr->get_all_members();
 
-  Sid_map local_sid_map(NULL);
-  Sid_map group_sid_map(NULL);
-  Gtid_set local_member_set(&local_sid_map, NULL);
-  Gtid_set group_set(&group_sid_map, NULL);
-  Sid_map purged_sid_map(NULL);
-  Gtid_set purged_set(&purged_sid_map, NULL);
+  Sid_map local_sid_map(nullptr);
+  Sid_map group_sid_map(nullptr);
+  Gtid_set local_member_set(&local_sid_map, nullptr);
+  Gtid_set group_set(&group_sid_map, nullptr);
+  Sid_map purged_sid_map(nullptr);
+  Gtid_set purged_set(&purged_sid_map, nullptr);
 
   if (local_member_set.add_gtid_text(
           local_member_info->get_gtid_executed().c_str()) != RETURN_STATUS_OK ||
@@ -211,9 +214,10 @@ int Remote_clone_handler::extract_donor_info(
     }
   }
 
-  // Calculate the number of missing gtids
+  // Check clone activation threshold breach
   group_set.remove_gtid_set(&local_member_set);
-  number_gtids_missing = group_set.get_gtid_number();
+  clone_activation_threshold_breach =
+      group_set.is_size_greater_than_or_equal(m_clone_activation_threshold);
 
   // Before deciding calculate also the number of valid recovery donors
   for (Group_member_info *member : *all_members_info) {
@@ -257,7 +261,7 @@ cleaning:
   std::get<0>(*donor_info) = valid_clone_donors;
   std::get<1>(*donor_info) = valid_recovery_donors;
   std::get<2>(*donor_info) = valid_recovering_donors;
-  std::get<3>(*donor_info) = number_gtids_missing;
+  std::get<3>(*donor_info) = clone_activation_threshold_breach;
 
   // clean the members
   for (Group_member_info *member : *all_members_info) {
@@ -272,7 +276,7 @@ Remote_clone_handler::enum_clone_check_result
 Remote_clone_handler::check_clone_preconditions() {
   Remote_clone_handler::enum_clone_check_result result = NO_RECOVERY_POSSIBLE;
 
-  std::tuple<uint, uint, uint, ulonglong> donor_info(0, 0, 0, 0);
+  std::tuple<uint, uint, uint, bool> donor_info(0, 0, 0, false);
   if (extract_donor_info(&donor_info)) {
     return CHECK_ERROR; /* purecov: inspected */
   }
@@ -280,10 +284,10 @@ Remote_clone_handler::check_clone_preconditions() {
   uint valid_clone_donors = std::get<0>(donor_info);
   uint valid_recovery_donors = std::get<1>(donor_info);
   uint valid_recovering_donors = std::get<2>(donor_info);
-  ulonglong number_gtids_missing = std::get<3>(donor_info);
+  bool clone_activation_threshold_breach = std::get<3>(donor_info);
   ulonglong threshold = m_clone_activation_threshold;
 
-  if (number_gtids_missing >= threshold && valid_clone_donors > 0) {
+  if (clone_activation_threshold_breach && valid_clone_donors > 0) {
     result = DO_CLONE;
     LogPluginErr(WARNING_LEVEL, ER_GRP_RPL_RECOVERY_STRAT_CLONE_THRESHOLD,
                  threshold);
@@ -344,7 +348,9 @@ void Remote_clone_handler::get_clone_donors(
   std::vector<Group_member_info *> *all_members_info =
       group_member_mgr->get_all_members();
   if (all_members_info->size() > 1) {
-    std::random_shuffle(all_members_info->begin(), all_members_info->end());
+    std::random_device rng;
+    std::mt19937 urng(rng());
+    std::shuffle(all_members_info->begin(), all_members_info->end(), urng);
   }
 
   for (Group_member_info *member : *all_members_info) {
@@ -402,6 +408,14 @@ int Remote_clone_handler::fallback_to_recovery_or_leave(
   // The stop process will leave the group
   if (get_server_shutdown_status()) return 0;
 
+  Replication_thread_api applier_channel("group_replication_applier");
+  if (!critical_error && !applier_channel.is_applier_thread_running() &&
+      applier_channel.start_threads(false, true, NULL, false)) {
+    abort_plugin_process(
+        "The plugin was not able to start the group_replication_applier "
+        "channel.");
+    return 1;
+  }
   // If it failed to (re)connect to the server or the set read only query
   if (!sql_command_interface->is_session_valid() ||
       sql_command_interface->set_super_read_only()) {
@@ -415,7 +429,7 @@ int Remote_clone_handler::fallback_to_recovery_or_leave(
    Since cloning can be time consuming valid members may have left
    or joined in the meanwhile.
   */
-  std::tuple<uint, uint, uint, ulonglong> donor_info(0, 0, 0, 0);
+  std::tuple<uint, uint, uint, bool> donor_info(0, 0, 0, false);
   if (extract_donor_info(&donor_info)) {
     critical_error = true; /* purecov: inspected */
   } else {
@@ -474,6 +488,20 @@ int Remote_clone_handler::run_clone_query(
     std::string &port, std::string &username, std::string &password,
     bool use_ssl) {
   int error = 0;
+
+#ifndef NDEBUG
+  DBUG_EXECUTE_IF("gr_run_clone_query_fail_once", {
+    const char act[] =
+        "now signal signal.run_clone_query_waiting wait_for "
+        "signal.run_clone_query_continue";
+    assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+
+    DBUG_SET("-d,gr_run_clone_query_fail_once");
+
+    return 1;
+  });
+#endif /* NDEBUG */
+
   mysql_mutex_lock(&m_clone_query_lock);
   m_clone_query_session_id =
       sql_command_interface->get_sql_service_interface()->get_session_id();
@@ -502,7 +530,7 @@ int Remote_clone_handler::kill_clone_query() {
   mysql_mutex_lock(&m_clone_query_lock);
 
   if (m_clone_query_status == CLONE_QUERY_EXECUTING) {
-    DBUG_ASSERT(m_clone_query_session_id != 0);
+    assert(m_clone_query_session_id != 0);
     Sql_service_command_interface *sql_command_interface =
         new Sql_service_command_interface();
     error = sql_command_interface->establish_session_connection(
@@ -615,16 +643,28 @@ end:
   DBUG_RETURN(ret);
 }
 
-#ifndef DBUG_OFF
+bool Remote_clone_handler::evaluate_error_code(int) {
+  // If the server dropped its data, async recovery will fail
+  if (is_server_data_dropped()) {
+    return true;
+  }
+  return false;
+}
+
+#ifndef NDEBUG
 void Remote_clone_handler::gr_clone_debug_point() {
   DBUG_EXECUTE_IF("gr_clone_process_before_execution", {
     const char act[] =
         "now signal signal.gr_clone_thd_paused wait_for "
         "signal.gr_clone_thd_continue";
-    DBUG_ASSERT(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+    assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+  });
+  DBUG_EXECUTE_IF("gr_clone_before_applier_stop", {
+    const char act[] = "now wait_for applier_stopped";
+    assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
   });
 }
-#endif /* DBUG_OFF */
+#endif /* NDEBUG */
 
 [[noreturn]] void Remote_clone_handler::clone_thread_handle() {
   int error = 0;
@@ -632,18 +672,21 @@ void Remote_clone_handler::gr_clone_debug_point() {
   std::string username;
   std::string password;
   Replication_thread_api recovery_channel("group_replication_recovery");
+  Replication_thread_api applier_channel("group_replication_applier");
   bool empty_donor_list = false;
   bool critical_error = false;
   int number_attempts = 0;
   int number_servers = 0;
 
   // Initialize the MySQL thread infrastructure.
-  m_clone_thd = new THD;
+  THD *thd = new THD;
+  m_clone_thd = thd;
   my_thread_init();
-  m_clone_thd->set_new_thread_id();
-  m_clone_thd->thread_stack = reinterpret_cast<const char *>(&m_clone_thd);
-  m_clone_thd->store_globals();
-  global_thd_manager_add_thd(m_clone_thd);
+  thd->set_new_thread_id();
+  thd->thread_stack = reinterpret_cast<const char *>(&thd);
+  thd->store_globals();
+  thd->security_context()->skip_grants();
+  global_thd_manager_add_thd(thd);
 
   Plugin_stage_monitor_handler stage_handler;
   if (stage_handler.initialize_stage_monitor()) {
@@ -721,6 +764,22 @@ void Remote_clone_handler::gr_clone_debug_point() {
       /* purecov: end */
     }
 
+#ifndef NDEBUG
+  gr_clone_debug_point();
+#endif /* NDEBUG */
+  // Ignore any channel stop error and confirm channel is stopped or not.
+  // Since we will clone next.
+  applier_channel.stop_threads(false, true);
+  if (applier_channel.is_applier_thread_running()) {
+    /* purecov: begin inspected */
+    LogPluginErr(ERROR_LEVEL, ER_GRP_RPL_CLONE_PROCESS_PREPARE_ERROR,
+                 "The plugin was not able to stop the "
+                 "group_replication_applier channel.");
+    error = 1;
+    goto thd_end;
+    /* purecov: end */
+  }
+
   number_attempts = 1;
   mysql_mutex_lock(&m_donor_list_lock);
   number_servers = m_suitable_donors.size();
@@ -729,9 +788,9 @@ void Remote_clone_handler::gr_clone_debug_point() {
   stage_handler.set_stage(info_GR_STAGE_clone_execute.m_key, __FILE__, __LINE__,
                           number_servers, number_attempts);
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   gr_clone_debug_point();
-#endif /* DBUG_OFF */
+#endif /* NDEBUG */
 
   while (!empty_donor_list && !m_being_terminated) {
     stage_handler.set_completed_work(number_attempts);
@@ -739,13 +798,15 @@ void Remote_clone_handler::gr_clone_debug_point() {
 
     std::string hostname("");
     std::string port("");
+    std::vector<std::pair<std::string, uint>> endpoints;
 
     mysql_mutex_lock(&m_donor_list_lock);
     empty_donor_list = m_suitable_donors.empty();
     if (!empty_donor_list) {
       Group_member_info *member = m_suitable_donors.front();
-      hostname.assign(member->get_hostname());
-      port.assign(std::to_string(member->get_port()));
+      Donor_recovery_endpoints donor_endpoints;
+      endpoints = donor_endpoints.get_endpoints(member);
+
       // define the current donor
       delete m_current_donor_address;
       m_current_donor_address =
@@ -758,45 +819,56 @@ void Remote_clone_handler::gr_clone_debug_point() {
     }
     mysql_mutex_unlock(&m_donor_list_lock);
 
-    // No valid donor remains in the list
-    if (hostname.empty()) continue;
-
-    /* Update the allowed donor list */
-    if ((error = update_donor_list(sql_command_interface, hostname, port))) {
-      break; /* purecov: inspected */
+    // No valid donor in the list
+    if (endpoints.size() == 0) {
+      error = 1;
+      continue;
     }
 
-    if (m_being_terminated) goto thd_end;
+    for (auto endpoint : endpoints) {
+      hostname.assign(endpoint.first);
+      port.assign(std::to_string(endpoint.second));
 
-    terminate_wait_on_start_process(true);
-
-    error = run_clone_query(sql_command_interface, hostname, port, username,
-                            password, use_ssl);
-
-    switch (error) {
-      case ER_RESTART_SERVER_FAILED:
-        critical_error = true;
-        goto thd_end;
-    }
-
-    if (error && !m_being_terminated) {
-      if (evaluate_server_connection(sql_command_interface)) {
-        /* purecov: begin inspected */
-        // This is a bad sign, might as well quit
-        critical_error = true;
-        goto thd_end;
-        /* purecov: end */
+      /* Update the allowed donor list */
+      if ((error = update_donor_list(sql_command_interface, hostname, port))) {
+        continue; /* purecov: inspected */
       }
 
-      /*
-       If we reach this point and we are now alone it means no alternatives
-       remain for recovery. A fallback to distributed recovery would be
-       interpreted as a solo member recovery.
-      */
-      if (group_member_mgr->get_number_of_members() == 1) {
-        critical_error = true;
-        goto thd_end;
+      if (m_being_terminated) goto thd_end;
+
+      terminate_wait_on_start_process(true);
+
+      error = run_clone_query(sql_command_interface, hostname, port, username,
+                              password, use_ssl);
+
+      // Even on critical errors we continue as another clone can fix the issue
+      if (!critical_error) critical_error = evaluate_error_code(error);
+
+      // On ER_RESTART_SERVER_FAILED it makes no sense to retry
+      if (error == ER_RESTART_SERVER_FAILED) goto thd_end;
+
+      if (error && !m_being_terminated) {
+        if (evaluate_server_connection(sql_command_interface)) {
+          /* purecov: begin inspected */
+          // This is a bad sign, might as well quit
+          critical_error = true;
+          goto thd_end;
+          /* purecov: end */
+        }
+
+        /*
+          If we reach this point and we are now alone it means no alternatives
+          remain for recovery. A fallback to distributed recovery would be
+          interpreted as a solo member recovery.
+          */
+        if (group_member_mgr->get_number_of_members() == 1) {
+          critical_error = true;
+          goto thd_end;
+        }
       }
+
+      // try till there is a recovery endpoint that succeeds
+      if (!error) break;
     }
 
     // try till there is a clone command that succeeds
@@ -819,10 +891,11 @@ thd_end:
   stage_handler.terminate_stage_monitor();
 
   mysql_mutex_lock(&m_run_lock);
-  m_clone_thd->release_resources();
-  global_thd_manager_remove_thd(m_clone_thd);
-  delete m_clone_thd;
+  thd->release_resources();
+  global_thd_manager_remove_thd(thd);
+  delete thd;
   m_clone_thd = nullptr;
+  thd = nullptr;
   m_clone_process_thd_state.set_terminated();
   mysql_cond_broadcast(&m_run_cond);
   mysql_mutex_unlock(&m_run_lock);

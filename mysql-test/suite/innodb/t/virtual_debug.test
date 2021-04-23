@@ -46,6 +46,7 @@ SET DEBUG_SYNC = 'now SIGNAL go_ahead';
 connection default;
 reap;
 
+--sorted_result
 SELECT c FROM t;
 SHOW CREATE TABLE t;
 SELECT * FROM t;
@@ -64,6 +65,7 @@ SET DEBUG_SYNC = 'now SIGNAL go_ahead';
 connection default;
 reap;
 
+--sorted_result
 SELECT c FROM t;
 
 SET DEBUG_SYNC = 'innodb_inplace_alter_table_enter SIGNAL start_create WAIT_FOR go_ahead';
@@ -81,6 +83,7 @@ SET DEBUG_SYNC = 'now SIGNAL go_ahead';
 connection default;
 reap;
 
+--sorted_result
 SELECT c FROM t;
 
 disconnect con1;
@@ -114,6 +117,7 @@ SET SESSION debug="-d,create_index_fail";
 
 SHOW CREATE TABLE t;
 
+--sorted_result
 SELECT c FROM t;
 
 DROP TABLE t;
@@ -147,6 +151,7 @@ SET DEBUG_SYNC = 'now SIGNAL go_ahead';
 connection default;
 --echo /* connection default */ optimize table t;
 reap;
+--sorted_result
 SELECT c FROM t;
 SHOW CREATE TABLE t;
 SELECT * FROM t;
@@ -176,6 +181,7 @@ connection default;
 --echo /* connection default */ optimize table t;
 reap;
 
+--sorted_result
 SELECT c FROM t;
 
 disconnect con1;
@@ -243,9 +249,11 @@ select * from ibstd_14;
 
 # This will use the newly added "kn3" index, to check materialized vbcol
 # after log reapply
+--sorted_result
 select d,c,vbcol,b from  ibstd_14;
 
 # check the value is inserted into the index
+--sorted_result
 select vbcol from ibstd_14;
 
 drop table ibstd_14;
@@ -662,7 +670,7 @@ disconnect conn2;
 
 connection default;
 
-set session debug = '-d, row_merge_drop_indexes_force_table_count';
+set session debug = '-d, force_virtual_col_build_fail';
 
 INSERT INTO t1 VALUES(1);
 
@@ -670,5 +678,22 @@ CHECK TABLE t1;
 
 DROP TABLE t1;
 
-
 --source include/wait_until_count_sessions.inc
+
+--echo #
+--echo # Bug 31279528 - CRASH IN MYSQL SERVER, ASSERTION FAILURE: DICT0DICT.CC
+--echo #
+CREATE TABLE t1 (c1 INT);
+
+# Create a secondary index which will cause virtual columns to be added into table
+CREATE INDEX idx ON t1 ( ( c1 = 127 ) , ( c1 + c1 ) , c1 , ( c1 + - -1 ) , (c1 > 26 ) ) ;
+
+SHOW WARNINGS;
+
+SHOW CREATE TABLE t1;
+
+SET SESSION debug= '+d,skip_dd_table_access_check';
+SELECT ID INTO @tid FROM mysql.tables WHERE NAME='t1';
+SELECT NAME, ORDINAL_POSITION, TYPE, HIDDEN, GENERATION_EXPRESSION_UTF8 FROM mysql.columns WHERE TABLE_ID=@tid ORDER BY ORDINAL_POSITION;
+
+DROP TABLE t1;

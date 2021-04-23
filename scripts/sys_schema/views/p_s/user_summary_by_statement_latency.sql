@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -45,9 +45,9 @@ VIEW user_summary_by_statement_latency (
 ) AS
 SELECT IF(user IS NULL, 'background', user) AS user,
        SUM(count_star) AS total,
-       sys.format_time(SUM(sum_timer_wait)) AS total_latency,
-       sys.format_time(SUM(max_timer_wait)) AS max_latency,
-       sys.format_time(SUM(sum_lock_time)) AS lock_latency,
+       format_pico_time(SUM(sum_timer_wait)) AS total_latency,
+       format_pico_time(SUM(max_timer_wait)) AS max_latency,
+       format_pico_time(SUM(sum_lock_time)) AS lock_latency,
        SUM(sum_rows_sent) AS rows_sent,
        SUM(sum_rows_examined) AS rows_examined,
        SUM(sum_rows_affected) AS rows_affected,

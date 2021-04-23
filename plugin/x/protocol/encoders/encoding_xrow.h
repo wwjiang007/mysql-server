@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2021, Oracle and/or its affiliates.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2.0,
@@ -25,7 +25,13 @@
 #ifndef PLUGIN_X_PROTOCOL_ENCODERS_ENCODING_XROW_H_
 #define PLUGIN_X_PROTOCOL_ENCODERS_ENCODING_XROW_H_
 
+#include "my_compiler.h"
+MY_COMPILER_DIAGNOSTIC_PUSH()
+// Suppress warning C4251 'type' : class 'type1' needs to have dll-interface
+// to be used by clients of class 'type2'
+MY_COMPILER_MSVC_DIAGNOSTIC_IGNORE(4251)
 #include <google/protobuf/wire_format_lite.h>
+MY_COMPILER_DIAGNOSTIC_POP()
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -88,7 +94,7 @@ class XRow_encoder_base {
   }
 
   void field_bit(const char *const value, size_t length) {
-    DBUG_ASSERT(length <= 8);
+    assert(length <= 8);
     ++m_fields;
 
     uint64_t binary_value = 0;
@@ -136,7 +142,7 @@ class XRow_encoder_base {
 
     m_encoder->template ensure_buffer_size<20>();
     auto field_begin =
-        m_encoder->template begin_delimited_field<tags::Row::field>();
+        m_encoder->template begin_delimited_field<tags::Row::field, 3>();
     for (size_t i = 0; i < set_vals.size(); ++i) {
       m_encoder->template ensure_buffer_size<10>();
       m_encoder->encode_var_uint64(set_vals[i].length());
@@ -268,7 +274,7 @@ class XRow_encoder_base {
     std::string str_buf;
     int str_len = 200;
     str_buf.resize(str_len);
-    decimal2string(value, &(str_buf)[0], &str_len, 0, 0, 0);
+    decimal2string(value, &(str_buf)[0], &str_len);
     str_buf.resize(str_len);
 
     xcl::Decimal dec(str_buf);

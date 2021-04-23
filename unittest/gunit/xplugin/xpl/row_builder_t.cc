@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2021, Oracle and/or its affiliates.
 
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License, version 2.0,
@@ -28,15 +28,15 @@
 #include <set>
 #include <string>
 
-#include "decimal.h"
+#include "decimal.h"  // NOLINT(build/include_subdir)
 
 #include "plugin/x/client/mysqlxclient/xdatetime.h"
 #include "plugin/x/client/mysqlxclient/xdecimal.h"
 #include "plugin/x/client/mysqlxclient/xrow.h"
 #include "plugin/x/client/xrow_impl.h"
-#include "plugin/x/ngs/include/ngs/protocol/page_pool.h"
-#include "plugin/x/ngs/include/ngs/protocol/protocol_protobuf.h"
 #include "plugin/x/protocol/encoders/encoding_xrow.h"
+#include "plugin/x/src/ngs/protocol/page_pool.h"
+#include "plugin/x/src/ngs/protocol/protocol_protobuf.h"
 #include "unittest/gunit/xplugin/xpl/protobuf_message.h"
 
 namespace protocol {
@@ -495,11 +495,11 @@ TEST_F(Row_builder_testsuite, decimal_field) {
   m_row.begin_row();
 
   decimal_digit_t arr1[] = {1, 0};
-  decimal_t dec1 = {1, 1, 2, 1, arr1};
+  decimal_t dec1 = {1, 1, 2, true, arr1};
   m_row.field_decimal(&dec1);
 
   decimal_digit_t arr2[] = {1, 0};
-  decimal_t dec2 = {1, 1, 2, 0, arr2};
+  decimal_t dec2 = {1, 1, 2, false, arr2};
   m_row.field_decimal(&dec2);
 
   m_row.end_row();

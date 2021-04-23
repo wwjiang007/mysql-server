@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -46,9 +46,9 @@ SELECT IF(id IS NULL,
              CONCAT(user, '@', host, ':', id)
           ) thread, 
        sys.format_path(object_name) file, 
-       sys.format_time(timer_wait) AS latency, 
+       format_pico_time(timer_wait) AS latency, 
        operation, 
-       sys.format_bytes(number_of_bytes) AS requested
+       format_bytes(number_of_bytes) AS requested
   FROM performance_schema.events_waits_history_long 
   JOIN performance_schema.threads USING (thread_id)
   LEFT JOIN information_schema.processlist ON processlist_id = id

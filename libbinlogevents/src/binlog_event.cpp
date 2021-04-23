@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2011, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -135,7 +135,7 @@ bool Log_event_footer::event_checksum_test(unsigned char *event_buf,
     uint32_t computed;
 
     if (event_buf[EVENT_TYPE_OFFSET] == FORMAT_DESCRIPTION_EVENT) {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
       unsigned char fd_alg = event_buf[event_len - BINLOG_CHECKSUM_LEN -
                                        BINLOG_CHECKSUM_ALG_DESC_LEN];
 #endif
@@ -151,7 +151,7 @@ bool Log_event_footer::event_checksum_test(unsigned char *event_buf,
            The only algorithm currently is CRC32. Zero indicates
            the binlog file is checksum-free *except* the FD-event.
         */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
       BAPI_ASSERT(fd_alg == BINLOG_CHECKSUM_ALG_CRC32 || fd_alg == 0);
 #endif
       BAPI_ASSERT(alg == BINLOG_CHECKSUM_ALG_CRC32);
@@ -178,7 +178,7 @@ bool Log_event_footer::event_checksum_test(unsigned char *event_buf,
 
     res = !(computed == incoming);
   }
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (binary_log_debug::debug_checksum_test) return true;
 #endif
   return res;
@@ -283,7 +283,7 @@ void Binary_log_event::print_long_info(std::ostream &) {}
   Please note this is different from the print_event_info methods
   used by mysqlbinlog.cc.
 
-  @param std output stream to which the event data is appended.
+  @param info std output stream to which the event data is appended.
 */
 void Stop_event::print_long_info(std::ostream &info) {
   info << "Timestamp: " << header()->when.tv_sec;

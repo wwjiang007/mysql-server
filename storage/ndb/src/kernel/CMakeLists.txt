@@ -1,4 +1,4 @@
-# Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2008, 2021, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License, version 2.0,
@@ -91,6 +91,7 @@ MYSQL_ADD_EXECUTABLE(ndbd
 
   DESTINATION ${INSTALL_SBINDIR}
   COMPONENT ClusterDataNode
+  ENABLE_EXPORTS
   LINK_LIBRARIES ${NDBD_LIBS} ndbsched ${LIBDL}
   )
 
@@ -104,6 +105,7 @@ IF(WITH_NDBMTD)
 
     DESTINATION ${INSTALL_SBINDIR}
     COMPONENT ClusterDataNode
+    ENABLE_EXPORTS
     LINK_LIBRARIES ${NDBD_LIBS} ndbsched_mt ${LIBDL}
     )
 ENDIF()

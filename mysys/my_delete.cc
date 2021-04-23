@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -49,15 +49,12 @@ int my_delete(const char *name, myf MyFlags) {
 
   if ((err = unlink(name)) == -1) {
     set_my_errno(errno);
-    if (MyFlags & (MY_FAE + MY_WME)) {
-      char errbuf[MYSYS_STRERROR_SIZE];
-      my_error(EE_DELETE, MYF(0), name, errno,
-               my_strerror(errbuf, sizeof(errbuf), errno));
+    if (MyFlags & (MY_FAE | MY_WME)) {
+      MyOsError(my_errno(), EE_DELETE, MYF(0), name);
     }
-  } else if ((MyFlags & MY_SYNC_DIR) && my_sync_dir_by_file(name, MyFlags))
-    err = -1;
+  }
   return err;
-} /* my_delete */
+}
 
 #if defined(_WIN32)
 /**
@@ -131,9 +128,7 @@ int nt_share_delete(const char *name, myf MyFlags) {
     set_my_errno(errno);
 
   if (MyFlags & (MY_FAE + MY_WME)) {
-    char errbuf[MYSYS_STRERROR_SIZE];
-    my_error(EE_DELETE, MYF(0), name, my_errno(),
-             my_strerror(errbuf, sizeof(errbuf), my_errno()));
+    MyOsError(my_errno(), EE_DELETE, MYF(0), name);
   }
   return -1;
 }

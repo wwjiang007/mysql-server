@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2013, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -27,6 +27,7 @@
   @file include/prealloced_array.h
 */
 
+#include <assert.h>
 #include <stddef.h>
 #include <algorithm>
 #include <new>
@@ -34,7 +35,7 @@
 #include <utility>
 
 #include "my_compiler.h"
-#include "my_dbug.h"
+
 #include "my_inttypes.h"
 #include "my_sys.h"
 #include "mysql/psi/psi_memory.h"
@@ -139,6 +140,14 @@ class Prealloced_array {
       this->push_back(*p);
   }
 
+  Prealloced_array(Prealloced_array &&that)
+      : m_size(0),
+        m_capacity(Prealloc),
+        m_array_ptr(cast_rawbuff()),
+        m_psi_key(that.m_psi_key) {
+    *this = std::move(that);
+  }
+
   /**
     Range constructor.
 
@@ -156,6 +165,9 @@ class Prealloced_array {
     for (; first != last; ++first) push_back(*first);
   }
 
+  Prealloced_array(std::initializer_list<Element_type> elems)
+      : Prealloced_array(PSI_NOT_INSTRUMENTED, elems.begin(), elems.end()) {}
+
   /**
     Copies all the elements from 'that' into this container.
     Any objects in this container are destroyed first.
@@ -165,6 +177,27 @@ class Prealloced_array {
     if (this->reserve(that.capacity())) return *this;
     for (const Element_type *p = that.begin(); p != that.end(); ++p)
       this->push_back(*p);
+    return *this;
+  }
+
+  Prealloced_array &operator=(Prealloced_array &&that) {
+    this->clear();
+    if (that.m_array_ptr != that.cast_rawbuff()) {
+      if (m_array_ptr != cast_rawbuff()) my_free(m_array_ptr);
+      // The array is on the heap, so we can just grab it.
+      m_array_ptr = that.m_array_ptr;
+      m_capacity = that.m_capacity;
+      m_size = that.m_size;
+      that.m_size = 0;
+      that.m_array_ptr = that.cast_rawbuff();
+      that.m_capacity = Prealloc;
+    } else {
+      // Move over each element.
+      if (this->reserve(that.capacity())) return *this;
+      for (Element_type *p = that.begin(); p != that.end(); ++p)
+        this->push_back(std::move(*p));
+      that.clear();
+    }
     return *this;
   }
 
@@ -185,12 +218,12 @@ class Prealloced_array {
   size_t size() const { return m_size; }
 
   Element_type &at(size_t n) {
-    DBUG_ASSERT(n < size());
+    assert(n < size());
     return m_array_ptr[n];
   }
 
   const Element_type &at(size_t n) const {
-    DBUG_ASSERT(n < size());
+    assert(n < size());
     return m_array_ptr[n];
   }
 
@@ -299,7 +332,7 @@ class Prealloced_array {
     container size by one. This destroys the removed element.
    */
   void pop_back() {
-    DBUG_ASSERT(!empty());
+    assert(!empty());
     if (!Has_trivial_destructor) back().~Element_type();
     m_size -= 1;
   }
@@ -420,7 +453,7 @@ class Prealloced_array {
     move-assignable.
   */
   iterator erase(const_iterator position) {
-    DBUG_ASSERT(position != end());
+    assert(position != end());
     return erase(position - begin());
   }
 
@@ -428,7 +461,7 @@ class Prealloced_array {
     Removes a single element from the array.
   */
   iterator erase(size_t ix) {
-    DBUG_ASSERT(ix < size());
+    assert(ix < size());
     iterator pos = begin() + ix;
     if (pos + 1 != end()) std::move(pos + 1, end(), pos);
     pop_back();

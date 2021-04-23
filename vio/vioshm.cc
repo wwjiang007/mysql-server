@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -23,6 +23,7 @@
 #include "vio_priv.h"
 
 #include "my_byteorder.h"
+#include "my_dbug.h"
 #include "my_shm_defaults.h"
 
 size_t vio_read_shared_memory(Vio *vio, uchar *buf, size_t size) {

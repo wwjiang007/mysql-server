@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -61,7 +61,7 @@ void *my_mmap(void *addr, size_t len, int prot, int flags, File fd,
               my_off_t offset) {
   HANDLE hFileMap;
   LPVOID ptr;
-  HANDLE hFile = (HANDLE)my_get_osfhandle(fd);
+  HANDLE hFile = my_get_osfhandle(fd);
   DBUG_TRACE;
   DBUG_PRINT("mysys", ("map fd: %d", fd));
 

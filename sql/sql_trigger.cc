@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2004, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -57,6 +57,7 @@
 #include "sql/sql_backup_lock.h"  // acquire_shared_backup_lock
 #include "sql/sql_base.h"         // find_temporary_table()
 #include "sql/sql_class.h"
+#include "sql/sql_db.h"  // check_schema_readonly
 #include "sql/sql_error.h"
 #include "sql/sql_handler.h"  // mysql_ha_rm_tables()
 #include "sql/sql_lex.h"
@@ -135,41 +136,10 @@ bool get_table_for_trigger(THD *thd, const LEX_CSTRING &db_name,
 
   if (*table == nullptr) return true;
 
-  (*table)->select_lex = lex->current_select();
-  (*table)->cacheable_table = 1;
+  (*table)->query_block = lex->current_query_block();
+  (*table)->cacheable_table = true;
 
   return false;
-}
-
-// Only used by NDB.
-bool drop_all_triggers(THD *thd, const char *db_name, const char *table_name) {
-  // Check if there is at least one trigger for the given table.
-  dd::cache::Dictionary_client::Auto_releaser releaser(thd->dd_client());
-
-  dd::Table *table = nullptr;
-  if (thd->dd_client()->acquire_for_modification(db_name, table_name, &table)) {
-    // Error is reported by the dictionary subsystem.
-    return true;
-  }
-
-  if (table == nullptr || !table->has_trigger()) return false;
-
-#ifdef HAVE_PSI_SP_INTERFACE
-  // Not very "transactional", but this is the same order it happens
-  // during drop table.
-  remove_all_triggers_from_perfschema(db_name, *table);
-#endif
-
-  for (const dd::Trigger *trigger : *table->triggers())
-    table->drop_trigger(trigger);
-
-  if (thd->dd_client()->update(table)) {
-    trans_rollback_stmt(thd);
-    trans_rollback(thd);
-    return true;
-  }
-
-  return trans_commit_stmt(thd) || trans_commit(thd);
 }
 
 #ifdef HAVE_PSI_SP_INTERFACE
@@ -201,56 +171,22 @@ bool check_table_triggers_are_not_in_the_same_schema(const char *db_name,
   return false;
 }
 
-// Only used by NDB
-bool reload_triggers_for_table(THD *thd, const char *db_name,
-                               const char *table_alias MY_ATTRIBUTE((unused)),
-                               const char *table_name MY_ATTRIBUTE((unused)),
-                               const char *new_db_name,
-                               const char *new_table_name) {
-  // Check if there is at least one trigger for the given table.
-  dd::cache::Dictionary_client::Auto_releaser releaser(thd->dd_client());
+bool acquire_exclusive_mdl_for_trigger(THD *thd, const char *db,
+                                       const char *trg_name) {
+  DBUG_TRACE;
 
-  const dd::Table *table = nullptr;
+  // Protect CREATE/DROP TRIGGER statement against concurrent global read lock.
+  if (thd->global_read_lock.can_acquire_protection()) return true;
 
-  if (thd->dd_client()->acquire(new_db_name, new_table_name, &table)) {
-    // Error is reported by the dictionary subsystem.
-    return true;
-  }
-
-  if (table == nullptr || !table->has_trigger()) return false;
-
-  /*
-    Since triggers should be in the same schema as their subject tables
-    moving table with them between two schemas raises too many questions.
-    (E.g. what should happen if in new schema we already have trigger
-     with same name ?).
-  */
-
-  if (my_strcasecmp(table_alias_charset, db_name, new_db_name)) {
-    my_error(ER_TRG_IN_WRONG_SCHEMA, MYF(0));
-    return true;
-  }
-
-  /*
-    This method interfaces the mysql server code protected by
-    an exclusive metadata lock.
-  */
-  DBUG_ASSERT(thd->mdl_context.owns_equal_or_stronger_lock(
-      MDL_key::TABLE, db_name, table_name, MDL_EXCLUSIVE));
-
-  DBUG_ASSERT(my_strcasecmp(table_alias_charset, table_alias, new_table_name));
-
-  return Table_trigger_dispatcher::check_n_load(thd, *table, new_db_name,
-                                                new_table_name);
+  return acquire_mdl_for_trigger(thd, db, trg_name, MDL_EXCLUSIVE);
 }
 
 bool acquire_mdl_for_trigger(THD *thd, const char *db, const char *trg_name,
                              enum_mdl_type trigger_name_mdl_type) {
-  DBUG_ASSERT(trg_name != nullptr);
-  DBUG_ASSERT(trigger_name_mdl_type == MDL_EXCLUSIVE ||
-              trigger_name_mdl_type == MDL_SHARED_HIGH_PRIO);
-
-  if (thd->global_read_lock.can_acquire_protection()) return true;
+  DBUG_TRACE;
+  assert(trg_name != nullptr);
+  assert(trigger_name_mdl_type == MDL_EXCLUSIVE ||
+         trigger_name_mdl_type == MDL_SHARED_HIGH_PRIO);
 
   MDL_key mdl_key;
   dd::Trigger::create_mdl_key(dd::String_type(db), dd::String_type(trg_name),
@@ -310,7 +246,7 @@ bool Sql_cmd_ddl_trigger_common::check_trg_priv_on_subj_table(
 TABLE *Sql_cmd_ddl_trigger_common::open_and_lock_subj_table(
     THD *thd, TABLE_LIST *tables, MDL_ticket **mdl_ticket) const {
   /* We should have only one table in table list. */
-  DBUG_ASSERT(tables->next_global == nullptr);
+  assert(tables->next_global == nullptr);
 
   /* We also don't allow creation of triggers on views. */
   tables->required_type = dd::enum_table_type::BASE_TABLE;
@@ -552,6 +488,8 @@ bool Sql_cmd_drop_trigger::execute(THD *thd) {
 
   if (schema_mdl_locker.ensure_locked(thd->lex->spname->m_db.str)) return true;
 
+  if (check_schema_readonly(thd, thd->lex->spname->m_db.str)) return true;
+
   if (acquire_exclusive_mdl_for_trigger(thd, thd->lex->spname->m_db.str,
                                         thd->lex->spname->m_name.str))
     return true;
@@ -567,7 +505,7 @@ bool Sql_cmd_drop_trigger::execute(THD *thd) {
     return true;
 
   if (tables == nullptr) {
-    DBUG_ASSERT(thd->lex->drop_if_exists == true);
+    assert(thd->lex->drop_if_exists == true);
     /*
       Since the trigger does not exist, there is no associated table,
       and therefore :
@@ -601,7 +539,7 @@ bool Sql_cmd_drop_trigger::execute(THD *thd) {
     restore_original_mdl_state(thd, mdl_ticket);
     return true;
   }
-  DBUG_ASSERT(dd_table != nullptr);
+  assert(dd_table != nullptr);
 
   const dd::Trigger *dd_trig_obj =
       dd_table->get_trigger(thd->lex->spname->m_name.str);

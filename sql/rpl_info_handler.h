@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -49,8 +49,9 @@ enum enum_info_repository {
 */
 enum enum_return_check {
   REPOSITORY_DOES_NOT_EXIST = 1,
-  REPOSITORY_EXISTS,
-  ERROR_CHECKING_REPOSITORY
+  REPOSITORY_EXISTS = 2,
+  ERROR_CHECKING_REPOSITORY = 4,
+  REPOSITORY_CLEARED = 10
 };
 
 class Rpl_info_handler {
@@ -440,7 +441,7 @@ class Rpl_info_handler {
 
 bool operator!(Rpl_info_handler::enum_field_get_status status);
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 extern ulong w_rr;
 extern uint mts_debug_concurrent_access;
 #endif

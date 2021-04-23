@@ -1,7 +1,7 @@
 #ifndef SQL_COMPOSITE_ITERATORS_INCLUDED
 #define SQL_COMPOSITE_ITERATORS_INCLUDED
 
-/* Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2018, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -37,7 +37,9 @@
   SortingIterator is also a composite iterator, but is defined in its own file.
  */
 
+#include <assert.h>
 #include <stdio.h>
+
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -45,10 +47,12 @@
 
 #include "my_alloc.h"
 #include "my_base.h"
-#include "my_dbug.h"
+
 #include "my_table_map.h"
 #include "prealloced_array.h"
+#include "sql/hash_join_buffer.h"
 #include "sql/item.h"
+#include "sql/join_type.h"
 #include "sql/row_iterator.h"
 #include "sql/table.h"
 
@@ -56,7 +60,7 @@ class FollowTailIterator;
 template <class T>
 class List;
 class JOIN;
-class SELECT_LEX;
+class Query_block;
 class SJ_TMP_TABLE;
 class THD;
 class Temp_table_param;
@@ -87,12 +91,6 @@ class FilterIterator final : public RowIterator {
   }
   void UnlockRow() override { m_source->UnlockRow(); }
 
-  std::vector<Child> children() const override;
-
-  std::vector<std::string> DebugString() const override {
-    return {"Filter: " + ItemToString(m_condition)};
-  }
-
  private:
   unique_ptr_destroy_only<RowIterator> m_source;
   Item *m_condition;
@@ -113,20 +111,23 @@ class LimitOffsetIterator final : public RowIterator {
     @param count_all_rows If true, the query will run to completion to get
       more accurate numbers for skipped_rows, so you will not get any
       performance benefits of early end.
+    @param reject_multiple_rows True if a derived table transformed from a
+      scalar subquery needs a run-time cardinality check
     @param skipped_rows If not nullptr, is incremented for each row skipped by
       offset or limit.
    */
   LimitOffsetIterator(THD *thd, unique_ptr_destroy_only<RowIterator> source,
                       ha_rows limit, ha_rows offset, bool count_all_rows,
-                      ha_rows *skipped_rows)
+                      bool reject_multiple_rows, ha_rows *skipped_rows)
       : RowIterator(thd),
         m_source(move(source)),
         m_limit(limit),
         m_offset(offset),
         m_count_all_rows(count_all_rows),
+        m_reject_multiple_rows(reject_multiple_rows),
         m_skipped_rows(skipped_rows) {
     if (count_all_rows) {
-      DBUG_ASSERT(m_skipped_rows != nullptr);
+      assert(m_skipped_rows != nullptr);
     }
   }
 
@@ -144,27 +145,6 @@ class LimitOffsetIterator final : public RowIterator {
   }
   void UnlockRow() override { m_source->UnlockRow(); }
 
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_source.get(), ""}};
-  }
-
-  std::vector<std::string> DebugString() const override {
-    char buf[256];
-    if (m_offset == 0) {
-      snprintf(buf, sizeof(buf), "Limit: %llu row(s)", m_limit);
-    } else if (m_limit == HA_POS_ERROR) {
-      snprintf(buf, sizeof(buf), "Offset: %llu row(s)", m_offset);
-    } else {
-      snprintf(buf, sizeof(buf), "Limit/Offset: %llu/%llu row(s)",
-               m_limit - m_offset, m_offset);
-    }
-    if (m_count_all_rows) {
-      return {std::string(buf) + " (no early end due to SQL_CALC_FOUND_ROWS)"};
-    } else {
-      return {std::string(buf)};
-    }
-  }
-
  private:
   unique_ptr_destroy_only<RowIterator> m_source;
 
@@ -180,6 +160,7 @@ class LimitOffsetIterator final : public RowIterator {
 
   const ha_rows m_limit, m_offset;
   const bool m_count_all_rows;
+  const bool m_reject_multiple_rows;
   ha_rows *m_skipped_rows;
 };
 
@@ -191,35 +172,36 @@ class LimitOffsetIterator final : public RowIterator {
   already gives us the rows in a group-compatible order, or because there is no
   grouping.)
 
-  AggregateIterator is special in that it's one of the very few row iterators
-  that actually change the shape of the rows; some columns are dropped as part
-  of aggregation, others (the aggregates) are added. For this reason (and also
-  because we need to make copies of the group expressions -- see Read()), it
-  conceptually always outputs to a temporary table. If we _are_ outputting to a
-  temporary table, that's not a problem -- we take over responsibility for
-  copying the group expressions from MaterializeIterator, which would otherwise
-  do it.
+  AggregateIterator needs to be able to save and restore rows; it doesn't know
+  when a group ends until it's seen the first row that is part of the _next_
+  group. When that happens, it needs to tuck away that next row, and then
+  restore the previous row so that the output row gets the correct grouped
+  values. A simple example, doing SELECT a, SUM(b) FROM t1 GROUP BY a:
 
-  However, if we are outputting directly to the user, we need somewhere to store
-  the output. This is solved by abusing the slice system; since we only need to
-  buffer a single row, we can set up just enough items in the
-  REF_SLICE_ORDERED_GROUP_BY slice, so that it can hold a single row. This row
-  is then used for our output, and we then switch to it just before the end of
-  Read() so that anyone reading from the buffers will get that output.
-  The caller knows the context about where our output goes, and thus also picks
-  the appropriate output slice for us.
+    t1.a  t1.b                                       SUM(b)
+     1     1     <-- first row, save it                1
+     1     2                                           3
+     1     3                                           6
+     2     1     <-- group changed, save row
+    [1     1]    <-- restore first row, output         6
+                     reset aggregate              -->  0
+    [2     1]    <-- restore new row, process it       1
+     2    10                                          11
+                 <-- EOF, output                      11
 
-  This isn't very pretty. What should be done is probably a more abstract
-  concept of sending a row around and taking copies of it if needed, as opposed
-  to it implicitly staying in the table's buffer. (This would also solve some
+  To save and restore rows like this, it uses the infrastructure from
+  pack_rows.h to pack and unpack all relevant rows into record[0] of every input
+  table. (Currently, there can only be one input table, but this may very well
+  change in the future.) It would be nice to have a more abstract concept of
+  sending a row around and taking copies of it if needed, as opposed to it
+  implicitly staying in the table's buffer. (This would also solve some
   issues in EQRefIterator and when synthesizing NULL rows for outer joins.)
   However, that's a large refactoring.
  */
 class AggregateIterator final : public RowIterator {
  public:
   AggregateIterator(THD *thd, unique_ptr_destroy_only<RowIterator> source,
-                    JOIN *join, Temp_table_param *temp_table_param,
-                    int output_slice, bool rollup);
+                    JOIN *join, pack_rows::TableCollection tables, bool rollup);
 
   bool Init() override;
   int Read() override;
@@ -238,17 +220,10 @@ class AggregateIterator final : public RowIterator {
     // different group. Thus, do nothing.
   }
 
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_source.get(), ""}};
-  }
-
-  std::vector<std::string> DebugString() const override;
-
  private:
   enum {
     READING_FIRST_ROW,
     LAST_ROW_STARTED_NEW_GROUP,
-    READING_ROWS,
     OUTPUTTING_ROLLUP_ROWS,
     DONE_OUTPUTTING_ROWS
   } m_state;
@@ -263,12 +238,6 @@ class AggregateIterator final : public RowIterator {
    */
   JOIN *m_join = nullptr;
 
-  /// The slice of the fields we are reading from (see the class comment).
-  int m_input_slice;
-
-  /// The slice of the fields we are outputting to. See the class comment.
-  int m_output_slice;
-
   /// Whether we have seen the last input row.
   bool m_seen_eof;
 
@@ -278,52 +247,18 @@ class AggregateIterator final : public RowIterator {
    */
   table_map m_save_nullinfo;
 
-  /// The parameters for the temporary table we are materializing into, if any.
-  Temp_table_param *m_temp_table_param;
-
   /// Whether this is a rollup query.
   const bool m_rollup;
 
   /**
-    Whether we have a rollup query where we needed to replace m_join->fields
-    with a set of Item_refs. See the constructor for more information.
-   */
-  bool m_replace_field_list;
-
-  /// If we have replaced the field list, contains the original field list.
-  List<Item> *m_original_fields = nullptr;
-
-  /**
-    If we have replaced the field list, this is the list of Item pointers
-    that each Item_ref points into.
-   */
-  Mem_root_array<Item *> *m_current_fields = nullptr;
-
-  /**
-    The list that the current values in m_current_fields come from.
-    This is used purely as an optimization so that SwitchFieldList()
-    does not have to do copying work if m_current_fields is already set up
-    correctly. Only used if m_replace_field_list is true.
-   */
-  const List<Item> *m_current_fields_source = nullptr;
-
-  /**
     For rollup: The index of the first group item that did _not_ change when we
     last switched groups. E.g., if we have group fields A,B,C,D and then switch
-    to group A,B,D,D, this value will become 1 (which means that we need
-    to output rollup rows for 2 -- A,B,D,NULL -- and then 1 -- A,B,NULL,NULL).
+    to group A,B,E,D, this value will become 1 (which means that we need
+    to output rollup rows for 2 -- A,B,E,NULL -- and then 1 -- A,B,NULL,NULL).
     m_current_rollup_position will count down from the end until it becomes
     less than this value.
 
-    In addition, it is important to know this value so that we known
-    which aggregates to reset once we start reading rows again; e.g.,
-    in the given example, the two first aggregates should keep counting,
-    while the two last ones should be reset. join->sum_funcs_end contains
-    the right end pointers for this purpose.
-
-    If we do not have rollup, this value is perennially zero, because there
-    is only one element in join->sum_funcs_end (representing all aggregates
-    in the query).
+    If we do not have rollup, this value is perennially zero.
    */
   int m_last_unchanged_group_item_idx;
 
@@ -331,79 +266,35 @@ class AggregateIterator final : public RowIterator {
     If we are in state OUTPUTTING_ROLLUP_ROWS, where we are in the iteration.
     This value will start at the index of the last group expression and then
     count backwards down to and including m_last_unchanged_group_item_idx.
-    It is used to know which field list we should send.
+    It is used to communicate to the rollup group items whether to turn
+    themselves into NULLs, and the sum items which of their sums to output.
    */
   int m_current_rollup_position;
 
-  void SwitchFieldList(List<Item> *fields) {
-    if (!m_replace_field_list || m_current_fields_source == fields) {
-      return;
-    }
+  /**
+    The list of tables we are reading from; they are the ones for which we need
+    to save and restore rows.
+   */
+  pack_rows::TableCollection m_tables;
 
-    size_t item_index = 0;
-    for (Item &item : *fields) {
-      (*m_current_fields)[item_index++] = &item;
-    }
-    m_current_fields_source = fields;
-  }
-};
-
-/**
-  Similar to AggregateIterator, but asusmes that the actual aggregates are
-  already have been filled out (typically by QUICK_RANGE_MIN_MAX), and all the
-  iterator needs to do is copy over the non-aggregated fields.
- */
-class PrecomputedAggregateIterator final : public RowIterator {
- public:
-  PrecomputedAggregateIterator(THD *thd,
-                               unique_ptr_destroy_only<RowIterator> source,
-                               JOIN *join, Temp_table_param *temp_table_param,
-                               int output_slice)
-      : RowIterator(thd),
-        m_source(move(source)),
-        m_join(join),
-        m_temp_table_param(temp_table_param),
-        m_output_slice(output_slice) {}
-
-  bool Init() override;
-  int Read() override;
-  void SetNullRowFlag(bool is_null_row) override {
-    m_source->SetNullRowFlag(is_null_row);
-  }
-
-  void StartPSIBatchMode() override { m_source->StartPSIBatchMode(); }
-  void EndPSIBatchModeIfStarted() override {
-    m_source->EndPSIBatchModeIfStarted();
-  }
-  void UnlockRow() override {
-    // See AggregateIterator::UnlockRow().
-  }
-
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_source.get(), ""}};
-  }
-
-  std::vector<std::string> DebugString() const override;
-
- private:
-  unique_ptr_destroy_only<RowIterator> m_source;
+  /// Packed version of the first row in the group we are currently processing.
+  String m_first_row_this_group;
 
   /**
-    The join we are part of. It would be nicer not to rely on this,
-    but we need a large number of members from there, like which
-    aggregate functions we have, the THD, temporary table parameters
-    and so on.
+    If applicable, packed version of the first row in the _next_ group. This is
+    used only in the LAST_ROW_STARTED_NEW_GROUP state; we just saw a row that
+    didn't belong to the current group, so we saved it here and went to output
+    a group. On the next Read() call, we need to process this deferred row
+    first of all.
+
+    Even when not in use, this string contains a buffer that is large enough to
+    pack a full row into, sans blobs. (If blobs are present,
+    StoreFromTableBuffers() will automatically allocate more space if needed.)
    */
-  JOIN *m_join = nullptr;
+  String m_first_row_next_group;
 
-  /// The parameters for the temporary table we are materializing into, if any.
-  Temp_table_param *m_temp_table_param;
-
-  /// The slice of the fields we are outputting to.
-  int m_output_slice;
+  void SetRollupLevel(int level);
 };
-
-enum class JoinType { INNER, OUTER, ANTI, SEMI };
 
 /**
   A simple nested loop join, taking in two iterators (left/outer and
@@ -430,13 +321,13 @@ class NestedLoopIterator final : public RowIterator {
         m_source_inner(move(source_inner)),
         m_join_type(join_type),
         m_pfs_batch_mode(pfs_batch_mode) {
-    DBUG_ASSERT(m_source_outer != nullptr);
-    DBUG_ASSERT(m_source_inner != nullptr);
+    assert(m_source_outer != nullptr);
+    assert(m_source_inner != nullptr);
 
     // Batch mode makes no sense for anti- or semijoins, since they should only
     // be reading one row.
     if (join_type == JoinType::ANTI || join_type == JoinType::SEMI) {
-      DBUG_ASSERT(!pfs_batch_mode);
+      assert(!pfs_batch_mode);
     }
   }
 
@@ -462,13 +353,6 @@ class NestedLoopIterator final : public RowIterator {
     if (m_state == READING_FIRST_INNER_ROW || m_state == READING_INNER_ROWS) {
       m_source_inner->UnlockRow();
     }
-  }
-
-  std::vector<std::string> DebugString() const override;
-
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_source_outer.get(), ""},
-                              {m_source_inner.get(), ""}};
   }
 
  private:
@@ -520,10 +404,6 @@ class CacheInvalidatorIterator final : public RowIterator {
   }
 
   void UnlockRow() override { m_source_iterator->UnlockRow(); }
-  std::vector<std::string> DebugString() const override;
-  std::vector<Child> children() const override {
-    return {Child{m_source_iterator.get(), ""}};
-  }
 
   int64_t generation() const { return m_generation; }
   std::string name() const { return m_name; }
@@ -555,7 +435,7 @@ class CacheInvalidatorIterator final : public RowIterator {
   actually write to the table; see StreamingIterator for details.
 
   MaterializeIterator conceptually materializes iterators, not JOINs or
-  SELECT_LEX_UNITs. However, there are many details that leak out
+  Query_expressions. However, there are many details that leak out
   (e.g., setting performance schema batch mode, slices, reusing CTEs,
   etc.), so we need to send them in anyway.
  */
@@ -590,7 +470,7 @@ class MaterializeIterator final : public TableRowIterator {
 
     /// If set to false, the Field objects in the output row are
     /// presumed already to be filled out. This is the case iff
-    /// there's an AggregateIterator earlier in the chain.
+    /// there's a windowing iterator earlier in the chain.
     bool copy_fields_and_items;
 
     /// If copy_fields_and_items is true, used for copying the Field objects
@@ -617,7 +497,8 @@ class MaterializeIterator final : public TableRowIterator {
       after materialization.
     @param cte If materializing a CTE, points to it (see m_cte), otherwise
       nullptr.
-    @param unit The query expression we are materializing (see m_unit).
+    @param unit The query expression we are materializing (see
+    m_query_expression).
     @param join
       When materializing within the same JOIN (e.g., into a temporary table
       before sorting), as opposed to a derived table or a CTE, we may need
@@ -631,67 +512,28 @@ class MaterializeIterator final : public TableRowIterator {
       (e.g., because we have a dependency on a value from outside the query
       block).
     @param limit_rows
-      Does the same job as a LimitOffsetIterator right before the
-      MaterializeIterator would have done, except that it works _after_
-      deduplication (if that is active). It is used for when pushing LIMIT down
-      to MaterializeIterator, so that we can stop materializing when there are
-      enough rows. The deduplication is the reason why this specific limit has
-      to be handled in MaterializeIterator and not using a regular
-      LimitOffsetIterator. Set to HA_POS_ERROR for no limit.
+      Used for when pushing LIMIT down to MaterializeIterator; this is
+      more efficient than having a LimitOffsetIterator above the
+      MaterializeIterator, since we can stop materializing when there are
+      enough rows. (This is especially important for recursive CTEs.)
+      Note that we cannot have a LimitOffsetIterator _below_ the
+      MaterializeIterator, as that would count wrong if we have deduplication,
+      and would not work at all for recursive CTEs.
+      Set to HA_POS_ERROR for no limit.
+    @param reject_multiple_rows true if this is the top level iterator for a
+      materialized derived table transformed from a scalar subquery which needs
+      run-time cardinality check.
    */
   MaterializeIterator(THD *thd,
                       Mem_root_array<QueryBlock> query_blocks_to_materialize,
                       TABLE *table,
                       unique_ptr_destroy_only<RowIterator> table_iterator,
-                      const Common_table_expr *cte, SELECT_LEX_UNIT *unit,
+                      Common_table_expr *cte, Query_expression *unit,
                       JOIN *join, int ref_slice, bool rematerialize,
-                      ha_rows limit_rows);
-
-  /**
-    A convenience form for materializing a single table only.
-
-    @param thd Thread handler.
-    @param subquery_iterator The iterator to read the actual rows from.
-    @param temp_table_param If copy_fields_and_items is true, used for copying
-      the Field objects into the temporary table row. Otherwise unused.
-    @param table Handle to table to materialize into.
-    @param table_iterator Iterator used for scanning the temporary table
-      after materialization.
-    @param cte If materializing a CTE, points to it (see m_cte), otherwise
-      nullptr.
-    @param select_number Used only for optimizer trace.
-    @param unit The query expression we are materializing (see m_unit).
-    @param join
-      When materializing within the same JOIN (e.g., into a temporary table
-      before sorting), as opposed to a derived table or a CTE, we may need
-      to change the slice on the join before returning rows from the result
-      table. If so, join and ref_slice would need to be set, and
-      query_blocks_to_materialize should contain only one member, with the same
-      join.
-    @param ref_slice See join. If we are materializing across JOINs,
-      e.g. derived tables, ref_slice should be left at -1.
-    @param copy_fields_and_items If set to false, the Field objects in the
-      output row are presumed already to be filled out. This is the case iff
-      there's an AggregateIterator earlier in the chain.
-    @param rematerialize true if rematerializing on every Init() call
-      (e.g., because we have a dependency on a value from outside the query
-      block).
-    @param limit_rows See limit_rows on the other constructor.
-   */
-  MaterializeIterator(THD *thd,
-                      unique_ptr_destroy_only<RowIterator> subquery_iterator,
-                      Temp_table_param *temp_table_param, TABLE *table,
-                      unique_ptr_destroy_only<RowIterator> table_iterator,
-                      const Common_table_expr *cte, int select_number,
-                      SELECT_LEX_UNIT *unit, JOIN *join, int ref_slice,
-                      bool copy_fields_and_items, bool rematerialize,
-                      ha_rows limit_rows);
+                      ha_rows limit_rows, bool reject_multiple_rows);
 
   bool Init() override;
   int Read() override;
-  std::vector<std::string> DebugString() const override;
-
-  std::vector<Child> children() const override;
 
   void SetNullRowFlag(bool is_null_row) override {
     m_table_iterator->SetNullRowFlag(is_null_row);
@@ -718,7 +560,7 @@ class MaterializeIterator final : public TableRowIterator {
   /// If we are materializing a CTE, points to it (otherwise nullptr).
   /// Used so that we see if some other iterator already materialized the table,
   /// avoiding duplicate work.
-  const Common_table_expr *m_cte;
+  Common_table_expr *m_cte;
 
   /// The query expression we are materializing. For derived tables,
   /// we materialize the entire query expression; for materialization within
@@ -727,7 +569,7 @@ class MaterializeIterator final : public TableRowIterator {
   /// the unit when we rematerialize, since they depend on values from
   /// outside the query expression, and those values may have changed
   /// since last materialization.
-  SELECT_LEX_UNIT *m_unit;
+  Query_expression *m_query_expression;
 
   /// See constructor.
   JOIN *const m_join;
@@ -740,6 +582,9 @@ class MaterializeIterator final : public TableRowIterator {
   /// If true, we need to materialize anew for each Init() (because the contents
   /// of the table will depend on some outer non-constant value).
   const bool m_rematerialize;
+
+  /// See constructor.
+  const bool m_reject_multiple_rows;
 
   /// See constructor.
   const ha_rows m_limit_rows;
@@ -783,28 +628,31 @@ class MaterializeIterator final : public TableRowIterator {
   It is used for when the optimizer would normally set up a materialization,
   but you don't actually need one, ie. you don't want to read the rows multiple
   times after writing them, and you don't want to access them by index (only
-  a single table scan). If you don't need the copy functionality (ie., you
-  have an AggregateIterator, which does this job already), you still need a
-  StreamingIterator, to set the NULL row flag on the temporary table.
+  a single table scan). It also takes care of setting the NULL row flag
+  on the temporary table.
  */
 class StreamingIterator final : public TableRowIterator {
  public:
+  /**
+    @param thd Thread handle.
+    @param subquery_iterator The iterator to read rows from.
+    @param temp_table_param Parameters for the temp table.
+    @param table The table we are streaming through. Will never actually
+      be written to, but its fields will be used.
+    @param provide_rowid If true, generate a row ID for each row we stream.
+      This is used if the parent needs row IDs for deduplication, in particular
+      weedout.
+    @param join See MaterializeIterator.
+    @param ref_slice See MaterializeIterator.
+   */
   StreamingIterator(THD *thd,
                     unique_ptr_destroy_only<RowIterator> subquery_iterator,
                     Temp_table_param *temp_table_param, TABLE *table,
-                    bool copy_fields_and_items);
+                    bool provide_rowid, JOIN *join, int ref_slice);
 
   bool Init() override;
 
   int Read() override;
-
-  std::vector<std::string> DebugString() const override {
-    return {"Stream results"};
-  }
-
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_subquery_iterator.get(), ""}};
-  }
 
   void StartPSIBatchMode() override {
     m_subquery_iterator->StartPSIBatchMode();
@@ -817,13 +665,15 @@ class StreamingIterator final : public TableRowIterator {
  private:
   unique_ptr_destroy_only<RowIterator> m_subquery_iterator;
   Temp_table_param *m_temp_table_param;
-  const bool m_copy_fields_and_items;
   ha_rows m_row_number;
+  JOIN *const m_join;
+  const int m_output_slice;
+  int m_input_slice;
 
   // Whether the iterator should generate and provide a row ID. Only true if the
   // iterator is part of weedout, where the iterator will create a fake row ID
   // to uniquely identify the rows it produces.
-  bool m_provide_rowid{false};
+  const bool m_provide_rowid;
 };
 
 /**
@@ -836,8 +686,8 @@ class TemptableAggregateIterator final : public TableRowIterator {
   TemptableAggregateIterator(
       THD *thd, unique_ptr_destroy_only<RowIterator> subquery_iterator,
       Temp_table_param *temp_table_param, TABLE *table,
-      unique_ptr_destroy_only<RowIterator> table_iterator,
-      SELECT_LEX *select_lex, JOIN *join, int ref_slice);
+      unique_ptr_destroy_only<RowIterator> table_iterator, JOIN *join,
+      int ref_slice);
 
   bool Init() override;
   int Read() override;
@@ -849,9 +699,6 @@ class TemptableAggregateIterator final : public TableRowIterator {
     m_subquery_iterator->EndPSIBatchModeIfStarted();
   }
   void UnlockRow() override {}
-  std::vector<std::string> DebugString() const override;
-
-  std::vector<Child> children() const override;
 
  private:
   /// The iterator we are reading rows from.
@@ -861,7 +708,6 @@ class TemptableAggregateIterator final : public TableRowIterator {
   unique_ptr_destroy_only<RowIterator> m_table_iterator;
 
   Temp_table_param *m_temp_table_param;
-  SELECT_LEX *m_select_lex;
   JOIN *const m_join;
   const int m_ref_slice;
 
@@ -887,9 +733,6 @@ class MaterializedTableFunctionIterator final : public TableRowIterator {
 
   bool Init() override;
   int Read() override { return m_table_iterator->Read(); }
-  std::vector<std::string> DebugString() const override {
-    return {{"Materialize table function"}};
-  }
   void SetNullRowFlag(bool is_null_row) override {
     m_table_iterator->SetNullRowFlag(is_null_row);
   }
@@ -931,15 +774,10 @@ class MaterializedTableFunctionIterator final : public TableRowIterator {
 class WeedoutIterator final : public RowIterator {
  public:
   WeedoutIterator(THD *thd, unique_ptr_destroy_only<RowIterator> source,
-                  SJ_TMP_TABLE *sj);
+                  SJ_TMP_TABLE *sj, table_map tables_to_get_rowid_for);
 
   bool Init() override;
   int Read() override;
-  std::vector<std::string> DebugString() const override;
-
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_source.get(), ""}};
-  }
 
   void SetNullRowFlag(bool is_null_row) override {
     m_source->SetNullRowFlag(is_null_row);
@@ -953,11 +791,7 @@ class WeedoutIterator final : public RowIterator {
  private:
   unique_ptr_destroy_only<RowIterator> m_source;
   SJ_TMP_TABLE *m_sj;
-
-  // The cached value of QEP_TAB::rowid_status for each of the tables in the
-  // weedout. Index 0 corresponds to the first table in m_sj.
-  // See QEP_TAB::rowid_status for why we need to cache this value.
-  Prealloced_array<rowid_statuses, 4> m_rowid_status;
+  const table_map m_tables_to_get_rowid_for;
 };
 
 /**
@@ -977,11 +811,6 @@ class RemoveDuplicatesIterator final : public RowIterator {
 
   bool Init() override;
   int Read() override;
-  std::vector<std::string> DebugString() const override;
-
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_source.get(), ""}};
-  }
 
   void SetNullRowFlag(bool is_null_row) override {
     m_source->SetNullRowFlag(is_null_row);
@@ -1012,7 +841,8 @@ class RemoveDuplicatesIterator final : public RowIterator {
 
   In this case, the query tree without this iterator would ostensibly look like
 
-    -> Table scan on t1
+    -> Nested loop join
+       -> Table scan on t1
        -> Remove duplicates on t2_idx
           -> Nested loop semijoin
              -> Index scan on t2 using t2_idx
@@ -1059,13 +889,6 @@ class NestedLoopSemiJoinWithDuplicateRemovalIterator final
     m_source_inner->UnlockRow();
   }
 
-  std::vector<std::string> DebugString() const override;
-
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_source_outer.get(), ""},
-                              {m_source_inner.get(), ""}};
-  }
-
  private:
   unique_ptr_destroy_only<RowIterator> const m_source_outer;
   unique_ptr_destroy_only<RowIterator> const m_source_inner;
@@ -1082,10 +905,12 @@ class NestedLoopSemiJoinWithDuplicateRemovalIterator final
   aggregates (i.e., OVER expressions). It deals specifically with aggregates
   that don't need to buffer rows.
 
-  WindowingIterator always outputs to a temporary table. Similarly to
-  AggregateIterator, needs to do some of MaterializeIterator's work in
-  copying fields and Items into the destination fields (see AggregateIterator
-  for more information).
+  If we are outputting to a temporary table -- we take over responsibility
+  for storing the fields from MaterializeIterator, which would otherwise do it.
+  Otherwise, we do a fair amount of slice switching back and forth to be sure
+  to present the right output row to the user. Longer-term, we should probably
+  do as AggregateIterator does -- it used to do the same, but now instead saves
+  and restores rows, making for a more uniform data flow.
  */
 class WindowingIterator final : public RowIterator {
  public:
@@ -1108,12 +933,6 @@ class WindowingIterator final : public RowIterator {
 
   void UnlockRow() override {
     // There's nothing we can do here.
-  }
-
-  std::vector<std::string> DebugString() const override;
-
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_source.get(), ""}};
   }
 
  private:
@@ -1164,12 +983,6 @@ class BufferingWindowingIterator final : public RowIterator {
     // There's nothing we can do here.
   }
 
-  std::vector<std::string> DebugString() const override;
-
-  std::vector<Child> children() const override {
-    return std::vector<Child>{{m_source.get(), ""}};
-  }
-
  private:
   int ReadBufferedRow(bool new_partition_or_eof);
 
@@ -1211,19 +1024,11 @@ class BufferingWindowingIterator final : public RowIterator {
 class MaterializeInformationSchemaTableIterator final : public RowIterator {
  public:
   MaterializeInformationSchemaTableIterator(
-      THD *thd, QEP_TAB *qep_tab,
-      unique_ptr_destroy_only<RowIterator> table_iterator);
+      THD *thd, unique_ptr_destroy_only<RowIterator> table_iterator,
+      TABLE_LIST *table_list, Item *condition);
 
   bool Init() override;
   int Read() override { return m_table_iterator->Read(); }
-  std::vector<std::string> DebugString() const override;
-
-  std::vector<Child> children() const override {
-    // We don't list the table iterator as an explicit child; we mark it in
-    // our DebugString() instead. (Anything else would look confusingly much
-    // like a join.)
-    return {};
-  }
 
   void SetNullRowFlag(bool is_null_row) override {
     m_table_iterator->SetNullRowFlag(is_null_row);
@@ -1241,7 +1046,8 @@ class MaterializeInformationSchemaTableIterator final : public RowIterator {
  private:
   /// The iterator that reads from the materialized table.
   unique_ptr_destroy_only<RowIterator> m_table_iterator;
-  QEP_TAB *m_qep_tab;
+  TABLE_LIST *m_table_list;
+  Item *m_condition;
 };
 
 /**
@@ -1257,9 +1063,6 @@ class AppendIterator final : public RowIterator {
 
   bool Init() override;
   int Read() override;
-
-  std::vector<std::string> DebugString() const override { return {"Append"}; }
-  std::vector<Child> children() const override;
 
   void StartPSIBatchMode() override;
   void EndPSIBatchModeIfStarted() override;

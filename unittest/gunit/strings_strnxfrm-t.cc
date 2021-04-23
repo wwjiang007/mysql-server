@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -138,7 +138,7 @@ int compare_through_strxfrm(CHARSET_INFO *cs, const char *a, const char *b) {
 
 }  // namespace
 
-#if !defined(DBUG_OFF)
+#if !defined(NDEBUG)
 // There is no point in benchmarking anything in debug mode.
 const size_t num_iterations = 1ULL;
 #else
@@ -150,7 +150,7 @@ const size_t num_iterations = 2ULL;
 
 class StrnxfrmTest : public ::testing::TestWithParam<size_t> {
  protected:
-  virtual void SetUp() {
+  void SetUp() override {
     m_length = GetParam();
     m_src.assign(m_length, 0x20);
     m_dst.assign(m_length, 0x20);
@@ -162,8 +162,8 @@ class StrnxfrmTest : public ::testing::TestWithParam<size_t> {
 
 size_t test_values[] = {1, 10, 100, 1000};
 
-INSTANTIATE_TEST_CASE_P(Strnxfrm, StrnxfrmTest,
-                        ::testing::ValuesIn(test_values));
+INSTANTIATE_TEST_SUITE_P(Strnxfrm, StrnxfrmTest,
+                         ::testing::ValuesIn(test_values));
 
 TEST_P(StrnxfrmTest, OriginalSrcDst) {
   CHARSET_INFO *cs = init_collation("latin1_swedish_ci");

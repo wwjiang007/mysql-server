@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2016, 2021, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -71,12 +71,12 @@ HARNESS_EXPORT void flush_keyring();
 /**
  * Gets a previously initialized singleton instance of the keyring
  */
-HARNESS_EXPORT Keyring *get_keyring();
+HARNESS_EXPORT Keyring *get_keyring() noexcept;
 
 /**
  * Clears the keyring singleton.
  */
-HARNESS_EXPORT void reset_keyring();
+HARNESS_EXPORT void reset_keyring() noexcept;
 }  // namespace mysql_harness
 
 #endif

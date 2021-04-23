@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -57,8 +57,8 @@ VIEW user_summary_by_stages (
 SELECT IF(user IS NULL, 'background', user) AS user,
        event_name,
        count_star AS total,
-       sys.format_time(sum_timer_wait) AS total_latency, 
-       sys.format_time(avg_timer_wait) AS avg_latency 
+       format_pico_time(sum_timer_wait) AS total_latency, 
+       format_pico_time(avg_timer_wait) AS avg_latency 
   FROM performance_schema.events_stages_summary_by_user_by_event_name
  WHERE sum_timer_wait != 0 
  ORDER BY user, sum_timer_wait DESC;

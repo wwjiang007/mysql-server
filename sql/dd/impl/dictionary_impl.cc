@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -51,7 +51,8 @@
 #include "sql/dd/impl/tables/table_partitions.h"  // dd::tables::Table_partitions
 #include "sql/dd/impl/tables/tables.h"            // dd::tables::Tables
 #include "sql/dd/impl/tables/tablespaces.h"       // dd::tables::Tablespaces
-#include "sql/dd/impl/utils.h"                    // dd::tables::Tablespaces
+#include "sql/dd/impl/upgrade/server.h"
+#include "sql/dd/impl/utils.h"            // dd::tables::Tablespaces
 #include "sql/dd/info_schema/metadata.h"  // dd::info_schema::store_dynamic...
 #include "sql/dd/types/abstract_table.h"  // dd::Abstract_table::DD_table
 #include "sql/dd/types/column.h"          // dd::Column::DD_table
@@ -65,6 +66,7 @@
 #include "sql/derror.h"
 #include "sql/handler.h"
 #include "sql/mdl.h"
+#include "sql/mysqld.h"                 //next_query_id()
 #include "sql/opt_costconstantcache.h"  // init_optimizer_cost_module
 #include "sql/plugin_table.h"
 #include "sql/sql_base.h"   // close_cached_tables
@@ -73,6 +75,9 @@
 #include "sql/thd_raii.h"                       // Disable_autocommit_guard
 #include "sql/transaction.h"                    // trans_commit()
 #include "storage/perfschema/pfs_dd_version.h"  // PFS_DD_VERSION
+
+extern Cost_constant_cache *cost_constant_cache;  // defined in
+                                                  // opt_costconstantcache.cc
 
 ///////////////////////////////////////////////////////////////////////////
 
@@ -85,7 +90,7 @@ namespace dd {
 class Object_table;
 class Table;
 
-Dictionary_impl *Dictionary_impl::s_instance = NULL;
+Dictionary_impl *Dictionary_impl::s_instance = nullptr;
 
 Dictionary_impl *Dictionary_impl::instance() { return s_instance; }
 
@@ -98,7 +103,7 @@ const String_type Dictionary_impl::DEFAULT_CATALOG_NAME("def");
 bool Dictionary_impl::init(enum_dd_init_type dd_init) {
   if (dd_init == enum_dd_init_type::DD_INITIALIZE ||
       dd_init == enum_dd_init_type::DD_RESTART_OR_UPGRADE) {
-    DBUG_ASSERT(!Dictionary_impl::s_instance);
+    assert(!Dictionary_impl::s_instance);
 
     if (Dictionary_impl::s_instance) return false; /* purecov: inspected */
 
@@ -114,7 +119,11 @@ bool Dictionary_impl::init(enum_dd_init_type dd_init) {
     Upgrade process needs heap engine initialized, hence parameter 'true'
     is passed to the function.
   */
-  init_optimizer_cost_module(true);
+  bool cost_constant_inited = false;
+  if (cost_constant_cache == nullptr) {
+    init_optimizer_cost_module(true);
+    cost_constant_inited = true;
+  }
 
   // Disable table encryption privilege checks for system threads.
   bool saved_table_encryption_privilege_check =
@@ -165,11 +174,18 @@ bool Dictionary_impl::init(enum_dd_init_type dd_init) {
         nullptr, nullptr, &dd::info_schema::update_I_S_metadata,
         SYSTEM_THREAD_DD_INITIALIZE);
 
+  // Creation of non-dd-based INFORMATION_SCHEMA system views.
+  else if (dd_init ==
+           enum_dd_init_type::DD_INITIALIZE_NON_DD_BASED_SYSTEM_VIEWS)
+    result = ::bootstrap::run_bootstrap_thread(
+        nullptr, nullptr, &dd::info_schema::init_non_dd_based_system_view,
+        SYSTEM_THREAD_DD_INITIALIZE);
+
   // Restore the table_encryption_privilege_check.
   opt_table_encryption_privilege_check = saved_table_encryption_privilege_check;
 
   /* Now that the dd is initialized, delete the cost model. */
-  delete_optimizer_cost_module();
+  if (cost_constant_inited) delete_optimizer_cost_module();
 
   return result;
 }
@@ -180,7 +196,7 @@ bool Dictionary_impl::shutdown() {
   if (!Dictionary_impl::s_instance) return true;
 
   delete Dictionary_impl::s_instance;
-  Dictionary_impl::s_instance = NULL;
+  Dictionary_impl::s_instance = nullptr;
 
   return false;
 }
@@ -198,8 +214,8 @@ uint Dictionary_impl::get_actual_dd_version(THD *thd) {
   uint version = 0;
   bool error MY_ATTRIBUTE((unused)) = tables::DD_properties::instance().get(
       thd, "DD_VERSION", &version, &exists);
-  DBUG_ASSERT(!error);
-  DBUG_ASSERT(exists);
+  assert(!error);
+  assert(exists);
   return version;
 }
 
@@ -216,8 +232,8 @@ uint Dictionary_impl::get_actual_I_S_version(THD *thd) {
   uint version = 0;
   bool error MY_ATTRIBUTE((unused)) = tables::DD_properties::instance().get(
       thd, "IS_VERSION", &version, &exists);
-  DBUG_ASSERT(!error);
-  DBUG_ASSERT(exists);
+  assert(!error);
+  assert(exists);
   return version;
 }
 
@@ -238,9 +254,23 @@ uint Dictionary_impl::get_actual_P_S_version(THD *thd) {
   uint version = 0;
   bool error MY_ATTRIBUTE((unused)) = tables::DD_properties::instance().get(
       thd, "PS_VERSION", &version, &exists);
-  DBUG_ASSERT(!error);
-  DBUG_ASSERT(exists);
+  assert(!error);
+  assert(exists);
   return version;
+}
+
+///////////////////////////////////////////////////////////////////////////
+
+bool Dictionary_impl::get_actual_ndbinfo_schema_version(THD *thd, uint *ver) {
+  bool exists = false;
+  tables::DD_properties::instance().get(thd, "NDBINFO_VERSION", ver, &exists);
+  return exists;
+}
+
+///////////////////////////////////////////////////////////////////////////
+
+uint Dictionary_impl::set_ndbinfo_schema_version(THD *thd, uint version) {
+  return tables::DD_properties::instance().set(thd, "NDBINFO_VERSION", version);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -253,7 +283,7 @@ uint Dictionary_impl::set_P_S_version(THD *thd, uint version) {
 
 const Object_table *Dictionary_impl::get_dd_table(
     const String_type &schema_name, const String_type &table_name) const {
-  if (!is_dd_schema_name(schema_name)) return NULL;
+  if (!is_dd_schema_name(schema_name)) return nullptr;
 
   return System_tables::instance()->find_table(schema_name, table_name);
 }
@@ -446,6 +476,15 @@ static bool acquire_mdl(THD *thd, MDL_key::enum_mdl_namespace lock_namespace,
   } else if (thd->mdl_context.acquire_locks(&mdl_requests, lock_wait_timeout))
     return true;
 
+  /*
+    Unlike in other places where we acquire protection against global read
+    lock, the read_only state is not checked here since it is handled by
+    the caller or extra steps are taken to correctly ignore it. Also checking
+    read_only state can be problematic for background threads like drop table
+    thread and purge thread which can be initiated on behalf of statements
+    executed by replication thread where the read_only state does not apply.
+  */
+
   if (out_mdl_ticket) *out_mdl_ticket = mdl_request.ticket;
 
   return false;
@@ -572,7 +611,7 @@ bool create_native_table(THD *thd, const Plugin_table *pt) {
     4. Undo 1.
   */
   dd::cache::Dictionary_client *client = thd->dd_client();
-  const dd::Table *table_def = NULL;
+  const dd::Table *table_def = nullptr;
   if (client->acquire(pt->get_schema_name(), pt->get_name(), &table_def))
     return true;
 
@@ -621,7 +660,7 @@ bool drop_native_table(THD *thd, const char *schema_name,
     return true;
 
   dd::cache::Dictionary_client *client = thd->dd_client();
-  const dd::Table *table_def = NULL;
+  const dd::Table *table_def = nullptr;
   if (client->acquire(schema_name, table_name, &table_def)) {
     // Error is reported by the dictionary subsystem.
     return true;
@@ -694,6 +733,23 @@ void rename_tablespace_mdl_hook(THD *thd, MDL_ticket *src, MDL_ticket *dst) {
     return;
   }
   thd->locked_tables_list.add_rename_tablespace_mdls(src, dst);
+}
+
+bool alter_tablespace_encryption(THD *thd, const char *tablespace_name,
+                                 bool encryption) {
+  dd::upgrade::Bootstrap_error_handler error_handler;
+  bool save_log_error = dd::upgrade::Bootstrap_error_handler::m_log_error;
+  error_handler.set_log_error(false);
+
+  thd->set_query_id(next_query_id());
+
+  dd::String_type query = dd::String_type("ALTER TABLESPACE ") +
+                          tablespace_name + dd::String_type(" ENCRYPTION = ") +
+                          dd::String_type(encryption ? "'Y'" : "'N'");
+
+  bool res = execute_query(thd, query);
+  error_handler.set_log_error(save_log_error);
+  return res;
 }
 
 }  // namespace dd

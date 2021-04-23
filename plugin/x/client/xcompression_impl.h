@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2021, Oracle and/or its affiliates.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2.0,
@@ -37,8 +37,26 @@ namespace xcl {
 
 class Compression_impl : public XCompression {
  public:
+  bool reinitialize(const Compression_algorithm algorithm) override;
+  bool reinitialize(const Compression_algorithm algorithm,
+                    const int32_t level) override;
+
   Input_stream_ptr downlink(Input_stream *data_stream) override;
   Output_stream_ptr uplink(Output_stream *data_stream) override;
+
+  protocol::Compression_algorithm_interface *compression_algorithm()
+      const override {
+    return m_uplink_stream.get();
+  }
+  protocol::Decompression_algorithm_interface *decompression_algorithm()
+      const override {
+    return m_downlink_stream.get();
+  }
+
+ private:
+  std::shared_ptr<protocol::Decompression_algorithm_interface>
+      m_downlink_stream;
+  std::shared_ptr<protocol::Compression_algorithm_interface> m_uplink_stream;
 };
 
 }  // namespace xcl

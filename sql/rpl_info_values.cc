@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -42,7 +42,7 @@ bool Rpl_info_values::init() {
   DBUG_TRACE;
 
   if (!value && !(value = new String[ninfo])) return true;
-  if (bitmap_init(&is_null, nullptr, ninfo, false)) {
+  if (bitmap_init(&is_null, nullptr, ninfo)) {
     delete[] value;
     return true;
   }

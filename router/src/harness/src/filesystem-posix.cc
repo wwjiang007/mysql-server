@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+  Copyright (c) 2015, 2021, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -41,6 +41,7 @@
 #include <system_error>
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <fnmatch.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -239,13 +240,10 @@ void Directory::DirectoryIterator::State::fill_result() {
 // be here since the automatically generated default
 // constructor/destructor uses the definition of the class 'State',
 // which is not available when the header file is read.
-Directory::DirectoryIterator::~DirectoryIterator() {}
+Directory::DirectoryIterator::~DirectoryIterator() = default;
 Directory::DirectoryIterator::DirectoryIterator(DirectoryIterator &&) = default;
-Directory::DirectoryIterator::DirectoryIterator(const DirectoryIterator &other)
-    : DirectoryIteratorBase(other),
-      path_(other.path_),
-      pattern_(other.pattern_),
-      state_(other.state_) {}
+Directory::DirectoryIterator::DirectoryIterator(const DirectoryIterator &) =
+    default;
 
 Directory::DirectoryIterator::DirectoryIterator()
     : path_("*END*"), state_(std::make_shared<State>()) {}
@@ -290,10 +288,24 @@ Path Path::real_path() const {
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-int delete_dir(const std::string &dir) noexcept { return ::rmdir(dir.c_str()); }
+stdx::expected<void, std::error_code> delete_dir(
+    const std::string &dir) noexcept {
+  if (::rmdir(dir.c_str()) != 0) {
+    return stdx::make_unexpected(
+        std::error_code(errno, std::generic_category()));
+  }
 
-int delete_file(const std::string &path) noexcept {
-  return ::unlink(path.c_str());
+  return {};
+}
+
+stdx::expected<void, std::error_code> delete_file(
+    const std::string &path) noexcept {
+  if (::unlink(path.c_str()) != 0) {
+    return stdx::make_unexpected(
+        std::error_code(errno, std::generic_category()));
+  }
+
+  return {};
 }
 
 std::string get_tmp_dir(const std::string &name) {

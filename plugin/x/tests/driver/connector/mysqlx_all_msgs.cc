@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2021, Oracle and/or its affiliates.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2.0,
@@ -97,6 +97,9 @@ static struct init_message_factory {
     server_message<Mysqlx::Sql::StmtExecuteOk>(
         Mysqlx::ServerMessages::SQL_STMT_EXECUTE_OK, "SQL_STMT_EXECUTE_OK",
         "Mysqlx.Sql.StmtExecuteOk");
+    server_message<Mysqlx::Connection::Compression>(
+        Mysqlx::ServerMessages::COMPRESSION, "COMPRESSION",
+        "Mysqlx.Connection.Compression");
 
     client_message<Mysqlx::Connection::CapabilitiesGet>(
         Mysqlx::ClientMessages::CON_CAPABILITIES_GET, "CON_CAPABILITIES_GET",
@@ -153,6 +156,7 @@ static struct init_message_factory {
     client_message<Mysqlx::Prepare::Deallocate>(
         Mysqlx::ClientMessages::PREPARE_DEALLOCATE, "PREPARE_DEALLOCATE",
         "Mysqlx.Prepare.Deallocate");
+
     client_message<Mysqlx::Cursor::Open>(Mysqlx::ClientMessages::CURSOR_OPEN,
                                          "CURSOR_OPEN", "Mysqlx.Cursor.Open");
     client_message<Mysqlx::Cursor::Fetch>(Mysqlx::ClientMessages::CURSOR_FETCH,
@@ -161,5 +165,8 @@ static struct init_message_factory {
     client_message<Mysqlx::Cursor::Close>(Mysqlx::ClientMessages::CURSOR_CLOSE,
                                           "CURSOR_CLOSE",
                                           "Mysqlx.Cursor.Close");
+    client_message<Mysqlx::Connection::Compression>(
+        Mysqlx::ClientMessages::COMPRESSION, "COMPRESSION",
+        "Mysqlx.Connection.Compression");
   }
 } init_message_factory;

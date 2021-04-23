@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -84,7 +84,7 @@ char *sql_strmake_with_convert(const char *str, size_t arg_length,
   size_t new_length = to_cs->mbmaxlen * arg_length;
   max_res_length--;  // Reserve place for end null
 
-  set_if_smaller(new_length, max_res_length);
+  new_length = std::min(new_length, max_res_length);
   if (!(pos = (char *)(*THR_MALLOC)->Alloc(new_length + 1)))
     return pos;  // Error
 

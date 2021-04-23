@@ -1,4 +1,4 @@
-/* Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -22,13 +22,14 @@
 
 #include "sql/sql_initialize.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#include "components/mysql_server/log_builtins_filter_imp.h"  // verbosity
 #include "m_ctype.h"
+
 #include "my_dir.h"
 #include "my_inttypes.h"
 #include "my_io.h"
@@ -36,21 +37,17 @@
 #include "my_rnd.h"
 #include "my_sys.h"
 #include "mysql/components/services/log_builtins.h"
-#include "mysql_com.h"
 #include "mysqld_error.h"
 #include "scripts/sql_commands_help_data.h"
 #include "scripts/sql_commands_system_data.h"
 #include "scripts/sql_commands_system_tables.h"
 #include "scripts/sql_commands_system_users.h"
 #include "scripts/sys_schema/sql_commands.h"
-#include "sql/current_thd.h"
-#include "sql/log.h"
 #include "sql/mysqld.h"
+#include "sql/server_component/log_builtins_filter_imp.h"  // verbosity
 #include "sql/sql_bootstrap.h"
-#include "sql/sql_class.h"
-#include "sql/sql_error.h"
 
-static const char *initialization_cmds[] = {"USE mysql;\n", NULL};
+static const char *initialization_cmds[] = {"USE mysql;\n", nullptr};
 
 #define INSERT_USER_CMD \
   "CREATE USER root@localhost IDENTIFIED BY '%s' PASSWORD EXPIRE;\n"
@@ -67,7 +64,7 @@ bool mysql_initialize_directory_freshly_created = false;
 static const char *initialization_data[] = {
     "FLUSH PRIVILEGES", insert_user_buffer,
     "GRANT ALL PRIVILEGES ON *.* TO root@localhost WITH GRANT OPTION;\n",
-    "GRANT PROXY ON ''@'' TO 'root'@'localhost' WITH GRANT OPTION;\n", NULL};
+    "GRANT PROXY ON ''@'' TO 'root'@'localhost' WITH GRANT OPTION;\n", nullptr};
 
 static const char **cmds[] = {initialization_cmds, mysql_system_tables,
                               initialization_data, mysql_system_data,
@@ -85,18 +82,9 @@ static const char *cmd_descs[] = {
     "Creating the sys schema",
     nullptr};
 
-static bool generate_password(char *password, int size) {
-#define UPCHARS "QWERTYUIOPASDFGHJKLZXCVBNM"
-#define LOWCHARS "qwertyuiopasdfghjklzxcvbnm"
-#define NUMCHARS "1234567890"
-#define SYMCHARS ",.-+*;:_!#%&/()=?><"
+bool generate_password(char *password, int size) {
 #define rnd_of(x) x[((int)(my_rnd_ssl(&failed) * 100)) % (sizeof(x) - 1)]
 
-  static const char g_allowed_pwd_chars[] = LOWCHARS SYMCHARS UPCHARS NUMCHARS;
-  static const char g_upper_case_chars[] = UPCHARS;
-  static const char g_lower_case_chars[] = LOWCHARS;
-  static const char g_numeric_chars[] = NUMCHARS;
-  static const char g_special_chars[] = SYMCHARS;
   bool failed = false;
   char *ptr = password;
   bool had_upper = false, had_lower = false, had_numeric = false,
@@ -182,15 +170,16 @@ bool Compiled_in_command_iterator::begin(void) {
 }
 
 int Compiled_in_command_iterator::next(std::string &query) {
-  while (cmds[m_cmds_ofs] != NULL && cmds[m_cmds_ofs][m_cmd_ofs] == NULL) {
+  while (cmds[m_cmds_ofs] != nullptr &&
+         cmds[m_cmds_ofs][m_cmd_ofs] == nullptr) {
     m_cmds_ofs++;
-    if (cmds[m_cmds_ofs] != NULL)
+    if (cmds[m_cmds_ofs] != nullptr)
       LogErr(INFORMATION_LEVEL, ER_SERVER_INIT_COMPILED_IN_COMMANDS,
              cmd_descs[m_cmds_ofs]);
     m_cmd_ofs = 0;
   }
 
-  if (cmds[m_cmds_ofs] == NULL) {
+  if (cmds[m_cmds_ofs] == nullptr) {
     return READ_BOOTSTRAP_EOF;
   }
 
@@ -206,7 +195,7 @@ void Compiled_in_command_iterator::report_error_details(
     so ::next() never returns errors.
     Hence, there should never be an error to print.
   */
-  DBUG_ASSERT(false);
+  assert(false);
   return;
 }
 
@@ -238,7 +227,7 @@ bool initialize_create_data_directory(const char *data_home) {
 #endif
       ;
 
-  if (NULL != (dir = my_dir(data_home, MYF(MY_DONT_SORT)))) {
+  if (nullptr != (dir = my_dir(data_home, MYF(MY_DONT_SORT)))) {
     bool no_files = true;
     char path[FN_REFLEN];
     File fd;
@@ -261,8 +250,8 @@ bool initialize_create_data_directory(const char *data_home) {
 
     LogErr(INFORMATION_LEVEL, ER_INIT_DATADIR_EXISTS_WONT_INITIALIZE);
 
-    if (NULL == fn_format(path, "is_writable", data_home, "",
-                          MY_UNPACK_FILENAME | MY_SAFE_PATH)) {
+    if (nullptr == fn_format(path, "is_writable", data_home, "",
+                             MY_UNPACK_FILENAME | MY_SAFE_PATH)) {
       LogErr(ERROR_LEVEL,
              ER_INIT_DATADIR_EXISTS_AND_PATH_TOO_LONG_WONT_INITIALIZE);
       return true; /* purecov: inspected */

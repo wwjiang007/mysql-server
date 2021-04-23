@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -59,7 +59,7 @@ extern "C" int test_if_data_home_dir(const char *dir);
 
 bool stmt_causes_implicit_commit(const THD *thd, uint mask);
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 extern void turn_parser_debug_on();
 #endif
 
@@ -68,6 +68,7 @@ bool parse_sql(THD *thd, Parser_state *parser_state,
 
 void free_items(Item *item);
 void cleanup_items(Item *item);
+void bind_fields(Item *first);
 
 Comp_creator *comp_eq_creator(bool invert);
 Comp_creator *comp_equal_creator(bool invert);
@@ -97,9 +98,8 @@ bool is_update_query(enum enum_sql_command command);
 bool is_explainable_query(enum enum_sql_command command);
 bool is_log_table_write_query(enum enum_sql_command command);
 bool alloc_query(THD *thd, const char *packet, size_t packet_length);
-void mysql_parse(THD *thd, Parser_state *parser_state);
+void dispatch_sql_command(THD *thd, Parser_state *parser_state);
 void mysql_reset_thd_for_next_command(THD *thd);
-bool create_select_for_variable(Parse_context *pc, const char *var_name);
 void create_table_set_open_action_and_adjust_tables(LEX *lex);
 int mysql_execute_command(THD *thd, bool first_level = false);
 bool do_command(THD *thd);
@@ -127,16 +127,10 @@ bool show_precheck(THD *thd, LEX *lex, bool lock);
 extern uint sql_command_flags[];
 extern const LEX_CSTRING command_name[];
 
-inline bool is_supported_parser_charset(const CHARSET_INFO *cs) {
-  return (cs->mbminlen == 1);
-}
-
 bool sqlcom_can_generate_row_events(enum enum_sql_command command);
 
 bool all_tables_not_ok(THD *thd, TABLE_LIST *tables);
 bool some_non_temp_table_to_be_updated(THD *thd, TABLE_LIST *tables);
-
-bool execute_show(THD *thd, TABLE_LIST *all_tables);
 
 // TODO: remove after refactoring of ALTER DATABASE:
 bool set_default_charset(HA_CREATE_INFO *create_info,
@@ -282,6 +276,11 @@ bool set_default_collation(HA_CREATE_INFO *create_info,
   --skip-grant-tables server option.
 */
 #define CF_REQUIRE_ACL_CACHE (1U << 20)
+
+/**
+  Identifies statements as SHOW commands using INFORMATION_SCHEMA system views.
+*/
+#define CF_SHOW_USES_SYSTEM_VIEW (1U << 21)
 
 /* Bits in server_command_flags */
 

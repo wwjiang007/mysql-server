@@ -1,4 +1,4 @@
-/* Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2019, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -31,7 +31,7 @@ DEFINE_BOOL_METHOD(send, (const char *tag, const unsigned char *data,
                           const size_t data_length)) {
   DBUG_TRACE;
 
-  if (NULL == local_member_info) return true;
+  if (nullptr == local_member_info) return true;
 
   Group_member_info::Group_member_status member_status =
       local_member_info->get_recovery_status();
@@ -81,7 +81,7 @@ static void *launch_message_service_handler_thread(void *arg) {
   DBUG_TRACE;
   Message_service_handler *handler = (Message_service_handler *)arg;
   handler->dispatcher();
-  return 0;
+  return nullptr;
 }
 
 Message_service_handler::Message_service_handler()
@@ -172,7 +172,7 @@ void Message_service_handler::dispatcher() {
 
     DBUG_EXECUTE_IF("group_replication_message_service_hold_messages", {
       const char act[] = "now wait_for signal.notification_continue";
-      DBUG_ASSERT(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+      assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
     });
 
     if (pop_failed || service_message == nullptr) break;
@@ -202,7 +202,7 @@ void Message_service_handler::dispatcher() {
   mysql_mutex_unlock(&m_message_service_run_lock);
 
   my_thread_end();
-  my_thread_exit(0);
+  my_thread_exit(nullptr);
 }
 
 int Message_service_handler::terminate() {

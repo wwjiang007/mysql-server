@@ -23,7 +23,7 @@ perl;
                pid-file slow-query-log-file
                language lc-messages-dir
                datadir slave-load-tmpdir tmpdir socket table-definition-cache table-open-cache
-               tls-version secure-file-priv/;
+               tls-version admin-tls-version secure-file-priv/;
 
   # Variables which we don't want to display in result file since
   # they depend on type of build
@@ -61,6 +61,7 @@ perl;
     # s/\b196608\b/262144/;
     # s/\b524288\b/262144/;
     # s/\b393216\b/262144/;
+    s/\b1146880\b/262144/;
     s/\b860160\b/262144/;
     s/\b573440\b/262144/;
     s/\b286720\b/262144/;

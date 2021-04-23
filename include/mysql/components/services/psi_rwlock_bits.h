@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2008, 2021, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License, version 2.0,
@@ -22,6 +22,8 @@
 
 #ifndef COMPONENTS_SERVICES_PSI_RWLOCK_BITS_H
 #define COMPONENTS_SERVICES_PSI_RWLOCK_BITS_H
+
+#include <mysql/components/services/bits/psi_bits.h>
 
 /**
   @file
@@ -65,7 +67,7 @@ typedef unsigned int PSI_rwlock_key;
   Interface for an instrumented rwlock.
   This is an opaque structure.
 */
-struct PSI_rwlock;
+struct PSI_rwlock : PSI_instr {};
 typedef struct PSI_rwlock PSI_rwlock;
 
 /**
@@ -198,11 +200,11 @@ struct PSI_rwlock_locker_state_v1 {
   /** Current thread. */
   struct PSI_thread *m_thread;
   /** Timer start. */
-  unsigned long long m_timer_start;
+  unsigned long long m_timer_start{0};
   /** Timer function. */
   unsigned long long (*m_timer)(void);
   /** Internal data. */
-  void *m_wait;
+  void *m_wait{nullptr};
 };
 typedef struct PSI_rwlock_locker_state_v1 PSI_rwlock_locker_state_v1;
 

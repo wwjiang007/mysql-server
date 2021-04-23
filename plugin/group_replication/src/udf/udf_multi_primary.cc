@@ -1,4 +1,4 @@
-/* Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2018, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -110,8 +110,9 @@ static bool group_replication_switch_to_multi_primary_mode_init(
     std::snprintf(message, MYSQL_ERRMSG_SIZE, unreachable_member_on_group_str);
     return true;
   }
+  if (Charset_service::set_return_value_charset(initid)) return true;
 
-  initid->maybe_null = 0;
+  initid->maybe_null = false;
   udf_counter.succeeded();
   return false;
 }

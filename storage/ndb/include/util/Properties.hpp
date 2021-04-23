@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -50,6 +50,9 @@ struct Property {
   Property(const char* name, Uint64 val);
   Property(const char* name, const char * value);
   Property(const char* name, const class Properties * value);
+  // We have no copy or move constructors so delete also assignment operator.
+  Property& operator=(const Property&) = delete;
+  Property& operator=(Property&&) = delete;
   ~Property();
 private:
   friend class Properties;
@@ -68,6 +71,7 @@ public:
   Properties(bool case_insensitive= false);
   Properties(const Properties &);
   Properties(const Property *, int len);
+  Properties& operator=(const Properties&);
   virtual ~Properties();
 
   /**

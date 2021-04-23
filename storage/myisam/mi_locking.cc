@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -109,7 +109,7 @@ int mi_lock_database(MI_INFO *info, int lock_type) {
             share->state.update_count = info->last_loop = ++info->this_loop;
             if (mi_state_info_write(share->kfile, &share->state, 1))
               error = my_errno();
-            share->changed = 0;
+            share->changed = false;
             if (myisam_flush) {
               if (share->file_map)
                 my_msync(info->dfile, share->file_map, share->mmaped_length,
@@ -118,7 +118,7 @@ int mi_lock_database(MI_INFO *info, int lock_type) {
               if (mysql_file_sync(share->kfile, MYF(0))) error = my_errno();
               if (mysql_file_sync(info->dfile, MYF(0))) error = my_errno();
             } else
-              share->not_flushed = 1;
+              share->not_flushed = true;
             if (error) {
               mi_print_error(info->s, HA_ERR_CRASHED);
               mi_mark_crashed(info);
@@ -167,7 +167,7 @@ int mi_lock_database(MI_INFO *info, int lock_type) {
             error = my_errno();
             break;
           }
-          if (mi_state_info_read_dsk(share->kfile, &share->state, 1)) {
+          if (mi_state_info_read_dsk(share->kfile, &share->state, true)) {
             error = my_errno();
             (void)my_lock(share->kfile, F_UNLCK, MYF(MY_SEEK_NOT_DONE));
             set_my_errno(error);
@@ -202,7 +202,7 @@ int mi_lock_database(MI_INFO *info, int lock_type) {
               break;
             }
             if (!share->r_locks) {
-              if (mi_state_info_read_dsk(share->kfile, &share->state, 1)) {
+              if (mi_state_info_read_dsk(share->kfile, &share->state, true)) {
                 error = my_errno();
                 (void)my_lock(share->kfile, F_UNLCK,
                               info->lock_wait | MY_SEEK_NOT_DONE);
@@ -265,7 +265,7 @@ void mi_get_status(void *param, int concurrent_insert) {
              ("key_file: %ld  data_file: %ld  concurrent_insert: %d",
               (long)info->s->state.state.key_file_length,
               (long)info->s->state.state.data_file_length, concurrent_insert));
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (info->state->key_file_length > info->s->state.state.key_file_length ||
       info->state->data_file_length > info->s->state.state.data_file_length)
     DBUG_PRINT("warning", ("old info:  key_file: %ld  data_file: %ld",
@@ -287,7 +287,7 @@ void mi_update_status(void *param) {
     (This is enforced by thr_multi_lock.c)
   */
   if (info->state == &info->save_state) {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     DBUG_PRINT("info", ("updating status:  key_file: %ld  data_file: %ld",
                         (long)info->state->key_file_length,
                         (long)info->state->data_file_length));
@@ -300,7 +300,7 @@ void mi_update_status(void *param) {
     info->s->state.state = *info->state;
   }
   info->state = &info->s->state.state;
-  info->append_insert_at_end = 0;
+  info->append_insert_at_end = false;
 
   /*
     We have to flush the write cache here as other threads may start
@@ -318,7 +318,7 @@ void mi_update_status(void *param) {
 void mi_restore_status(void *param) {
   MI_INFO *info = (MI_INFO *)param;
   info->state = &info->s->state.state;
-  info->append_insert_at_end = 0;
+  info->append_insert_at_end = false;
 }
 
 void mi_copy_status(void *to, void *from) {
@@ -373,7 +373,7 @@ int _mi_readinfo(MI_INFO *info, int lock_type, int check_keybuffer) {
     if (!share->tot_locks) {
       if (my_lock(share->kfile, lock_type, info->lock_wait | MY_SEEK_NOT_DONE))
         return 1;
-      if (mi_state_info_read_dsk(share->kfile, &share->state, 1)) {
+      if (mi_state_info_read_dsk(share->kfile, &share->state, true)) {
         int error = my_errno() ? my_errno() : -1;
         (void)my_lock(share->kfile, F_UNLCK, MYF(MY_SEEK_NOT_DONE));
         set_my_errno(error);
@@ -424,7 +424,7 @@ int _mi_writeinfo(MI_INFO *info, uint operation) {
       return 1;
     set_my_errno(olderror);
   } else if (operation)
-    share->changed = 1; /* Mark keyfile changed */
+    share->changed = true; /* Mark keyfile changed */
   return error;
 } /* _mi_writeinfo */
 
@@ -479,7 +479,7 @@ int _mi_mark_file_changed(MI_INFO *info) {
     share->state.changed |=
         (STATE_CHANGED | STATE_NOT_ANALYZED | STATE_NOT_OPTIMIZED_KEYS);
     if (!share->global_changed) {
-      share->global_changed = 1;
+      share->global_changed = true;
       share->state.open_count++;
     }
     if (!share->temporary) {
@@ -503,7 +503,7 @@ int _mi_decrement_open_count(MI_INFO *info) {
   int lock_error = 0, write_error = 0;
   if (share->global_changed) {
     uint old_lock = info->lock_type;
-    share->global_changed = 0;
+    share->global_changed = false;
     lock_error = mi_lock_database(info, F_WRLCK);
     /* Its not fatal even if we couldn't get the lock ! */
     if (share->state.open_count > 0) {

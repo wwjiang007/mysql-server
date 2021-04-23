@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -39,6 +39,11 @@ int runDropTable(NDBT_Context* ctx, NDBT_Step* step);
   result = NDBT_FAILED; \
   continue; } 
 
+#define CHECK2(b) if (!(b)) { \
+  g_err << "ERR: "<< step->getName() \
+         << " failed on line " << __LINE__ << endl; \
+  return NDBT_FAILED; }
+
 char tabname[1000];
 
 int
@@ -46,6 +51,9 @@ clearOldBackups(NDBT_Context* ctx, NDBT_Step* step)
 {
   strcpy(tabname, ctx->getTab()->getName());
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   backup.clearOldBackups();
   return NDBT_OK;
 }
@@ -188,6 +196,9 @@ int start_scan_no_close(NDBT_Context *ctx,
 int outOfScanRecordsInLDM(NDBT_Context *ctx, NDBT_Step *step)
 {
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   unsigned backupId = 0;
   int i;
   Ndb* pNdb;
@@ -292,6 +303,9 @@ int outOfScanRecordsInLDM(NDBT_Context *ctx, NDBT_Step *step)
 
 int runAbort(NDBT_Context* ctx, NDBT_Step* step){
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
 
   NdbRestarter restarter;
 
@@ -326,6 +340,9 @@ int runAbort(NDBT_Context* ctx, NDBT_Step* step){
 
 int runFail(NDBT_Context* ctx, NDBT_Step* step){
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
 
   NdbRestarter restarter;
 
@@ -363,6 +380,9 @@ int outOfLDMRecords(NDBT_Context *ctx, NDBT_Step *step)
   int res;
   int row = 0;
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   NdbRestarter restarter;
   unsigned backupId = 0;
   HugoOperations hugoOps(*ctx->getTab());
@@ -431,6 +451,9 @@ int outOfLDMRecords(NDBT_Context *ctx, NDBT_Step *step)
 
 int runBackupOne(NDBT_Context* ctx, NDBT_Step* step){
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   unsigned backupId = 0;
 
   if (ctx->getProperty("SnapshotStart") == 0)
@@ -459,6 +482,9 @@ int runBackupOne(NDBT_Context* ctx, NDBT_Step* step){
 
 int runBackupRandom(NDBT_Context* ctx, NDBT_Step* step){
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   unsigned backupId = rand() % (MAX_BACKUPS);
 
   if (backup.start(backupId) == -1){
@@ -473,6 +499,9 @@ int runBackupRandom(NDBT_Context* ctx, NDBT_Step* step){
 int
 runBackupLoop(NDBT_Context* ctx, NDBT_Step* step){
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   
   int loops = ctx->getNumLoops();
   while(!ctx->isTestStopped() && loops--)
@@ -541,6 +570,9 @@ int runDropTablesRestart(NDBT_Context* ctx, NDBT_Step* step){
 
 int runRestoreOne(NDBT_Context* ctx, NDBT_Step* step){
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   unsigned backupId = ctx->getProperty("BackupId"); 
 
   ndbout << "Restoring backup " << backupId << endl;
@@ -614,6 +646,9 @@ int createNdbApplyStatusIfMissing(NDBT_Context* ctx, NDBT_Step* step)
 
 int runRestoreEpoch(NDBT_Context* ctx, NDBT_Step* step){
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   unsigned backupId = ctx->getProperty("BackupId");
 
   ndbout << "Restoring epoch from backup " << backupId << endl;
@@ -753,6 +788,9 @@ int runBackupBank(NDBT_Context* ctx, NDBT_Step* step){
   int maxSleep = 30; // Max seconds between each backup
   Ndb* pNdb = GETNDB(step);
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   unsigned minBackupId = ~0;
   unsigned maxBackupId = 0;
   unsigned backupId = 0;
@@ -799,6 +837,9 @@ int runBackupBank(NDBT_Context* ctx, NDBT_Step* step){
 int runRestoreBankAndVerify(NDBT_Context* ctx, NDBT_Step* step){
   NdbRestarter restarter;
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   unsigned minBackupId = ctx->getProperty("MinBackupId");
   unsigned maxBackupId = ctx->getProperty("MaxBackupId");
   unsigned backupId = minBackupId;
@@ -874,6 +915,9 @@ int runRestoreBankAndVerify(NDBT_Context* ctx, NDBT_Step* step){
 }
 int runBackupUndoWaitStarted(NDBT_Context* ctx, NDBT_Step* step){
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   unsigned backupId = 0;
   int undoError = 10041;
   NdbRestarter restarter;
@@ -942,6 +986,9 @@ int runChangeUndoDataDuringBackup(NDBT_Context* ctx, NDBT_Step* step){
 
   // make sure backup have finish
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
 
   // start log event
   if(backup.startLogEvent() != 0) {
@@ -1026,6 +1073,9 @@ int
 runBug57650(NDBT_Context* ctx, NDBT_Step* step)
 {
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   NdbRestarter res;
 
   int node0 = res.getNode(NdbRestarter::NS_RANDOM);
@@ -1051,6 +1101,9 @@ int
 runBug14019036(NDBT_Context* ctx, NDBT_Step* step)
 {
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   NdbRestarter res;
   NdbMgmd mgmd;
 
@@ -1112,6 +1165,9 @@ int
 runBug16656639(NDBT_Context* ctx, NDBT_Step* step)
 {
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   NdbRestarter res;
 
   res.insertErrorInAllNodes(10032); 
@@ -1183,6 +1239,9 @@ int
 runBug17882305(NDBT_Context* ctx, NDBT_Step* step)
 {
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   NdbRestarter res;
   NdbDictionary::Table tab;
   NdbDictionary::Index idx;
@@ -1242,6 +1301,9 @@ int
 runBug19202654(NDBT_Context* ctx, NDBT_Step* step)
 {
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
   NdbDictionary::Dictionary* const dict = GETNDB(step)->getDictionary();
 
   g_err << "Creating 35 ndb tables." << endl;
@@ -1992,6 +2054,9 @@ runGCPStallDuringBackupStart(NDBT_Context* ctx, NDBT_Step* step)
   const Uint32 stepNo = step->getStepNo();
   NdbRestarter restarter;
   NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
 
   g_err << stepNo << " : runGCPStallDuringBackupStart" << endl;
 
@@ -2065,6 +2130,143 @@ runGCPStallDuringBackup(NDBT_Context* ctx, NDBT_Step* step)
   restarter.insertErrorInAllNodes(0);
   
   return NDBT_OK;
+}
+
+/**
+ * Check whether the backup statistics manipulated by the error
+ * insertion (by setting them with MAX_INT64) is seen in events
+ * from mgmd.
+ * The test starts a backup, then reads event streams for max 10
+ * seconds. If the 'Backup completed' event is not found, or it
+ * doesn't show the inserted MAX_INT64 values for ndb versions
+ * higher than 7.5.16, 7.6.12 or 8.0.17, the test will fail.
+ */
+int
+runCheckPrintout(NDBT_Context* ctx, NDBT_Step* step)
+{
+  NdbBackup backup;
+  backup.set_default_encryption_password(ctx->getProperty("BACKUP_PASSWORD",
+                                                          (char*)NULL),
+                                         -1);
+  NdbRestarter res;
+  NdbMgmd mgmd;
+
+  CHECK2(mgmd.connect());
+  CHECK2(mgmd.subscribe_to_events());
+
+  // Find out whether Backup-completed event contains 64-bit format
+  int minNdbVer = 0;
+  int maxNdbVer = 0;
+  CHECK2(res.getNodeTypeVersionRange(NDB_MGM_NODE_TYPE_NDB,
+                                     minNdbVer,
+                                     maxNdbVer) == 0);
+  uint major = ndbGetMajor(minNdbVer);
+  uint minor = ndbGetMinor(minNdbVer);
+  uint build = ndbGetBuild(minNdbVer);
+
+  g_err << "Ndb version : " << major << "." << minor
+        << "." << build << endl;
+
+  bool BU_stats_64bit =
+    ((major == 7 &&
+      ((minor == 5 && build > 16) ||
+       (minor == 6 && build > 12))) ||
+     (major == 8 && build > 17));
+
+  // Find out whether api can read 64-bit format
+  major = NDB_VERSION_MAJOR;
+  minor = NDB_VERSION_MINOR;
+  build= NDB_VERSION_BUILD;
+
+  g_err << "Ndb version : " << major << "." << minor
+        << "." << build << endl;
+
+  bool can_read_64bit =
+    ((major == 7 &&
+      ((minor == 5 && build > 16) ||
+       (minor == 6 && build > 12))) ||
+     (major == 8 && build > 17));
+
+  // In order to test api client can read 64bit,
+  // remove the comment from the following line
+  // can_read_64bit = false;
+
+  res.insertErrorInAllNodes(5073); // slow down backup
+
+  res.insertErrorInAllNodes(10042); // Set the backup statistics to MAX_INT64
+
+  unsigned backup_id = 0;
+  CHECK2(backup.start(backup_id, 1, 0, 1) == 0);
+  g_info << "Backup id " << backup_id << endl;
+
+  Uint64 maxWaitSeconds = 10;
+  Uint64 endTime = NdbTick_CurrentMillisecond() +
+    (maxWaitSeconds * 1000);
+
+  char buff[512];
+  int result = NDBT_FAILED;
+  while (NdbTick_CurrentMillisecond() < endTime)
+  {
+    CHECK2(!mgmd.get_next_event_line(buff,
+                                     sizeof(buff),
+                                     10 * 1000) == 0);
+    if (strstr(buff, "Backup") &&
+        strstr(buff, "completed"))
+    {
+      g_err << "Line read from event stream : " << endl << buff << endl;
+
+      int nd, bu, from, start, stop;
+      if (can_read_64bit)
+      {
+        // New api client that can read 64bit values
+        Uint64 records = 0;
+        Uint64 log_records = 0;
+        Uint64 data = 0;
+        Uint64 log_bytes = 0;
+        sscanf(buff, "Node %d: Backup %d started from node %d completed. StartGCP: %u StopGCP: %u #Records: %llu #LogRecords: %llu Data: %llu bytes Log: %llu bytes", &nd, &bu, &from, &start, &stop, &records, &log_records, &data, & log_bytes);
+        g_err << "Read values : #Data records "  << records
+              << " #Log records "  << log_records
+              << " Data " << data << " bytes, Log " << log_bytes
+              << " bytes." << endl << endl;
+
+        if (! BU_stats_64bit ||
+            (records == INT_MAX64 &&
+             log_records == INT_MAX64 &&
+             data == INT_MAX64 &&
+             log_bytes == INT_MAX64))
+        {
+          result = NDBT_OK;
+          break;
+        }
+      }
+      else
+      {
+        // Old api client that can read only 32 bit values
+        Uint32 records = 0;
+        Uint32 log_records = 0;
+        Uint32 data = 0;
+        Uint32 log_bytes = 0;
+        sscanf(buff, "Node %d: Backup %d started from node %d completed. StartGCP: %u StopGCP: %u #Records: %u #LogRecords: %u Data: %u bytes Log: %u bytes", &nd, &bu, &from, &start, &stop, &records, &log_records, &data, &log_bytes);
+
+        g_err << "Read 32 bit values : #Data records "  << records
+              << " #Log records "  << log_records
+              << " Data " << data << " bytes, Log " << log_bytes
+              << " bytes." << endl << endl;
+
+        result = NDBT_OK;
+        break;
+      }
+    }
+  }
+
+  res.insertErrorInAllNodes(0);
+
+  if (result != NDBT_OK)
+  {
+    g_err << "ERROR: Could not read 'Backup complete' event from mgmd "
+          << "within " << maxWaitSeconds << " seconds." << endl;
+  }
+  return result;
 }
 
 NDBT_TESTSUITE(testBackup);
@@ -2186,6 +2388,11 @@ TESTCASE("FailMaster",
 	 "Test that backup behaves during node failiure\n"){
   INITIALIZER(clearOldBackups);
   INITIALIZER(setMaster);
+  /*
+   * runLoadTable needed to have enough data in some fragments to trigger
+   * SCAN_NEXTREQ which is needed for error insert 10033.
+   */
+  INITIALIZER(runLoadTable);
   STEP(runFail);
 
 }
@@ -2193,6 +2400,7 @@ TESTCASE("FailMasterAsSlave",
 	 "Test that backup behaves during node failiure\n"){
   INITIALIZER(clearOldBackups);
   INITIALIZER(setMasterAsSlave);
+  INITIALIZER(runLoadTable); // See comment above for "FailMaster"
   STEP(runFail);
 
 }
@@ -2200,6 +2408,7 @@ TESTCASE("FailSlave",
 	 "Test that backup behaves during node failiure\n"){
   INITIALIZER(clearOldBackups);
   INITIALIZER(setSlave);
+  INITIALIZER(runLoadTable); // See comment above for "FailMaster"
   STEP(runFail);
 
 }
@@ -2350,6 +2559,17 @@ TESTCASE("ConsistencyUnderLoadSnapshotStartStallGCP",
   FINALIZER(runClearTable);
 }
 
+TESTCASE("CheckBackupCompletedPrintout",
+	 "Test that backup completed printouts handle 64 bit data\n"
+         "1. Load table\n"
+         "2. Backup\n"
+         "3. Print the backed up data and logs")
+{
+  INITIALIZER(clearOldBackups);
+  INITIALIZER(runLoadTable);
+  STEP(runCheckPrintout);
+  FINALIZER(runClearTable);
+}
 
 NDBT_TESTSUITE_END(testBackup)
 

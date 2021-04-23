@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -56,10 +56,10 @@ SELECT IF(processlist_id IS NULL,
              CONCAT(processlist_user, '@', processlist_host)
           ) user, 
        SUM(count_star) total,
-       sys.format_time(SUM(sum_timer_wait)) total_latency,
-       sys.format_time(MIN(min_timer_wait)) min_latency,
-       sys.format_time(AVG(avg_timer_wait)) avg_latency,
-       sys.format_time(MAX(max_timer_wait)) max_latency,
+       format_pico_time(SUM(sum_timer_wait)) total_latency,
+       format_pico_time(MIN(min_timer_wait)) min_latency,
+       format_pico_time(AVG(avg_timer_wait)) avg_latency,
+       format_pico_time(MAX(max_timer_wait)) max_latency,
        thread_id,
        processlist_id
   FROM performance_schema.events_waits_summary_by_thread_by_event_name 

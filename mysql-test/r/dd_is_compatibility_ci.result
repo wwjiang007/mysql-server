@@ -114,7 +114,7 @@ t1	CREATE TABLE `t1` (
   `CHARACTER_SET_NAME` varchar(64) CHARACTER SET utf8 NOT NULL,
   `DEFAULT_COLLATE_NAME` varchar(64) CHARACTER SET utf8 NOT NULL,
   `DESCRIPTION` varchar(2048) CHARACTER SET utf8 NOT NULL,
-  `MAXLEN` int(10) unsigned NOT NULL
+  `MAXLEN` int unsigned NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 DROP TABLE t1;
 # CREATE TABLE LIKE works for I_S tables that are not system view.
@@ -122,15 +122,15 @@ CREATE TABLE t1 LIKE information_schema.processlist;
 SHOW CREATE TABLE t1;
 Table	Create Table
 t1	CREATE TABLE `t1` (
-  `ID` bigint(21) unsigned NOT NULL DEFAULT '0',
+  `ID` bigint unsigned NOT NULL DEFAULT '0',
   `USER` varchar(32) NOT NULL DEFAULT '',
   `HOST` varchar(261) NOT NULL DEFAULT '',
   `DB` varchar(64) DEFAULT NULL,
   `COMMAND` varchar(16) NOT NULL DEFAULT '',
-  `TIME` int(7) NOT NULL DEFAULT '0',
+  `TIME` int NOT NULL DEFAULT '0',
   `STATE` varchar(64) DEFAULT NULL,
   `INFO` longtext
-) ENGINE=InnoDB DEFAULT CHARSET=utf8
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3
 DROP TABLE t1;
 #########################################################
 # Issue WL#6599/HLS/6h): I_S schema/table name,
@@ -153,13 +153,17 @@ WHERE table_schema LIKE 'information_schema'
   ORDER BY table_name COLLATE UTF8_GENERAL_CI;
 SELECT * FROM v1;
 table_name
+ADMINISTRABLE_ROLE_AUTHORIZATIONS
+APPLICABLE_ROLES
 CHARACTER_SETS
 CHECK_CONSTRAINTS
 COLLATIONS
 COLLATION_CHARACTER_SET_APPLICABILITY
 COLUMNS
+COLUMNS_EXTENSIONS
 COLUMN_PRIVILEGES
 COLUMN_STATISTICS
+ENABLED_ROLES
 ENGINES
 EVENTS
 FILES
@@ -173,8 +177,12 @@ PROCESSLIST
 PROFILING
 REFERENTIAL_CONSTRAINTS
 RESOURCE_GROUPS
+ROLE_COLUMN_GRANTS
+ROLE_ROUTINE_GRANTS
+ROLE_TABLE_GRANTS
 ROUTINES
 SCHEMATA
+SCHEMATA_EXTENSIONS
 SCHEMA_PRIVILEGES
 STATISTICS
 ST_GEOMETRY_COLUMNS
@@ -182,9 +190,13 @@ ST_SPATIAL_REFERENCE_SYSTEMS
 ST_UNITS_OF_MEASURE
 TABLES
 TABLESPACES
+TABLESPACES_EXTENSIONS
+TABLES_EXTENSIONS
 TABLE_CONSTRAINTS
+TABLE_CONSTRAINTS_EXTENSIONS
 TABLE_PRIVILEGES
 TRIGGERS
+USER_ATTRIBUTES
 USER_PRIVILEGES
 VIEWS
 VIEW_ROUTINE_USAGE
@@ -200,15 +212,15 @@ WHERE TABLE_NAME LIKE 'no_such_table';
 TABLE_NAME
 # 4. Names collate differently. On trunk, the queries below returns
 #    the same result set.
-SELECT count(*) = IF(@@lower_case_table_names = 0, 4, 9)
+SELECT count(*) = IF(@@lower_case_table_names = 0, 7, 12)
 FROM information_schema.tables
 WHERE table_name LIKE 'TAB%';
-count(*) = IF(@@lower_case_table_names = 0, 4, 9)
+count(*) = IF(@@lower_case_table_names = 0, 7, 12)
 1
-SELECT count(*) = IF(@@lower_case_table_names = 0, 5, 9)
+SELECT count(*) = IF(@@lower_case_table_names = 0, 5, 12)
 FROM information_schema.tables
 WHERE table_name LIKE 'tab%';
-count(*) = IF(@@lower_case_table_names = 0, 5, 9)
+count(*) = IF(@@lower_case_table_names = 0, 5, 12)
 1
 # This is because the collation of the column is different. On trunk,
 # it is utf8_general_ci. With the global DD, it is the collation of the

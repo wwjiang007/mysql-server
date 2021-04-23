@@ -4,6 +4,10 @@
 --source include/have_log_bin.inc
 --source include/have_myisam.inc
 
+# A fairly large segment has logic that relies on @@sql_big_selects,
+# which invokes SQL_BUFFER_RESULT, which isn't supported, and the loops go astray.
+--source include/not_hypergraph.inc
+
 --disable_warnings
 drop table if exists t1,t2;
 --enable_warnings
@@ -1849,3 +1853,14 @@ while($var_id <= $count_vars)
 #Cleanup
 SET @@sql_big_selects=@sql_big_selects_save;
 DROP TABLE all_vars;
+
+--echo # Bug#31372388: bool Item::evaluate(): assertion `false' failed
+
+--error ER_WRONG_VALUE_FOR_VAR
+SET character_set_client = @undefined_var;
+
+PREPARE s FROM "set character_set_client = ?";
+SET @x = NULL;
+--error ER_WRONG_VALUE_FOR_VAR
+EXECUTE s USING @x;
+DEALLOCATE PREPARE s;

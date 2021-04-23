@@ -929,6 +929,7 @@ CREATE TABLE `t4` (`task_id` smallint(6) NOT NULL default '0',`description` varc
 INSERT INTO `t4` (`task_id`, `description`) VALUES (1, 'Daily Check List'),(2, 'Weekly Status');
 --sorted_result
 select  dbid, name, (date_format(now() , '%Y-%m-%d') - INTERVAL how_often DAY) >= ifnull((SELECT date_format(max(create_date),'%Y-%m-%d') FROM t1 WHERE dbid = b.db_id AND taskid = a.taskgenid), '1950-01-01') from t3 a, t2 b, t4  WHERE dbid = - 1 AND primary_uid = '1' AND t4.task_id = taskid;
+--sorted_result
 SELECT dbid, name FROM t3 a, t2 b, t4 WHERE dbid = - 1 AND primary_uid = '1' AND ((date_format(now() , '%Y-%m-%d') - INTERVAL how_often DAY) >= ifnull((SELECT date_format(max(create_date),'%Y-%m-%d') FROM t1 WHERE dbid = b.db_id AND taskid = a.taskgenid), '1950-01-01')) AND t4.task_id = taskid;
 drop table t1,t2,t3,t4;
 
@@ -1090,6 +1091,7 @@ explain select * from t1 as tt where not exists (select id from t1 where id < 8 
 insert into t1 (id, text) values (1000, 'text1000'), (1001, 'text1001');
 create table t2 (id int not null, text varchar(20) not null default '', primary key (id));
 insert into t2 (id, text) values (1, 'text1'), (2, 'text2'), (3, 'text3'), (4, 'text4'), (5, 'text5'), (6, 'text6'), (7, 'text7'), (8, 'text8'), (9, 'text9'), (10, 'text10'), (11, 'text1'), (12, 'text2'), (13, 'text3'), (14, 'text4'), (15, 'text5'), (16, 'text6'), (17, 'text7'), (18, 'text8'), (19, 'text9'), (20, 'text10'),(21, 'text1'), (22, 'text2'), (23, 'text3'), (24, 'text4'), (25, 'text5'), (26, 'text6'), (27, 'text7'), (28, 'text8'), (29, 'text9'), (30, 'text10'), (31, 'text1'), (32, 'text2'), (33, 'text3'), (34, 'text4'), (35, 'text5'), (36, 'text6'), (37, 'text7'), (38, 'text8'), (39, 'text9'), (40, 'text10'), (41, 'text1'), (42, 'text2'), (43, 'text3'), (44, 'text4'), (45, 'text5'), (46, 'text6'), (47, 'text7'), (48, 'text8'), (49, 'text9'), (50, 'text10');
+--sorted_result
 select * from t1 a left join t2 b on (a.id=b.id or b.id is null) join t1 c on (if(isnull(b.id), 1000, b.id)=c.id);
 explain select * from t1 a left join t2 b on (a.id=b.id or b.id is null) join t1 c on (if(isnull(b.id), 1000, b.id)=c.id);
 drop table t1,t2;
@@ -1992,11 +1994,13 @@ SELECT a FROM t1 ORDER BY (SELECT c FROM t2 WHERE b > 2), a;
 --error ER_SUBQUERY_NO_1_ROW
 SELECT a FROM t1 ORDER BY (SELECT c FROM t2 WHERE b > 1), a;
 
+--sorted_result
 SELECT b, MAX(c) FROM t2 GROUP BY b, (SELECT c FROM t2 WHERE b > 2);
 --error ER_SUBQUERY_NO_1_ROW
 SELECT b, MAX(c) FROM t2 GROUP BY b, (SELECT c FROM t2 WHERE b > 1);
 
 
+--sorted_result
 SELECT a FROM t1 GROUP BY a
   HAVING IFNULL((SELECT b FROM t2 WHERE b > 2),
                 (SELECT c FROM t2 WHERE c=a AND b > 2 ORDER BY b)) > 3;
@@ -2005,6 +2009,7 @@ SELECT a FROM t1 GROUP BY a
   HAVING IFNULL((SELECT b FROM t2 WHERE b > 1),
                 (SELECT c FROM t2 WHERE c=a AND b > 2 ORDER BY b)) > 3;
 
+--sorted_result
 SELECT a FROM t1 GROUP BY a
   HAVING IFNULL((SELECT b FROM t2 WHERE b > 4),
                 (SELECT c FROM t2 WHERE c=a AND b > 2 ORDER BY b)) > 3;
@@ -2013,6 +2018,7 @@ SELECT a FROM t1 GROUP BY a
   HAVING IFNULL((SELECT b FROM t2 WHERE b > 4),
                 (SELECT c FROM t2 WHERE c=a AND b > 1 ORDER BY b)) > 3;
 
+--sorted_result
 SELECT a FROM t1
   ORDER BY IFNULL((SELECT b FROM t2 WHERE b > 2),
                   (SELECT c FROM t2 WHERE c=a AND b > 2 ORDER BY b));
@@ -2021,6 +2027,7 @@ SELECT a FROM t1
   ORDER BY IFNULL((SELECT b FROM t2 WHERE b > 1),
                   (SELECT c FROM t2 WHERE c=a AND b > 1 ORDER BY b));
 
+--sorted_result
 SELECT a FROM t1
   ORDER BY IFNULL((SELECT b FROM t2 WHERE b > 4),
                   (SELECT c FROM t2 WHERE c=a AND b > 2 ORDER BY b));
@@ -2055,6 +2062,7 @@ CREATE TABLE t1 (
 
 insert into t1 values (1, 1), (2, 2), (2, 3), (3, 4), (3, 5), (3, 6), (NULL, NULL);
 select * from t1;
+--sorted_result
 select min(a) from t1 group by grp;
 drop table t1;
 
@@ -2754,24 +2762,29 @@ INSERT INTO t1 VALUES (1,1,0,'a'), (1,2,0,'b'), (1,3,0,'c'), (1,4,0,'d'),
 (1,5,0,'e'), (2,1,0,'f'), (2,2,0,'g'), (2,3,0,'h'), (3,4,0,'i'), (3,3,0,'j'),
 (3,2,0,'k'), (3,1,0,'l'), (1,9,0,'m'), (1,0,10,'n'), (2,0,5,'o'), (3,0,7,'p');
 
+--sorted_result
 SELECT a, MAX(b),
   (SELECT t.c FROM t1 AS t WHERE t1.a=t.a AND t.b=MAX(t1.b + 0)) as test
   FROM t1 GROUP BY a;
+--sorted_result
 SELECT a, AVG(b),
   (SELECT t.c FROM t1 AS t WHERE t1.a=t.a AND t.b=AVG(t1.b)) AS test
   FROM t1 WHERE t1.d=0 GROUP BY a;
 
+--sorted_result
 SELECT tt.a,
  (SELECT (SELECT c FROM t1 as t WHERE t1.a=t.a AND t.d=MAX(t1.b + tt.a)
   LIMIT 1) FROM t1 WHERE t1.a=tt.a GROUP BY a LIMIT 1) as test
   FROM t1 as tt;
 
+--sorted_result
 SELECT tt.a,
  (SELECT (SELECT t.c FROM t1 AS t WHERE t1.a=t.a AND t.d=MAX(t1.b + tt.a)
   LIMIT 1)
   FROM t1 WHERE t1.a=tt.a GROUP BY a LIMIT 1) as test
   FROM t1 as tt GROUP BY tt.a;
 
+--sorted_result
 SELECT tt.a, MAX(
  (SELECT (SELECT t.c FROM t1 AS t WHERE t1.a=t.a AND t.d=MAX(t1.b + tt.a)
   LIMIT 1)
@@ -2788,9 +2801,12 @@ DROP TABLE t1;
 CREATE TABLE t1 (a int, b int);
 INSERT INTO t1 VALUES (2,22),(1,11),(2,22);
 
+--sorted_result
 SELECT a FROM t1 WHERE (SELECT COUNT(b) FROM DUAL) > 0 GROUP BY a;
+--sorted_result
 SELECT a FROM t1 WHERE (SELECT COUNT(b) FROM DUAL) > 1 GROUP BY a;
 
+--sorted_result
 SELECT a FROM t1 t0
   WHERE (SELECT COUNT(t0.b) FROM t1 t WHERE t.b>20) GROUP BY a;
 
@@ -2856,14 +2872,18 @@ INSERT INTO t1 VALUES
 CREATE TABLE t2 (id int NOT NULL, INDEX idx(id));
 INSERT INTO t2 VALUES (7), (5), (1), (3);
 
+--sorted_result
 SELECT id, st FROM t1
   WHERE st IN ('GA','FL') AND EXISTS(SELECT 1 FROM t2 WHERE t2.id=t1.id);
+--sorted_result
 SELECT id, st FROM t1
   WHERE st IN ('GA','FL') AND EXISTS(SELECT 1 FROM t2 WHERE t2.id=t1.id)
     GROUP BY id;
 
+--sorted_result
 SELECT id, st FROM t1
   WHERE st IN ('GA','FL') AND NOT EXISTS(SELECT 1 FROM t2 WHERE t2.id=t1.id);
+--sorted_result
 SELECT id, st FROM t1
   WHERE st IN ('GA','FL') AND NOT EXISTS(SELECT 1 FROM t2 WHERE t2.id=t1.id)
     GROUP BY id;
@@ -3297,6 +3317,7 @@ create table t3 (a int);
 insert into t3 values (NULL), (NULL);
 flush status;
 select a in (select max(ie) from t1 where oref=4 group by grp) from t3;
+--skip_if_hypergraph  # Depends on the query plan.
 show status like 'Handler_read_rnd_next';
 select ' ^ This must show 11' Z;
 
@@ -3329,6 +3350,7 @@ select oref, a, a in (select a from t1 where oref=t2.oref) z from t2;
 flush status;
 select oref, a from t2 where a in (select a from t1 where oref=t2.oref);
 # This will only show access to t2:
+--skip_if_hypergraph  # Depends on the query plan.
 show status like '%Handler_read_rnd_next';
 
 # Check that repeated NULL-scans are not cached (subq. is not correlated):
@@ -3337,6 +3359,7 @@ insert into t2 values (NULL, 0),(NULL, 0), (NULL, 0), (NULL, 0);
 
 flush status;
 select oref, a, a in (select a from t1 where oref=t2.oref) Z from t2;
+--skip_if_hypergraph  # Depends on the query plan.
 show status like '%Handler_read%';
 select 'No key lookups, seq reads: 29= 5 reads from t2 + 4 * 6 reads from t1.' Z;
 
@@ -4285,9 +4308,12 @@ drop table t_in;
 CREATE TABLE t1 (a INT, b INT);
 INSERT INTO t1 VALUES (2,22),(1,11),(2,22);
 
+--sorted_result
 SELECT a FROM t1 WHERE (SELECT COUNT(b) FROM DUAL) > 0 GROUP BY a;
+--sorted_result
 SELECT a FROM t1 WHERE (SELECT COUNT(b) FROM DUAL) > 1 GROUP BY a;
 
+--sorted_result
 SELECT a FROM t1 t0
   WHERE (SELECT COUNT(t0.b) FROM t1 t WHERE t.b>20) GROUP BY a;
 
@@ -4461,31 +4487,31 @@ INSERT INTO t1 VALUES (1),(2);
 
 CREATE TABLE t2( a INT, b INT );
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * 
 FROM (SELECT a INTO @var FROM t1 WHERE a = 2) t1a;
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * 
 FROM (SELECT a INTO OUTFILE 'file' FROM t1 WHERE a = 2) t1a;
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * 
 FROM (SELECT a INTO DUMPFILE 'file' FROM t1 WHERE a = 2) t1a;
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM ( 
   SELECT 1 a 
   UNION 
   SELECT a INTO @var FROM t1 WHERE a = 2 
 ) t1a;
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM ( 
   SELECT 1 a 
   UNION 
   SELECT a INTO OUTFILE 'file' FROM t1 WHERE a = 2 
 ) t1a;
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM ( 
   SELECT 1 a 
   UNION 
@@ -4512,25 +4538,25 @@ SELECT * FROM (
 SELECT * FROM ((SELECT 1 a) UNION SELECT 1 a);
 SELECT * FROM (SELECT 1 a UNION (SELECT 1 a)) alias;
 SELECT * FROM (SELECT 1 UNION SELECT 1) t1a;
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM ((SELECT 1 a INTO @a)) t1a;
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM ((SELECT 1 a INTO OUTFILE 'file' )) t1a;
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM ((SELECT 1 a INTO DUMPFILE 'file' )) t1a;
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM (SELECT 1 a UNION (SELECT 1 a INTO @a)) t1a;
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM (SELECT 1 a UNION (SELECT 1 a INTO DUMPFILE 'file' )) t1a;
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM (SELECT 1 a UNION (SELECT 1 a INTO OUTFILE 'file' )) t1a;
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM (SELECT 1 a UNION ((SELECT 1 a INTO @a))) t1a;
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM (SELECT 1 a UNION ((SELECT 1 a INTO DUMPFILE 'file' ))) t1a;
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM (SELECT 1 a UNION ((SELECT 1 a INTO OUTFILE 'file' ))) t1a;
 
 SELECT * FROM (SELECT 1 a ORDER BY a) t1a;
@@ -4580,41 +4606,41 @@ SELECT * FROM t1 WHERE a = ALL ( SELECT 1 );
 SELECT * FROM t1 WHERE a = ALL ( SELECT 1 UNION SELECT 1 );
 SELECT * FROM t1 WHERE a = ANY ( SELECT 3 UNION SELECT 1 );
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a = ANY ( SELECT 1 UNION SELECT 1 INTO @a);
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a = ANY ( SELECT 1 UNION SELECT 1 INTO OUTFILE 'file' );
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a = ANY ( SELECT 1 UNION SELECT 1 INTO DUMPFILE 'file' );
 
 SELECT * FROM t1 WHERE a = ( SELECT 1 );
 SELECT * FROM t1 WHERE a = ( SELECT 1 UNION SELECT 1 );
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a = ( SELECT 1 INTO @a);
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a = ( SELECT 1 INTO OUTFILE 'file' );
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a = ( SELECT 1 INTO DUMPFILE 'file' );
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a = ( SELECT 1 UNION SELECT 1 INTO @a);
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a = ( SELECT 1 UNION SELECT 1 INTO OUTFILE 'file' );
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a = ( SELECT 1 UNION SELECT 1 INTO DUMPFILE 'file' );
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT ( SELECT 1 INTO @v );
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT ( SELECT 1 INTO OUTFILE 'file' );
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT ( SELECT 1 INTO DUMPFILE 'file' );
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT ( SELECT 1 UNION SELECT 1 INTO @v );
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT ( SELECT 1 UNION SELECT 1 INTO OUTFILE 'file' );
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT ( SELECT 1 UNION SELECT 1 INTO DUMPFILE 'file' );
 
 # Make sure context is popped when we leave the nested select
@@ -4626,31 +4652,31 @@ SELECT * FROM t2 WHERE (a, b) IN (SELECT a, b FROM t2);
 
 # Make sure the parser does not allow nested UNIONs anywhere
 
---error ER_PARSE_ERROR
+--error ER_NOT_SUPPORTED_YET
 SELECT 1 UNION ( SELECT 1 UNION SELECT 1 );
 ( SELECT 1 UNION SELECT 1 ) UNION SELECT 1;
 
---error ER_PARSE_ERROR
+--error ER_NOT_SUPPORTED_YET
 SELECT ( SELECT 1 UNION ( SELECT 1 UNION SELECT 1 ) );
 --error ER_PARSE_ERROR
 SELECT ( ( SELECT 1 UNION SELECT 1 ) UNION SELECT 1;
 SELECT ( SELECT 1 UNION SELECT 1 UNION SELECT 1 );
 SELECT ((SELECT 1 UNION SELECT 1 UNION SELECT 1));
 
---error ER_PARSE_ERROR
+--error ER_DERIVED_MUST_HAVE_ALIAS
 SELECT * FROM ( SELECT 1 UNION ( SELECT 1 UNION SELECT 1 ) );
 --error ER_DERIVED_MUST_HAVE_ALIAS
 SELECT * FROM ( ( SELECT 1 UNION SELECT 1 ) UNION SELECT 1 );
 SELECT * FROM ( ( SELECT 1 UNION SELECT 1 ) UNION SELECT 1 ) a;
 SELECT * FROM ( SELECT 1 UNION SELECT 1 UNION SELECT 1 ) a;
 
---error ER_PARSE_ERROR
+--error ER_NOT_SUPPORTED_YET
 SELECT * FROM t1 WHERE a =     ( SELECT 1 UNION ( SELECT 1 UNION SELECT 1 ) );
---error ER_PARSE_ERROR
+--error ER_NOT_SUPPORTED_YET
 SELECT * FROM t1 WHERE a = ALL ( SELECT 1 UNION ( SELECT 1 UNION SELECT 1 ) );
---error ER_PARSE_ERROR
+--error ER_NOT_SUPPORTED_YET
 SELECT * FROM t1 WHERE a = ANY ( SELECT 1 UNION ( SELECT 1 UNION SELECT 1 ) );
---error ER_PARSE_ERROR
+--error ER_NOT_SUPPORTED_YET
 SELECT * FROM t1 WHERE a IN    ( SELECT 1 UNION ( SELECT 1 UNION SELECT 1 ) );
 
 SELECT * FROM t1 WHERE a =     ( ( SELECT 1 UNION SELECT 1 )  UNION SELECT 1 );
@@ -4663,17 +4689,17 @@ SELECT * FROM t1 WHERE a = ALL ( SELECT 1 UNION SELECT 1 UNION SELECT 1 );
 SELECT * FROM t1 WHERE a = ANY ( SELECT 1 UNION SELECT 1 UNION SELECT 1 );
 SELECT * FROM t1 WHERE a IN    ( SELECT 1 UNION SELECT 1 UNION SELECT 1 );
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE EXISTS ( SELECT 1 UNION SELECT 1 INTO @v );
 SELECT EXISTS(SELECT 1+1);
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT EXISTS(SELECT 1+1 INTO @test);
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a IN ( SELECT 1 UNION SELECT 1 INTO @v );
 
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE EXISTS ( SELECT 1 INTO @v );
---error ER_PARSE_ERROR
+--error ER_MISPLACED_INTO
 SELECT * FROM t1 WHERE a IN ( SELECT 1 INTO @v );
 
 DROP TABLE t1, t2;
@@ -4812,6 +4838,7 @@ WHERE (i1, i2)
 --echo # Check that the subquery only has to be evaluated once 
 --echo # for all-NULL values even though there are two (NULL,NULL) records
 --echo # Baseline:
+--skip_if_hypergraph  # Depends on the query plan.
 SHOW STATUS LIKE '%Handler_read_rnd_next';
 
 --echo 
@@ -4827,6 +4854,7 @@ WHERE (i1, i2)
 --echo 
 --echo # Handler_read_rnd_next should be one more than baseline 
 --echo # (read record from t1, but do not read from t2)
+--skip_if_hypergraph  # Depends on the query plan.
 SHOW STATUS LIKE '%Handler_read_rnd_next';
 
 
@@ -5009,6 +5037,7 @@ WHERE (i1, i2)
 --echo # Check that the subquery only has to be evaluated once 
 --echo # for all-NULL values even though there are two (NULL,NULL) records
 --echo # Baseline:
+--skip_if_hypergraph  # Depends on the query plan.
 SHOW STATUS LIKE '%Handler_read_rnd_next';
 
 --echo 
@@ -5024,6 +5053,7 @@ WHERE (i1, i2)
 --echo 
 --echo # Handler_read_rnd_next should be one more than baseline 
 --echo # (read record from t1, but do not read from t2)
+--skip_if_hypergraph  # Depends on the query plan.
 SHOW STATUS LIKE '%Handler_read_rnd_next';
 DROP TABLE t1,t2;
 
@@ -5564,6 +5594,7 @@ SELECT DISTINCT f1_key
 FROM t2 
 WHERE f1_key != table2.f1_key AND f1_key >= table1.f1 );
 
+--sorted_result
 eval $query;
 eval explain $query;
 
@@ -5894,6 +5925,7 @@ let $query=select * from t1 where a in (select a from t2 where b=3);
 eval explain $query;
 flush status;
 eval $query;
+--skip_if_hypergraph  # Depends on the query plan.
 show status like "handler_read%";
 drop table t1,t2;
 

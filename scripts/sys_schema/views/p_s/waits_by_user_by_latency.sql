@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -55,9 +55,9 @@ VIEW waits_by_user_by_latency (
 SELECT IF(user IS NULL, 'background', user) AS user,
        event_name AS event,
        count_star AS total,
-       sys.format_time(sum_timer_wait) AS total_latency,
-       sys.format_time(avg_timer_wait) AS avg_latency,
-       sys.format_time(max_timer_wait) AS max_latency
+       format_pico_time(sum_timer_wait) AS total_latency,
+       format_pico_time(avg_timer_wait) AS avg_latency,
+       format_pico_time(max_timer_wait) AS max_latency
   FROM performance_schema.events_waits_summary_by_user_by_event_name
  WHERE event_name != 'idle'
    AND user IS NOT NULL

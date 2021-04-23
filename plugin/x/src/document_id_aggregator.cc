@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2021, Oracle and/or its affiliates.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2.0,
@@ -35,7 +35,7 @@ std::string Document_id_aggregator::generate_id(const Variables &vars) {
 }
 
 ngs::Error_code Document_id_aggregator::configue(
-    ngs::Sql_session_interface *data_context) {
+    iface::Sql_session *data_context) {
   Sql_data_result result(data_context);
   try {
     result.query(

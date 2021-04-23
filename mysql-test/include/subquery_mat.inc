@@ -139,10 +139,14 @@ select b1, c2 from t2, t3 where b2 > c2;
 create algorithm=temptable view v2m as
 select b1, c2 from t2, t3 group by b2, c2;
 
+--sorted_result
 select * from v1 where (c2, b1) in (select c2, b1 from v2 where b1 is not null);
+--sorted_result
 select * from v1 where (c2, b1) in (select distinct c2, b1 from v2 where b1 is not null);
 
+--sorted_result
 select * from v1m where (c2, b1) in (select c2, b1 from v2m where b1 is not null);
+--sorted_result
 select * from v1m where (c2, b1) in (select distinct c2, b1 from v2m where b1 is not null);
 
 --source include/restore_sql_mode_after_turn_off_only_full_group_by.inc
@@ -298,6 +302,7 @@ select * from t1 group by (select col from columns limit 1);
 
 explain
 select * from t1 group by (a1 in (select col from columns));
+--skip_if_hypergraph  # Different warnings.
 select * from t1 group by (a1 in (select col from columns));
 
 --source include/restore_sql_mode_after_turn_off_only_full_group_by.inc
@@ -494,6 +499,7 @@ ALTER TABLE t1 ADD INDEX(a);
 --let $query=SELECT * FROM t1 WHERE (a,b) = ANY (SELECT a, max(b) FROM t1 GROUP BY a)
 FLUSH STATUS;
 --eval $query
+--skip_if_hypergraph  # Depends on the query plan.
 SHOW SESSION STATUS LIKE 'Sort_scan%';
 --eval EXPLAIN $query
 
@@ -940,6 +946,7 @@ SELECT * FROM t1 WHERE a IN (SELECT * FROM t2);
 CREATE TABLE t3 SELECT * FROM t1 WHERE a IN (SELECT * FROM t2);
 SELECT * FROM t3;
 # prove that subquery materialization was used:
+--skip_if_hypergraph  # Does not support subquery materialization yet.
 SHOW STATUS LIKE "CREATED_TMP_TABLES";
 DROP TABLE t1,t2,t3;
 
@@ -1094,6 +1101,7 @@ where (t2.a,t2.a) in (select a,a from t2 as t3);
 --echo then rejected (due to outer join), and in that case, the
 --echo fallback is IN->EXISTS, subq-materialization is not tried...
 eval explain $query;
+--sorted_result
 eval $query;
 
 --echo
@@ -1159,24 +1167,28 @@ having (z in (select * from t2)) is null;
 --echo no NULLs.
 
 eval explain $query;
+--sorted_result
 eval $query;
 
 --echo one outer NULL
 insert into t1 values(null,null);
 
 eval explain $query;
+--sorted_result
 eval $query;
 
 --echo one outer NULL and one inner NULL
 insert into t2 values(null);
 
 eval explain $query;
+--sorted_result
 eval $query;
 
 --echo one inner NULL
 delete from t1 where a is null;
 
 eval explain $query;
+--sorted_result
 eval $query;
 
 drop table t1,t2;
@@ -1199,6 +1211,7 @@ eval $query;
 --echo There will be one look-up in the temporary table for each row
 --echo of t1 (12), plus one additional look-up to check whether table
 --echo contains a NULL value.
+--skip_if_hypergraph  # Depends on the query plan.
 show status like "handler_read_key";
 
 drop table t1,t2;
@@ -1237,7 +1250,7 @@ INSERT INTO t2 SELECT * FROM t2 WHERE a IN (SELECT * FROM t2 WHERE a <> 2);
 --sorted_result
 SELECT * FROM t2;
 
---echo # Not used for single-table UPDATE, DELETE:
+--echo # Used for single-table UPDATE, DELETE, by converting to multi-table
 # a) all different tables
 EXPLAIN SELECT * FROM t2 WHERE a IN (SELECT * FROM t1);
 EXPLAIN UPDATE t2 SET a=a-1 WHERE a IN (SELECT * FROM t1);
@@ -1296,6 +1309,7 @@ let $query=select * from t1 where a in (select a from t2);
 eval explain $query;
 flush status;
 eval $query;
+--skip_if_hypergraph  # Depends on the query plan.
 show status like "handler_read%";
 drop table t1,t2;
 
@@ -1355,6 +1369,7 @@ WHERE
 eval EXPLAIN $query;
 FLUSH STATUS;
 eval $query;
+--skip_if_hypergraph  # Depends on the query plan.
 SHOW STATUS LIKE "HANDLER_READ%";
 
 DROP TABLE t1,t2,t3,t4;

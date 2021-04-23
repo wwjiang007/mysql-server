@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2009, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -48,15 +48,18 @@
 #include <list>
 #include <map>
 #include <new>
+#include <queue>
+#include <sstream>
 #include <string>
 
 #include "dur_prop.h"
+#include "libbinlogevents/include/compression/base.h"
+#include "libbinlogevents/include/compression/iterator.h"
 #include "libbinlogevents/include/control_events.h"
 #include "libbinlogevents/include/debug_vars.h"
 #include "libbinlogevents/include/rows_event.h"
 #include "libbinlogevents/include/statement_events.h"
 #include "libbinlogevents/include/table_id.h"
-#include "m_ctype.h"
 #include "mf_wcomp.h"    // wild_one, wild_many
 #include "mutex_lock.h"  // Mutex_lock
 #include "my_base.h"
@@ -76,6 +79,8 @@
 #include "mysqld_error.h"
 #include "partition_info.h"
 #include "prealloced_array.h"
+#include "sql/binlog/global.h"
+#include "sql/binlog/tools/iterators.h"
 #include "sql/binlog_ostream.h"
 #include "sql/binlog_reader.h"
 #include "sql/create_field.h"
@@ -178,14 +183,10 @@ static int binlog_prepare(handlerton *hton, THD *thd, bool all);
 static xa_status_code binlog_xa_commit(handlerton *hton, XID *xid);
 static xa_status_code binlog_xa_rollback(handlerton *hton, XID *xid);
 static void exec_binlog_error_action_abort(const char *err_string);
-static int binlog_recover(Binlog_file_reader *binlog_file_reader,
-                          my_off_t *valid_pos);
+static bool binlog_recover(Binlog_file_reader *binlog_file_reader,
+                           my_off_t *valid_pos);
 static void binlog_prepare_row_images(const THD *thd, TABLE *table);
-
-static inline bool has_commit_order_manager(THD *thd) {
-  return is_mts_worker(thd) &&
-         thd->rli_slave->get_commit_order_manager() != nullptr;
-}
+static bool is_loggable_xa_prepare(THD *thd);
 
 bool normalize_binlog_name(char *to, const char *from, bool is_relay_log) {
   DBUG_TRACE;
@@ -194,7 +195,7 @@ bool normalize_binlog_name(char *to, const char *from, bool is_relay_log) {
   char *ptr = const_cast<char *>(from);
   char *opt_name = is_relay_log ? opt_relay_logname : opt_bin_logname;
 
-  DBUG_ASSERT(from);
+  assert(from);
 
   /* opt_name is not null and not empty and from is a relative path */
   if (opt_name && opt_name[0] && from && !test_if_hard_path(from)) {
@@ -219,7 +220,7 @@ bool normalize_binlog_name(char *to, const char *from, bool is_relay_log) {
     }
   }
 
-  DBUG_ASSERT(ptr);
+  assert(ptr);
   if (ptr) {
     size_t length = strlen(ptr);
 
@@ -271,16 +272,16 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
 #endif
       const char *binlog_name, myf flags, bool existing = false) {
     DBUG_TRACE;
-    DBUG_ASSERT(m_pipeline_head == nullptr);
+    assert(m_pipeline_head == nullptr);
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     {
 #ifndef HAVE_PSI_INTERFACE
       PSI_file_key log_file_key = PSI_NOT_INSTRUMENTED;
 #endif
       MY_STAT info;
       if (!mysql_file_stat(log_file_key, binlog_name, &info, MYF(0))) {
-        DBUG_ASSERT(existing == !(my_errno() == ENOENT));
+        assert(existing == !(my_errno() == ENOENT));
         set_my_errno(0);
       }
     }
@@ -331,8 +332,7 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
     if (istream.read(magic, BINLOG_MAGIC_SIZE) != BINLOG_MAGIC_SIZE)
       return nullptr;
 
-    DBUG_ASSERT(Rpl_encryption_header::ENCRYPTION_MAGIC_SIZE ==
-                BINLOG_MAGIC_SIZE);
+    assert(Rpl_encryption_header::ENCRYPTION_MAGIC_SIZE == BINLOG_MAGIC_SIZE);
     /* Identify the file type by the magic to get the encryption header */
     if (memcmp(magic, Rpl_encryption_header::ENCRYPTION_MAGIC,
                BINLOG_MAGIC_SIZE) == 0) {
@@ -381,7 +381,7 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
      @retval true  Error
   */
   bool write(const unsigned char *buffer, my_off_t length) override {
-    DBUG_ASSERT(m_pipeline_head != nullptr);
+    assert(m_pipeline_head != nullptr);
 
     if (m_pipeline_head->write(buffer, length)) return true;
 
@@ -401,7 +401,7 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
      @retval true  Error
   */
   bool update(const unsigned char *buffer, my_off_t length, my_off_t offset) {
-    DBUG_ASSERT(m_pipeline_head != nullptr);
+    assert(m_pipeline_head != nullptr);
     return m_pipeline_head->seek(offset) ||
            m_pipeline_head->write(buffer, length);
   }
@@ -415,7 +415,7 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
      @retval true  Error
   */
   bool truncate(my_off_t offset) {
-    DBUG_ASSERT(m_pipeline_head != nullptr);
+    assert(m_pipeline_head != nullptr);
 
     if (m_pipeline_head->truncate(offset)) return true;
     m_position = offset;
@@ -521,7 +521,7 @@ class Thd_backup_and_restore {
         m_new_thd(new_thd),
         m_new_thd_old_real_id(new_thd->real_id),
         m_new_thd_old_thread_stack(new_thd->thread_stack) {
-    DBUG_ASSERT(m_backup_thd != nullptr && m_new_thd != nullptr);
+    assert(m_backup_thd != nullptr && m_new_thd != nullptr);
     // Reset the state of the current thd.
     m_backup_thd->restore_globals();
 
@@ -580,9 +580,20 @@ class binlog_cache_data {
   int flush(THD *thd, my_off_t *bytes, bool *wrote_xid);
   int write_event(Log_event *event);
   size_t get_event_counter() { return event_counter; }
+  size_t get_compressed_size() { return m_compressed_size; }
+  size_t get_decompressed_size() { return m_decompressed_size; }
+  binary_log::transaction::compression::type get_compression_type() {
+    return m_compression_type;
+  }
+
+  void set_compressed_size(size_t s) { m_compressed_size = s; }
+  void set_decompressed_size(size_t s) { m_decompressed_size = s; }
+  void set_compression_type(binary_log::transaction::compression::type t) {
+    m_compression_type = t;
+  }
 
   virtual ~binlog_cache_data() {
-    DBUG_ASSERT(is_binlog_empty());
+    assert(is_binlog_empty());
     m_cache.close();
   }
 
@@ -605,7 +616,7 @@ class binlog_cache_data {
 
   bool has_xid() const {
     // There should only be an XID event if we are transactional
-    DBUG_ASSERT((flags.transactional && flags.with_xid) || !flags.with_xid);
+    assert((flags.transactional && flags.with_xid) || !flags.with_xid);
     return flags.with_xid;
   }
 
@@ -639,7 +650,7 @@ class binlog_cache_data {
         flags.with_content = it->second.with_content;
         event_counter = it->second.event_counter;
       } else
-        DBUG_ASSERT(it == cache_state_map.end());
+        assert(it == cache_state_map.end());
     }
     // Rolling back to pos == 0 means cleaning up the cache.
     else {
@@ -683,7 +694,10 @@ class binlog_cache_data {
     */
     cache_state_map.clear();
     event_counter = 0;
-    DBUG_ASSERT(is_binlog_empty());
+    m_compressed_size = 0;
+    m_decompressed_size = 0;
+    m_compression_type = binary_log::transaction::compression::NONE;
+    assert(is_binlog_empty());
   }
 
   /**
@@ -725,12 +739,11 @@ class binlog_cache_data {
         flags.with_end &&     // Has transaction end statement
         !flags.with_content)  // Has no other content than START/END
     {
-      DBUG_ASSERT(event_counter == 2);  // Two events in the cache only
-      DBUG_ASSERT(!flags.with_sbr);     // No statements changing content
-      DBUG_ASSERT(!flags.with_rbr);     // No rows changing content
-      DBUG_ASSERT(!flags.immediate);    // Not a DDL
-      DBUG_ASSERT(
-          !flags.with_xid);  // Not a XID trx and not an atomic DDL Query
+      assert(event_counter == 2);  // Two events in the cache only
+      assert(!flags.with_sbr);     // No statements changing content
+      assert(!flags.with_rbr);     // No rows changing content
+      assert(!flags.immediate);    // Not a DDL
+      assert(!flags.with_xid);     // Not a XID trx and not an atomic DDL Query
       return true;
     }
     return false;
@@ -771,6 +784,11 @@ class binlog_cache_data {
     bytes), we need to keep track of how many events are in the binlog cache.
   */
   size_t event_counter = 0;
+
+  size_t m_compressed_size = 0;
+  size_t m_decompressed_size = 0;
+  binary_log::transaction::compression::type m_compression_type =
+      binary_log::transaction::compression::type::NONE;
   /*
     It truncates the cache to a certain position. This includes deleting the
     pending event. It corresponds to rollback statement or rollback to
@@ -867,6 +885,8 @@ class binlog_cache_data {
     bool with_content : 1;
   } flags;
 
+  virtual bool compress(THD *);
+
  private:
   /*
     Storage for byte data. This binlog_cache_data will serialize
@@ -940,7 +960,7 @@ class binlog_trx_cache_data : public binlog_cache_data {
         m_cannot_rollback(false),
         before_stmt_pos(MY_OFF_T_UNDEF) {}
 
-  void reset() {
+  void reset() override {
     DBUG_TRACE;
     DBUG_PRINT("enter", ("before_stmt_pos: %llu", (ulonglong)before_stmt_pos));
     m_cannot_rollback = false;
@@ -1052,7 +1072,7 @@ class binlog_cache_mngr {
     if (!trx_cache.is_binlog_empty()) trx_cache.reset();
   }
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   bool dbug_any_finalized() const {
     return stmt_cache.is_finalized() || trx_cache.is_finalized();
   }
@@ -1072,11 +1092,12 @@ class binlog_cache_mngr {
   int flush(THD *thd, my_off_t *bytes_written, bool *wrote_xid) {
     my_off_t stmt_bytes = 0;
     my_off_t trx_bytes = 0;
-    DBUG_ASSERT(stmt_cache.has_xid() == 0);
+    assert(stmt_cache.has_xid() == 0);
     int error = stmt_cache.flush(thd, &stmt_bytes, wrote_xid);
     if (error) return error;
     DEBUG_SYNC(thd, "after_flush_stm_cache_before_flush_trx_cache");
-    if (int error = trx_cache.flush(thd, &trx_bytes, wrote_xid)) return error;
+    error = trx_cache.flush(thd, &trx_bytes, wrote_xid);
+    if (error) return error;
     *bytes_written = stmt_bytes + trx_bytes;
     return 0;
   }
@@ -1115,7 +1136,7 @@ static binlog_cache_mngr *thd_get_cache_mngr(const THD *thd) {
     If opt_bin_log is not set, binlog_hton->slot == -1 and hence
     thd_get_ha_data(thd, hton) segfaults.
   */
-  DBUG_ASSERT(opt_bin_log);
+  assert(opt_bin_log);
   return (binlog_cache_mngr *)thd_get_ha_data(thd, binlog_hton);
 }
 
@@ -1183,9 +1204,9 @@ bool binlog_enabled() {
 
 static void binlog_trans_log_savepos(THD *thd, my_off_t *pos) {
   DBUG_TRACE;
-  DBUG_ASSERT(pos != nullptr);
+  assert(pos != nullptr);
   binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
-  DBUG_ASSERT(mysql_bin_log.is_open());
+  assert(mysql_bin_log.is_open());
   *pos = cache_mngr->trx_cache.get_byte_position();
   DBUG_PRINT("return", ("position: %lu", (ulong)*pos));
   cache_mngr->trx_cache.cache_state_checkpoint(*pos);
@@ -1257,7 +1278,7 @@ class Binlog_event_writer : public Basic_ostream {
     if (have_checksum) checksum = my_checksum(checksum, header, header_len);
   }
 
-  bool write(const unsigned char *buffer, my_off_t length) {
+  bool write(const unsigned char *buffer, my_off_t length) override {
     DBUG_TRACE;
 
     while (length > 0) {
@@ -1347,7 +1368,7 @@ static int binlog_deinit(void *) {
 static int binlog_close_connection(handlerton *, THD *thd) {
   DBUG_TRACE;
   binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
-  DBUG_ASSERT(cache_mngr->is_binlog_empty());
+  assert(cache_mngr->is_binlog_empty());
   DBUG_PRINT("debug", ("Set ha_data slot %d to 0x%llx", binlog_hton->slot,
                        (ulonglong) nullptr));
   thd_set_ha_data(thd, binlog_hton, nullptr);
@@ -1403,7 +1424,7 @@ bool MYSQL_BIN_LOG::assign_automatic_gtids_to_flush_group(THD *first_seen) {
   rpl_sidno locked_sidno = 0;
 
   for (THD *head = first_seen; head; head = head->next_to_commit) {
-    DBUG_ASSERT(head->variables.gtid_next.type != UNDEFINED_GTID);
+    assert(head->variables.gtid_next.type != UNDEFINED_GTID);
 
     /* Generate GTID */
     if (head->variables.gtid_next.type == AUTOMATIC_GTID) {
@@ -1416,7 +1437,7 @@ bool MYSQL_BIN_LOG::assign_automatic_gtids_to_flush_group(THD *first_seen) {
               head->get_transaction()->get_rpl_transaction_ctx()->get_sidno(),
               head->get_transaction()->get_rpl_transaction_ctx()->get_gno(),
               &locked_sidno) != RETURN_STATUS_OK) {
-        head->commit_error = THD::CE_FLUSH_ERROR;
+        head->commit_error = THD::CE_FLUSH_GNO_EXHAUSTED_ERROR;
         error = true;
       }
     } else {
@@ -1425,10 +1446,10 @@ bool MYSQL_BIN_LOG::assign_automatic_gtids_to_flush_group(THD *first_seen) {
                   "thd->owned_gtid.sidno=%d",
                   head->variables.gtid_next.type, head->owned_gtid.sidno));
       if (head->variables.gtid_next.type == ASSIGNED_GTID)
-        DBUG_ASSERT(head->owned_gtid.sidno > 0);
+        assert(head->owned_gtid.sidno > 0);
       else {
-        DBUG_ASSERT(head->variables.gtid_next.type == ANONYMOUS_GTID);
-        DBUG_ASSERT(head->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS);
+        assert(head->variables.gtid_next.type == ANONYMOUS_GTID);
+        assert(head->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS);
       }
     }
   }
@@ -1451,19 +1472,18 @@ bool MYSQL_BIN_LOG::assign_automatic_gtids_to_flush_group(THD *first_seen) {
   @retval false Success.
   @retval true Error.
 */
-bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
-                               Binlog_event_writer *writer) {
+bool MYSQL_BIN_LOG::write_transaction(THD *thd, binlog_cache_data *cache_data,
+                                      Binlog_event_writer *writer) {
   DBUG_TRACE;
 
   /*
     The GTID for the THD was assigned at
     assign_automatic_gtids_to_flush_group()
   */
-  DBUG_ASSERT(thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS ||
-              thd->owned_gtid.sidno > 0);
+  assert(thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS ||
+         thd->owned_gtid.sidno > 0);
 
   int64 sequence_number, last_committed;
-
   /* Generate logical timestamps for MTS */
   m_dependency_tracker.get_dependency(thd, sequence_number, last_committed);
 
@@ -1577,18 +1597,17 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
     // Clear the session variable to have cleared states for next transaction.
     thd->variables.original_server_version = UNDEFINED_SERVER_VERSION;
   }
-  /*
-    Generate and write the Gtid_log_event.
-  */
   Gtid_log_event gtid_event(
       thd, cache_data->is_trx_cache(), last_committed, sequence_number,
       cache_data->may_have_sbr_stmts(), original_commit_timestamp,
       immediate_commit_timestamp, trx_original_server_version,
       trx_immediate_server_version);
+
   // Set the transaction length, based on cache info
   gtid_event.set_trx_length_by_cache_size(cache_data->get_byte_position(),
                                           writer->is_checksum_enabled(),
                                           cache_data->get_event_counter());
+
   DBUG_PRINT("debug", ("cache_data->get_byte_position()= %llu",
                        cache_data->get_byte_position()));
   DBUG_PRINT("debug", ("cache_data->get_event_counter()= %lu",
@@ -1601,7 +1620,26 @@ bool MYSQL_BIN_LOG::write_gtid(THD *thd, binlog_cache_data *cache_data,
              ("transaction_length= %llu", gtid_event.transaction_length));
 
   bool ret = gtid_event.write(writer);
+  if (ret) goto end;
 
+  /*
+    finally write the transaction data, if it was not compressed
+    and written as part of the gtid event already
+  */
+  ret = mysql_bin_log.write_cache(thd, cache_data, writer);
+
+  if (!ret) {
+    // update stats if monitoring is active
+    binlog::global_context.monitoring_context()
+        .transaction_compression()
+        .update(binlog::monitoring::log_type::BINARY,
+                cache_data->get_compression_type(), thd->owned_gtid,
+                gtid_event.immediate_commit_timestamp,
+                cache_data->get_compressed_size(),
+                cache_data->get_decompressed_size());
+  }
+
+end:
   return ret;
 }
 
@@ -1611,7 +1649,7 @@ int MYSQL_BIN_LOG::gtid_end_transaction(THD *thd) {
   DBUG_PRINT("info", ("query=%s", thd->query().str));
 
   if (thd->owned_gtid.sidno > 0) {
-    DBUG_ASSERT(thd->variables.gtid_next.type == ASSIGNED_GTID);
+    assert(thd->variables.gtid_next.type == ASSIGNED_GTID);
 
     if (!opt_bin_log || (thd->slave_thread && !opt_log_slave_updates)) {
       /*
@@ -1627,8 +1665,57 @@ int MYSQL_BIN_LOG::gtid_end_transaction(THD *thd) {
       if (gtid_state->save(thd) != 0) {
         gtid_state->update_on_rollback(thd);
         return 1;
-      } else
+      } else if (!has_commit_order_manager(thd)) {
+        /*
+          The gtid_state->save implicitly performs the commit, in the following
+          stack:
+            Gtid_state::save ->
+            Gtid_table_persistor::save ->
+            Gtid_table_access_context::deinit ->
+            System_table_access::close_table ->
+            ha_commit_trans ->
+            Relay_log_info::pre_commit ->
+            Slave_worker::commit_positions(THD*) ->
+            Slave_worker::commit_positions(THD*,Log_event*,...) ->
+            Slave_worker::flush_info ->
+            Rpl_info_handler::flush_info ->
+            Rpl_info_table::do_flush_info ->
+            Rpl_info_table_access::close_table ->
+            System_table_access::close_table ->
+            ha_commit_trans ->
+            MYSQL_BIN_LOG::commit ->
+            ha_commit_low
+
+          If slave-preserve-commit-order is disabled, it does not call
+          update_on_commit from this stack. The reason is as follows:
+
+          In the normal case of MYSQL_BIN_LOG::commit, where the transaction is
+          going to be written to the binary log, it invokes
+          MYSQL_BIN_LOG::ordered_commit, which updates the GTID state (the call
+          gtid_state->update_commit_group(first) in process_commit_stage_queue).
+          However, when MYSQL_BIN_LOG::commit is invoked from this stack, it is
+          because the transaction is not going to be written to the binary log,
+          and then MYSQL_BIN_LOG::commit has a special case that calls
+          ha_commit_low directly, skipping ordered_commit. Therefore, the GTID
+          state is not updated in this stack.
+
+          On the other hand, if slave-preserve-commit-order is enabled, the
+          logic that orders commit carries out a subset of the binlog group
+          commit from within ha_commit_low, and this includes updating the GTID
+          state. In particular, there is the following call stack under
+          ha_commit_low:
+
+            ha_commit_low ->
+            Commit_order_manager::wait_and_finish ->
+            Commit_order_manager::finish ->
+            Commit_order_manager::flush_engine_and_signal_threads ->
+            Gtid_state::update_commit_group
+
+          Therefore, it is necessary to call update_on_commit only in case we
+          are not using slave-preserve-commit-order here.
+        */
         gtid_state->update_on_commit(thd);
+      }
     } else {
       /*
         If statement is supposed to be written to binlog, we write it
@@ -1646,7 +1733,7 @@ int MYSQL_BIN_LOG::gtid_end_transaction(THD *thd) {
       // Generate BEGIN event
       Query_log_event qinfo(thd, STRING_WITH_LEN("BEGIN"), true, false, true, 0,
                             true);
-      DBUG_ASSERT(!qinfo.is_using_immediate_logging());
+      assert(!qinfo.is_using_immediate_logging());
 
       /*
         Write BEGIN event and then commit (which will generate commit
@@ -1670,7 +1757,7 @@ int MYSQL_BIN_LOG::gtid_end_transaction(THD *thd) {
     gtid_state->update_on_commit(thd);
   } else if (thd->variables.gtid_next.type == ASSIGNED_GTID &&
              thd->owned_gtid_is_empty()) {
-    DBUG_ASSERT(thd->has_gtid_consistency_violation == false);
+    assert(thd->has_gtid_consistency_violation == false);
     gtid_state->update_on_commit(thd);
   }
 
@@ -1775,6 +1862,119 @@ err:
   return true;
 }
 
+bool binlog_cache_data::compress(THD *thd) {
+  DBUG_TRACE;
+  auto error{false};
+  auto ctype{binary_log::transaction::compression::type::NONE};
+  auto uncompressed_size{m_cache.length()};
+  auto size{uncompressed_size};
+  auto &cctx{thd->rpl_thd_ctx.transaction_compression_ctx()};
+  binary_log::transaction::compression::Compressor *compressor{nullptr};
+
+  // no compression enabled (ctype == NONE at this point)
+  if (thd->variables.binlog_trx_compression == false) goto end;
+
+  // do not compress if there are incident events
+  DBUG_EXECUTE_IF("binlog_compression_inject_incident", set_incident(););
+  if (has_incident()) goto end;
+
+  // do not compress if there are non-transactional changes
+  if (thd->get_transaction()->has_modified_non_trans_table(
+          Transaction_ctx::STMT) ||
+      thd->get_transaction()->has_modified_non_trans_table(
+          Transaction_ctx::SESSION))
+    goto end;
+
+  // do not compress if has SBR
+  if (may_have_sbr_stmts()) goto end;
+
+  // Unable to get a reference to a compressor, fallback to
+  // non compressed
+  if ((compressor = cctx.get_compressor(thd)) == nullptr) goto end;
+
+  // compression is enabled and all pre-conditions checked.
+  // now compress
+  else {
+    std::size_t old_capacity{0};
+    unsigned char *buffer{nullptr};
+    unsigned char *old_buffer{nullptr};
+    Transaction_payload_log_event tple{thd};
+    Compressed_ostream stream;
+    PSI_stage_info old_stage;
+
+    // set the thread stage to compressing transaction
+    thd->enter_stage(&stage_binlog_transaction_compress, &old_stage, __func__,
+                     __FILE__, __LINE__);
+    // do we have enough compression buffer ? If not swap with a larger one
+    std::tie(buffer, std::ignore, old_capacity) = compressor->get_buffer();
+    if (old_capacity < size) {
+      old_buffer = buffer;
+      auto new_buffer = (unsigned char *)malloc(size);
+      if (new_buffer)
+        compressor->set_buffer(new_buffer, size);
+      else {
+        /* purecov: begin inspected */
+        // OOM
+        error = true;
+        goto compression_end;
+        /* purecov: end */
+      }
+    }
+
+    ctype = compressor->compression_type_code();
+
+    compressor->open();
+
+    // inject the compressor in the output stream
+    stream.set_compressor(compressor);
+
+    // FIXME: innefficient, we should not copy caches around
+    //        This should be fixed when we revamp the capture
+    //        cache handling (and make this more geared towards
+    //        possible enhancements, such as streaming the changes)
+    //        Also, if the cache actually spills to disk, this may
+    //        the impact may be amplified, since reiniting the
+    //        causes a flush to disk
+    if ((error = m_cache.copy_to(&stream))) goto compression_end;
+
+    compressor->close();
+
+    if ((error = m_cache.truncate(0))) goto compression_end;
+    // Since we deleted all events from the cache, we also need to
+    // reset event_counter.
+    event_counter = 0;
+
+    // fill in the new transport event
+    std::tie(buffer, size, std::ignore) = compressor->get_buffer();
+    tple.set_payload((const char *)buffer);
+    tple.set_payload_size(size);
+    tple.set_compression_type(ctype);
+    tple.set_uncompressed_size(uncompressed_size);
+
+    // write back the new cache contents
+    error = write_event(&tple);
+
+  compression_end:
+    // revert back to the default buffer, so that we don't overuse memory
+    if (old_buffer) {
+      std::tie(buffer, std::ignore, std::ignore) = compressor->get_buffer();
+      compressor->set_buffer(old_buffer, old_capacity);
+      free(buffer);
+    }
+
+    // revert the stage if needed
+    if (old_stage.m_key != 0) THD_STAGE_INFO(thd, old_stage);
+  }
+
+end:
+  if (!error) {
+    set_compression_type(ctype);
+    set_compressed_size(m_cache.length());
+    set_decompressed_size(uncompressed_size);
+  }
+  return error;
+}
+
 /**
   This function finalizes the cache preparing for commit or rollback.
 
@@ -1793,11 +1993,12 @@ err:
 int binlog_cache_data::finalize(THD *thd, Log_event *end_event) {
   DBUG_TRACE;
   if (!is_binlog_empty()) {
-    DBUG_ASSERT(!flags.finalized);
+    assert(!flags.finalized);
     if (int error = flush_pending_event(thd)) return error;
     if (int error = write_event(end_event)) return error;
-    flags.finalized = true;
+    if (int error = this->compress(thd)) return error;
     DBUG_PRINT("debug", ("flags.finalized: %s", YESNO(flags.finalized)));
+    flags.finalized = true;
   }
   return 0;
 }
@@ -1889,7 +2090,8 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written,
     Binlog_event_writer writer(mysql_bin_log.get_binlog_file());
 
     /* The GTID ownership process might set the commit_error */
-    error = (thd->commit_error == THD::CE_FLUSH_ERROR);
+    error = (thd->commit_error == THD::CE_FLUSH_ERROR ||
+             thd->commit_error == THD::CE_FLUSH_GNO_EXHAUSTED_ERROR);
 
     DBUG_EXECUTE_IF("simulate_binlog_flush_error", {
       if (rand() % 3 == 0) {
@@ -1897,10 +2099,15 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written,
       }
     };);
 
+    DBUG_EXECUTE_IF("fault_injection_reinit_io_cache_while_flushing_to_file",
+                    { DBUG_SET("+d,fault_injection_reinit_io_cache"); });
+
     if (!error)
-      if ((error = mysql_bin_log.write_gtid(thd, this, &writer)))
+      if ((error = mysql_bin_log.write_transaction(thd, this, &writer)))
         thd->commit_error = THD::CE_FLUSH_ERROR;
-    if (!error) error = mysql_bin_log.write_cache(thd, this, &writer);
+
+    DBUG_EXECUTE_IF("fault_injection_reinit_io_cache_while_flushing_to_file",
+                    { DBUG_SET("-d,fault_injection_reinit_io_cache"); });
 
     if (flags.with_xid && error == 0) *wrote_xid = true;
 
@@ -1911,7 +2118,7 @@ int binlog_cache_data::flush(THD *thd, my_off_t *bytes_written,
     reset();
     if (bytes_written) *bytes_written = bytes_in_cache;
   }
-  DBUG_ASSERT(!flags.finalized);
+  assert(!flags.finalized);
   return error;
 }
 
@@ -2001,8 +2208,8 @@ inline bool is_loggable_xa_prepare(THD *thd) {
   */
   DBUG_EXECUTE_IF("simulate_commit_failure", {
     XID_STATE *xs = thd->get_transaction()->xid_state();
-    DBUG_ASSERT((thd->is_error() && xs->get_state() == XID_STATE::XA_IDLE) ||
-                xs->get_state() == XID_STATE::XA_NOTR);
+    assert((thd->is_error() && xs->get_state() == XID_STATE::XA_IDLE) ||
+           xs->get_state() == XID_STATE::XA_NOTR);
   });
 
   return DBUG_EVALUATE_IF(
@@ -2047,8 +2254,8 @@ static int binlog_prepare(handlerton *, THD *thd, bool all) {
 */
 
 inline int do_binlog_xa_commit_rollback(THD *thd, XID *xid, bool commit) {
-  DBUG_ASSERT(thd->lex->sql_command == SQLCOM_XA_COMMIT ||
-              thd->lex->sql_command == SQLCOM_XA_ROLLBACK);
+  assert(thd->lex->sql_command == SQLCOM_XA_COMMIT ||
+         thd->lex->sql_command == SQLCOM_XA_ROLLBACK);
 
   XID_STATE *xid_state = thd->get_transaction()->xid_state();
   binlog_cache_mngr *cache_mngr = thd_get_cache_mngr(thd);
@@ -2061,8 +2268,7 @@ inline int do_binlog_xa_commit_rollback(THD *thd, XID *xid, bool commit) {
   if (thd->is_error() && DBUG_EVALUATE_IF("simulate_xa_rm_error", 0, 1))
     return 0;  // don't binlog if there are some errors.
 
-  DBUG_ASSERT(!xid->is_null() ||
-              !(thd->variables.option_bits & OPTION_BIN_LOG));
+  assert(!xid->is_null() || !(thd->variables.option_bits & OPTION_BIN_LOG));
 
   char buf[XID::ser_buf_size];
   char query[(sizeof("XA ROLLBACK")) + 1 + sizeof(buf)];
@@ -2087,9 +2293,11 @@ inline xa_status_code binlog_xa_commit_or_rollback(THD *thd, XID *xid,
                                                    bool commit) {
   int error = 0;
 
-#ifndef DBUG_OFF
-  binlog_cache_mngr *cache_mngr = thd_get_cache_mngr(thd);
-  DBUG_ASSERT(!cache_mngr || !cache_mngr->has_logged_xid);
+#ifndef NDEBUG
+  {
+    binlog_cache_mngr *cache_mngr = thd_get_cache_mngr(thd);
+    assert(!cache_mngr || !cache_mngr->has_logged_xid);
+  }
 #endif
   if (!(error = do_binlog_xa_commit_rollback(thd, xid, commit))) {
     /*
@@ -2213,206 +2421,6 @@ static int binlog_rollback(handlerton *, THD *thd, bool all) {
   return error;
 }
 
-bool Stage_manager::Mutex_queue::append(THD *first) {
-  DBUG_TRACE;
-  lock();
-  DBUG_PRINT("enter", ("first: 0x%llx", (ulonglong)first));
-  DBUG_PRINT("info",
-             ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
-              (ulonglong)m_first, (ulonglong)&m_first, (ulonglong)m_last));
-  int32 count = 1;
-  bool empty = (m_first == nullptr);
-  *m_last = first;
-  DBUG_PRINT("info",
-             ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
-              (ulonglong)m_first, (ulonglong)&m_first, (ulonglong)m_last));
-  /*
-    Go to the last THD instance of the list. We expect lists to be
-    moderately short. If they are not, we need to track the end of
-    the queue as well.
-  */
-
-  while (first->next_to_commit) {
-    count++;
-    first = first->next_to_commit;
-  }
-  m_size += count;
-
-  m_last = &first->next_to_commit;
-  DBUG_PRINT("info",
-             ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
-              (ulonglong)m_first, (ulonglong)&m_first, (ulonglong)m_last));
-  DBUG_ASSERT(m_first || m_last == &m_first);
-  DBUG_PRINT("return", ("empty: %s", YESNO(empty)));
-  unlock();
-  return empty;
-}
-
-std::pair<bool, THD *> Stage_manager::Mutex_queue::pop_front() {
-  DBUG_TRACE;
-  lock();
-  THD *result = m_first;
-  bool more = true;
-  /*
-    We do not set next_to_commit to NULL here since this is only used
-    in the flush stage. We will have to call fetch_queue last here,
-    and will then "cut" the linked list by setting the end of that
-    queue to NULL.
-  */
-  if (result) m_first = result->next_to_commit;
-  if (m_first == nullptr) {
-    more = false;
-    m_last = &m_first;
-  }
-  DBUG_ASSERT(m_size.load() > 0);
-  --m_size;
-  DBUG_ASSERT(m_first || m_last == &m_first);
-  unlock();
-  DBUG_PRINT("return",
-             ("result: 0x%llx, more: %s", (ulonglong)result, YESNO(more)));
-  return std::make_pair(more, result);
-}
-
-bool Stage_manager::enroll_for(StageID stage, THD *thd,
-                               mysql_mutex_t *stage_mutex) {
-  // If the queue was empty: we're the leader for this batch
-  DBUG_PRINT("debug",
-             ("Enqueue 0x%llx to queue for stage %d", (ulonglong)thd, stage));
-  bool leader = m_queue[stage].append(thd);
-
-  if (stage == FLUSH_STAGE && has_commit_order_manager(thd)) {
-    Slave_worker *worker = dynamic_cast<Slave_worker *>(thd->rli_slave);
-    Commit_order_manager *mngr = worker->get_commit_order_manager();
-
-    mngr->unregister_trx(worker);
-  }
-
-  /*
-    We do not need to unlock the stage_mutex if it is LOCK_log when rotating
-    binlog caused by logging incident log event, since it should be held
-    always during rotation.
-  */
-  bool need_unlock_stage_mutex =
-      !(mysql_bin_log.is_rotating_caused_by_incident &&
-        stage_mutex == mysql_bin_log.get_log_lock());
-
-  /*
-    The stage mutex can be NULL if we are enrolling for the first
-    stage.
-  */
-  if (stage_mutex && need_unlock_stage_mutex) mysql_mutex_unlock(stage_mutex);
-
-#ifndef DBUG_OFF
-  DBUG_PRINT("info", ("This is a leader thread: %d (0=n 1=y)", leader));
-
-  DEBUG_SYNC(thd, "after_enrolling_for_stage");
-
-  switch (stage) {
-    case Stage_manager::FLUSH_STAGE:
-      DEBUG_SYNC(thd, "bgc_after_enrolling_for_flush_stage");
-      break;
-    case Stage_manager::SYNC_STAGE:
-      DEBUG_SYNC(thd, "bgc_after_enrolling_for_sync_stage");
-      break;
-    case Stage_manager::COMMIT_STAGE:
-      DEBUG_SYNC(thd, "bgc_after_enrolling_for_commit_stage");
-      break;
-    default:
-      // not reached
-      DBUG_ASSERT(0);
-  }
-
-  DBUG_EXECUTE_IF("assert_leader", DBUG_ASSERT(leader););
-  DBUG_EXECUTE_IF("assert_follower", DBUG_ASSERT(!leader););
-#endif
-
-  /*
-    If the queue was not empty, we're a follower and wait for the
-    leader to process the queue. If we were holding a mutex, we have
-    to release it before going to sleep.
-  */
-  if (!leader) {
-    mysql_mutex_lock(&m_lock_done);
-#ifndef DBUG_OFF
-    /*
-      Leader can be awaiting all-clear to preempt follower's execution.
-      With setting the status the follower ensures it won't execute anything
-      including thread-specific code.
-    */
-    thd->get_transaction()->m_flags.ready_preempt = 1;
-    if (leader_await_preempt_status) mysql_cond_signal(&m_cond_preempt);
-#endif
-    while (thd->tx_commit_pending) mysql_cond_wait(&m_cond_done, &m_lock_done);
-    mysql_mutex_unlock(&m_lock_done);
-  }
-  return leader;
-}
-
-THD *Stage_manager::Mutex_queue::fetch_and_empty() {
-  DBUG_TRACE;
-  lock();
-  DBUG_PRINT("enter",
-             ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
-              (ulonglong)m_first, (ulonglong)&m_first, (ulonglong)m_last));
-  THD *result = m_first;
-  m_first = nullptr;
-  m_last = &m_first;
-  DBUG_PRINT("info",
-             ("m_first: 0x%llx, &m_first: 0x%llx, m_last: 0x%llx",
-              (ulonglong)m_first, (ulonglong)&m_first, (ulonglong)m_last));
-  DBUG_PRINT("info", ("fetched queue of %d transactions", m_size.load()));
-  DBUG_PRINT("return", ("result: 0x%llx", (ulonglong)result));
-  DBUG_ASSERT(m_size.load() >= 0);
-  m_size.store(0);
-  unlock();
-  return result;
-}
-
-void Stage_manager::wait_count_or_timeout(ulong count, long usec,
-                                          StageID stage) {
-  long to_wait = DBUG_EVALUATE_IF("bgc_set_infinite_delay", LONG_MAX, usec);
-  /*
-    For testing purposes while waiting for inifinity
-    to arrive, we keep checking the queue size at regular,
-    small intervals. Otherwise, waiting 0.1 * infinite
-    is too long.
-   */
-  long delta = DBUG_EVALUATE_IF("bgc_set_infinite_delay", 100000,
-                                max<long>(1, (to_wait * 0.1)));
-
-  while (
-      to_wait > 0 &&
-      (count == 0 || static_cast<ulong>(m_queue[stage].get_size()) < count)) {
-#ifndef DBUG_OFF
-    if (current_thd) DEBUG_SYNC(current_thd, "bgc_wait_count_or_timeout");
-#endif
-    my_sleep(delta);
-    to_wait -= delta;
-  }
-}
-
-void Stage_manager::signal_done(THD *queue) {
-  mysql_mutex_lock(&m_lock_done);
-  for (THD *thd = queue; thd; thd = thd->next_to_commit)
-    thd->tx_commit_pending = false;
-  mysql_mutex_unlock(&m_lock_done);
-  mysql_cond_broadcast(&m_cond_done);
-}
-
-#ifndef DBUG_OFF
-void Stage_manager::clear_preempt_status(THD *head) {
-  DBUG_ASSERT(head);
-
-  mysql_mutex_lock(&m_lock_done);
-  while (!head->get_transaction()->m_flags.ready_preempt) {
-    leader_await_preempt_status = true;
-    mysql_cond_wait(&m_cond_preempt, &m_lock_done);
-  }
-  leader_await_preempt_status = false;
-  mysql_mutex_unlock(&m_lock_done);
-}
-#endif
-
 /**
   Write a rollback record of the transaction to the binary log.
 
@@ -2467,16 +2475,16 @@ int MYSQL_BIN_LOG::rollback(THD *thd, bool all) {
   if (thd->lex->sql_command == SQLCOM_XA_ROLLBACK) {
     XID_STATE *xs = thd->get_transaction()->xid_state();
 
-    DBUG_ASSERT(all || !xs->is_binlogged() ||
-                (!xs->is_in_recovery() && thd->is_error()));
+    assert(all || !xs->is_binlogged() ||
+           (!xs->is_in_recovery() && thd->is_error()));
     /*
       Whenever cache_mngr is not initialized, the xa prepared
       transaction's binary logging status must not be set, unless the
       transaction is rolled back through an external connection which
       has binlogging switched off.
     */
-    DBUG_ASSERT(cache_mngr || !xs->is_binlogged() ||
-                !(is_open() && thd->variables.option_bits & OPTION_BIN_LOG));
+    assert(cache_mngr || !xs->is_binlogged() ||
+           !(is_open() && thd->variables.option_bits & OPTION_BIN_LOG));
 
     is_empty = !xs->is_binlogged();
     if ((error = do_binlog_xa_commit_rollback(thd, xs->get_xid(), false)))
@@ -2517,7 +2525,7 @@ int MYSQL_BIN_LOG::rollback(THD *thd, bool all) {
     cache_mngr->stmt_cache.reset();
   } else if (!cache_mngr->stmt_cache.is_binlog_empty()) {
     if (thd->lex->sql_command == SQLCOM_CREATE_TABLE &&
-        thd->lex->select_lex->item_list.elements && /* With select */
+        !thd->lex->query_block->field_list_is_empty() && /* With select */
         !(thd->lex->create_info->options & HA_LEX_CREATE_TMP_TABLE) &&
         thd->is_current_stmt_binlog_format_row()) {
       /*
@@ -2545,9 +2553,9 @@ int MYSQL_BIN_LOG::rollback(THD *thd, bool all) {
       if (thd->lex->sql_command == SQLCOM_XA_ROLLBACK) {
         /* this block is relevant only for not prepared yet and "local" xa trx
          */
-        DBUG_ASSERT(
+        assert(
             thd->get_transaction()->xid_state()->has_state(XID_STATE::XA_IDLE));
-        DBUG_ASSERT(!cache_mngr->has_logged_xid);
+        assert(!cache_mngr->has_logged_xid);
 
         sprintf(query, "%s ", xa_rollback_str);
         xs->get_xid()->serialize(query + sizeof(xa_rollback_str));
@@ -2571,7 +2579,7 @@ int MYSQL_BIN_LOG::rollback(THD *thd, bool all) {
 
       DBUG_EXECUTE_IF("ensure_binlog_cache_is_reset", {
         /* Assert that binlog cache is reset at rollback time. */
-        DBUG_ASSERT(binlog_cache_is_reset);
+        assert(binlog_cache_is_reset);
         binlog_cache_is_reset = false;
       };);
     }
@@ -2636,27 +2644,20 @@ int MYSQL_BIN_LOG::rollback(THD *thd, bool all) {
       my_error(ER_RUN_HOOK_ERROR, MYF(0), "before_commit");
       return RESULT_ABORTED;
     }
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     /*
       XA rollback is always accepted.
     */
     if (thd->get_transaction()
             ->get_rpl_transaction_ctx()
             ->is_transaction_rollback())
-      DBUG_ASSERT(0);
+      assert(0);
 #endif
 
     error = ordered_commit(thd, all, /* skip_commit */ true);
   }
 
   if (check_write_error(thd)) {
-    /*
-      "all == true" means that a "rollback statement" triggered the error and
-      this function was called. However, this must not happen as a rollback
-      is written directly to the binary log. And in auto-commit mode, a single
-      statement that is rolled back has the flag all == false.
-    */
-    DBUG_ASSERT(!all);
     /*
       We reach this point if the effect of a statement did not properly get into
       a cache and need to be rolled back.
@@ -2764,7 +2765,7 @@ static int binlog_savepoint_rollback(handlerton *, THD *thd, void *sv) {
   DBUG_TRACE;
   binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
   my_off_t pos = *(my_off_t *)sv;
-  DBUG_ASSERT(pos != ~(my_off_t)0);
+  assert(pos != ~(my_off_t)0);
 
   /*
     Write ROLLBACK TO SAVEPOINT to the binlog cache if we have updated some
@@ -2879,7 +2880,7 @@ static bool binlog_savepoint_rollback_can_release_mdl(handlerton *, THD *thd) {
 class Adjust_offset : public Do_THD_Impl {
  public:
   Adjust_offset(my_off_t value) : m_purge_offset(value) {}
-  virtual void operator()(THD *thd) {
+  void operator()(THD *thd) override {
     LOG_INFO *linfo;
     mysql_mutex_lock(&thd->LOCK_thd_data);
     if ((linfo = thd->current_linfo)) {
@@ -2936,7 +2937,7 @@ class Log_in_use : public Do_THD_Impl {
   Log_in_use(const char *value) : m_log_name(value), m_count(0) {
     m_log_name_len = strlen(m_log_name) + 1;
   }
-  virtual void operator()(THD *thd) {
+  void operator()(THD *thd) override {
     LOG_INFO *linfo;
     mysql_mutex_lock(&thd->LOCK_thd_data);
     if ((linfo = thd->current_linfo)) {
@@ -2958,7 +2959,7 @@ class Log_in_use : public Do_THD_Impl {
 
 static int log_in_use(const char *log_name) {
   Log_in_use log_in_use(log_name);
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (current_thd)
     DEBUG_SYNC(current_thd, "purge_logs_after_lock_index_before_thread_count");
 #endif
@@ -3131,7 +3132,7 @@ bool purge_master_logs(THD *thd, const char *to_log) {
 bool purge_master_logs_before_date(THD *thd, time_t purge_time) {
   if (!mysql_bin_log.is_open()) {
     my_ok(thd);
-    return 0;
+    return false;
   }
   return purge_error_message(
       thd, mysql_bin_log.purge_logs_before_date(purge_time, false));
@@ -3192,10 +3193,10 @@ static bool copy_file(IO_CACHE *from, IO_CACHE *to, my_off_t offset) {
       goto err;
   }
 
-  return 0;
+  return false;
 
 err:
-  return 1;
+  return true;
 }
 
 /**
@@ -3235,7 +3236,7 @@ int log_loaded_block(IO_CACHE *file) {
                                    min(block_len, max_event_size),
                                    lf_info->log_delayed);
       if (mysql_bin_log.write_event(&b)) return 1;
-      lf_info->logged_data_file = 1;
+      lf_info->logged_data_file = true;
     }
   }
   return 0;
@@ -3246,24 +3247,25 @@ template <class BINLOG_FILE_READER>
 bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log) {
   Protocol *protocol = thd->get_protocol();
   List<Item> field_list;
-  const char *errmsg = nullptr;
+  std::string errmsg;
   LOG_INFO linfo;
 
   DBUG_TRACE;
 
-  DBUG_ASSERT(thd->lex->sql_command == SQLCOM_SHOW_BINLOG_EVENTS ||
-              thd->lex->sql_command == SQLCOM_SHOW_RELAYLOG_EVENTS);
+  assert(thd->lex->sql_command == SQLCOM_SHOW_BINLOG_EVENTS ||
+         thd->lex->sql_command == SQLCOM_SHOW_RELAYLOG_EVENTS);
 
   if (binary_log->is_open()) {
     LEX_MASTER_INFO *lex_mi = &thd->lex->mi;
-    SELECT_LEX_UNIT *unit = thd->lex->unit;
+    Query_expression *unit = thd->lex->unit;
     ha_rows event_count, limit_start, limit_end;
     my_off_t pos =
         max<my_off_t>(BIN_LOG_HEADER_SIZE, lex_mi->pos);  // user-friendly
     char search_file_name[FN_REFLEN], *name;
     const char *log_file_name = lex_mi->log_file_name;
+    Log_event *ev = nullptr;
 
-    unit->set_limit(thd, thd->lex->current_select());
+    unit->set_limit(thd, thd->lex->current_query_block());
     limit_start = unit->offset_limit_cnt;
     limit_end = unit->select_limit_cnt;
 
@@ -3271,7 +3273,7 @@ bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log) {
     if (log_file_name)
       binary_log->make_log_name(search_file_name, log_file_name);
     else
-      name = 0;  // Find first log
+      name = nullptr;  // Find first log
 
     linfo.index_file_offset = 0;
 
@@ -3313,44 +3315,86 @@ bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log) {
     if (!binary_log->is_active(linfo.log_file_name)) end_pos = 0;
 
     DEBUG_SYNC(thd, "after_show_binlog_event_found_file");
-    for (event_count = 0; event_count < limit_end; event_count++) {
-      Log_event *ev = binlog_file_reader.read_event_object();
-      if (ev == nullptr) {
-        if (binlog_file_reader.has_fatal_error())
-          errmsg = binlog_file_reader.get_error_str();
-        break;
-      }
 
+    /**
+      Relaylog_file_reader and Binlog_file_reader are typedefs to
+      Basic_binlog_file_reader whereas Relaylog_file_reader uses
+      a Relaylog_ifile in the template instantiation and
+      Binlog_file_reader uses a Binlog_ifile in the template
+      instantiation.
+
+      Binlog_ifile and Relaylog_ifile differ only in the open()
+      member function and they both derive from Basic_binlog_ifile.
+
+      Therefore, it is OK to cast to Binlog_file_reader here.
+
+      TODO: in the future investigate if some refactoring is needed
+            here. Perhaps make the Iterator itself templated.
+     */
+    binlog::tools::Iterator it(
+        reinterpret_cast<Binlog_file_reader *>(&binlog_file_reader));
+
+    /*
+      Unpacked events shall copy their part of the buffer from uncompressed
+      buffer (the cointainer, i.e., the buffer iterator goes out of scope
+      once the events are inflated and put in a vector). However, it is
+      unclear if the *buffer* from which events are deserialized is still
+      needed for the porposes of displaying events in SHOW BINLOG/RELAYLOG
+      EVENTS.
+    */
+    my_off_t last_log_pos = 0;
+    for (event_count = 0, ev = it.begin(); ev != it.end();) {
       DEBUG_SYNC(thd, "wait_in_show_binlog_events_loop");
       if (event_count >= limit_start &&
           ev->net_send(protocol, linfo.log_file_name, pos)) {
+        /* purecov: begin inspected */
         errmsg = "Net error";
         delete ev;
+        ev = nullptr;
         goto err;
+        /* purecov: end */
       }
+      last_log_pos = ev->common_header->log_pos;
       delete ev;
+      ev = nullptr;
       pos = binlog_file_reader.position();
-      if (end_pos > 0 && pos >= end_pos) break;
+
+      if (++event_count == limit_end) break;
+      if ((ev = it.next()) == it.end()) break;
+      if (it.has_error()) break;
+      if (end_pos > 0 && pos >= end_pos &&
+          (ev->common_header->log_pos != last_log_pos)) {
+        delete ev;
+        ev = nullptr;
+        break;
+      }
     }
+
+    if (binlog_file_reader.has_fatal_error())
+      errmsg = binlog_file_reader.get_error_str();
+    else if (it.has_error())
+      errmsg = it.get_error_message(); /* purecov: inspected */
+    else
+      errmsg = "";
   }
   // Check that linfo is still on the function scope.
   DEBUG_SYNC(thd, "after_show_binlog_events");
 
 err:
-  if (errmsg) {
+  if (!errmsg.empty()) {
     if (thd->lex->sql_command == SQLCOM_SHOW_RELAYLOG_EVENTS)
       my_error(ER_ERROR_WHEN_EXECUTING_COMMAND, MYF(0), "SHOW RELAYLOG EVENTS",
-               errmsg);
+               errmsg.c_str());
     else
       my_error(ER_ERROR_WHEN_EXECUTING_COMMAND, MYF(0), "SHOW BINLOG EVENTS",
-               errmsg);
+               errmsg.c_str());
   } else
     my_eof(thd);
 
   mysql_mutex_lock(&thd->LOCK_thd_data);
-  thd->current_linfo = 0;
+  thd->current_linfo = nullptr;
   mysql_mutex_unlock(&thd->LOCK_thd_data);
-  return errmsg != nullptr;
+  return !errmsg.empty();
 }
 
 bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log) {
@@ -3369,13 +3413,13 @@ bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log) {
   @retval true failure
 */
 bool mysql_show_binlog_events(THD *thd) {
-  List<Item> field_list;
   DBUG_TRACE;
 
-  DBUG_ASSERT(thd->lex->sql_command == SQLCOM_SHOW_BINLOG_EVENTS);
+  assert(thd->lex->sql_command == SQLCOM_SHOW_BINLOG_EVENTS);
 
+  mem_root_deque<Item *> field_list(thd->mem_root);
   Log_event::init_show_field_list(&field_list);
-  if (thd->send_result_metadata(&field_list,
+  if (thd->send_result_metadata(field_list,
                                 Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF))
     return true;
 
@@ -3389,7 +3433,7 @@ bool mysql_show_binlog_events(THD *thd) {
   return show_binlog_events(thd, &mysql_bin_log);
 }
 
-MYSQL_BIN_LOG::MYSQL_BIN_LOG(uint *sync_period)
+MYSQL_BIN_LOG::MYSQL_BIN_LOG(uint *sync_period, bool relay_log)
     : name(nullptr),
       write_error(false),
       inited(false),
@@ -3399,7 +3443,7 @@ MYSQL_BIN_LOG::MYSQL_BIN_LOG(uint *sync_period)
       file_id(1),
       sync_period_ptr(sync_period),
       sync_counter(0),
-      is_relay_log(0),
+      is_relay_log(relay_log),
       checksum_alg_reset(binary_log::BINLOG_CHECKSUM_ALG_UNDEF),
       relay_log_checksum_alg(binary_log::BINLOG_CHECKSUM_ALG_UNDEF),
       previous_gtid_set_relaylog(nullptr),
@@ -3420,7 +3464,7 @@ MYSQL_BIN_LOG::~MYSQL_BIN_LOG() { delete m_binlog_file; }
 void MYSQL_BIN_LOG::cleanup() {
   DBUG_TRACE;
   if (inited) {
-    inited = 0;
+    inited = false;
     close(LOG_CLOSE_INDEX | LOG_CLOSE_STOP_EVENT, true /*need_lock_log=true*/,
           true /*need_lock_index=true*/);
     mysql_mutex_destroy(&LOCK_log);
@@ -3431,7 +3475,9 @@ void MYSQL_BIN_LOG::cleanup() {
     mysql_mutex_destroy(&LOCK_xids);
     mysql_cond_destroy(&update_cond);
     mysql_cond_destroy(&m_prep_xids_cond);
-    stage_manager.deinit();
+    if (!is_relay_log) {
+      Commit_stage_manager::get_instance().deinit();
+    }
   }
 
   delete m_binlog_file;
@@ -3439,8 +3485,8 @@ void MYSQL_BIN_LOG::cleanup() {
 }
 
 void MYSQL_BIN_LOG::init_pthread_objects() {
-  DBUG_ASSERT(inited == 0);
-  inited = 1;
+  assert(inited == 0);
+  inited = true;
 
   mysql_mutex_init(m_key_LOCK_log, &LOCK_log, MY_MUTEX_INIT_SLOW);
   mysql_mutex_init(m_key_LOCK_index, &LOCK_index, MY_MUTEX_INIT_SLOW);
@@ -3451,8 +3497,11 @@ void MYSQL_BIN_LOG::init_pthread_objects() {
   mysql_mutex_init(m_key_LOCK_xids, &LOCK_xids, MY_MUTEX_INIT_FAST);
   mysql_cond_init(m_key_update_cond, &update_cond);
   mysql_cond_init(m_key_prep_xids_cond, &m_prep_xids_cond);
-  stage_manager.init(m_key_LOCK_flush_queue, m_key_LOCK_sync_queue,
-                     m_key_LOCK_commit_queue, m_key_LOCK_done, m_key_COND_done);
+  if (!is_relay_log) {
+    Commit_stage_manager::get_instance().init(
+        m_key_LOCK_flush_queue, m_key_LOCK_sync_queue, m_key_LOCK_commit_queue,
+        m_key_LOCK_done, m_key_COND_done, m_key_COND_flush_queue);
+  }
 }
 
 /**
@@ -3493,9 +3542,9 @@ static bool is_number(const char *str, ulong *res, bool allow_wildcards) {
          str++, flag = 1)
       ;
   }
-  if (*str != 0 || flag == 0) return 0;
+  if (*str != 0 || flag == 0) return false;
   if (res) *res = atol(start);
-  return 1; /* Number ok */
+  return true; /* Number ok */
 } /* is_number */
 
 /**
@@ -3539,8 +3588,8 @@ static int find_uniq_filename(char *name, uint32 new_index_number) {
   file_info = dir_info->dir_entry;
   for (i = dir_info->number_off_files; i--; file_info++) {
     if (strncmp(file_info->name, start, length) == 0 &&
-        is_number(file_info->name + length, &number, 0)) {
-      set_if_bigger(max_found, number);
+        is_number(file_info->name + length, &number, false)) {
+      max_found = std::max(max_found, number);
     }
   }
   my_dirend(dir_info);
@@ -3558,7 +3607,7 @@ static int find_uniq_filename(char *name, uint32 new_index_number) {
       "RESET MASTER TO" command and the binary log was already purged
       so max_found should be 0.
     */
-    DBUG_ASSERT(max_found == 0);
+    assert(max_found == 0);
     next = new_index_number;
   } else
     next = max_found + 1;
@@ -3664,7 +3713,7 @@ bool MYSQL_BIN_LOG::open(PSI_file_key log_file_key, const char *log_name,
   DBUG_TRACE;
   bool ret = false;
 
-  write_error = 0;
+  write_error = false;
   myf flags = MY_WME | MY_NABP | MY_WAIT_IF_FULL;
   if (is_relay_log) flags = flags | MY_REPORT_WAITING_IF_FULL;
 
@@ -3695,7 +3744,7 @@ bool MYSQL_BIN_LOG::open(PSI_file_key log_file_key, const char *log_name,
   if (ret) goto err;
 
   atomic_log_state = LOG_OPENED;
-  return 0;
+  return false;
 
 err:
   if (binlog_error_action == ABORT_SERVER) {
@@ -3709,7 +3758,7 @@ err:
   my_free(name);
   name = nullptr;
   atomic_log_state = LOG_CLOSED;
-  return 1;
+  return true;
 }
 
 bool MYSQL_BIN_LOG::open_index_file(const char *index_file_name_arg,
@@ -3762,7 +3811,7 @@ bool MYSQL_BIN_LOG::open_index_file(const char *index_file_name_arg,
       mysql_file_sync(index_file_nr, MYF(MY_WME)) ||
       init_io_cache_ext(&index_file, index_file_nr, IO_SIZE, READ_CACHE,
                         mysql_file_seek(index_file_nr, 0L, MY_SEEK_END, MYF(0)),
-                        0, MYF(MY_WME | MY_WAIT_IF_FULL),
+                        false, MYF(MY_WME | MY_WAIT_IF_FULL),
                         m_key_file_log_index_cache) ||
       DBUG_EVALUATE_IF("fault_injection_openning_index", 1, 0)) {
     /*
@@ -3823,9 +3872,9 @@ static bool read_gtids_and_update_trx_parser_from_relaylog(
   DBUG_TRACE;
   DBUG_PRINT("info", ("Opening file %s", filename));
 
-  DBUG_ASSERT(retrieved_gtids != nullptr);
-  DBUG_ASSERT(trx_parser != nullptr);
-#ifndef DBUG_OFF
+  assert(retrieved_gtids != nullptr);
+  assert(trx_parser != nullptr);
+#ifndef NDEBUG
   unsigned long event_counter = 0;
 #endif
   bool error = false;
@@ -3852,14 +3901,19 @@ static bool read_gtids_and_update_trx_parser_from_relaylog(
 
   while (!error && (ev = relaylog_file_reader.read_event_object()) != nullptr) {
     DBUG_PRINT("info", ("Read event of type %s", ev->get_type_str()));
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     event_counter++;
 #endif
 
     data_len = uint4korr(ev->temp_buf + EVENT_LEN_OFFSET);
-    if (trx_parser->feed_event(ev->temp_buf, data_len,
-                               relaylog_file_reader.format_description_event(),
-                               false)) {
+
+    bool info_error{false};
+    binary_log::Log_event_basic_info log_event_info;
+    std::tie(info_error, log_event_info) = extract_log_event_basic_info(
+        ev->temp_buf, data_len,
+        relaylog_file_reader.format_description_event());
+
+    if (info_error || trx_parser->feed_event(log_event_info, false)) {
       /*
         The transaction boundary parser found an error while parsing a
         sequence of events from the relaylog. As we don't know if the
@@ -3948,7 +4002,7 @@ static bool read_gtids_and_update_trx_parser_from_relaylog(
           error = true;
           break;
         }
-#ifndef DBUG_OFF
+#ifndef NDEBUG
         char *prev_buffer = prev_gtids_ev->get_str(nullptr, nullptr);
         DBUG_PRINT("info", ("Got Previous_gtids from file '%s': Gtid_set='%s'.",
                             filename, prev_buffer));
@@ -4034,7 +4088,7 @@ static bool read_gtids_and_update_trx_parser_from_relaylog(
     LogErr(WARNING_LEVEL, ER_BINLOG_ERROR_READING_GTIDS_FROM_RELAY_LOG, -1);
   }
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   LogErr(INFORMATION_LEVEL, ER_BINLOG_EVENTS_READ_FROM_RELAY_LOG_INFO,
          event_counter, filename);
 #endif
@@ -4042,6 +4096,13 @@ static bool read_gtids_and_update_trx_parser_from_relaylog(
   return error;
 }
 
+enum enum_read_gtids_from_binlog_status {
+  GOT_GTIDS,
+  GOT_PREVIOUS_GTIDS,
+  NO_GTIDS,
+  ERROR,
+  TRUNCATED
+};
 /**
   Reads GTIDs from the given binlog file.
 
@@ -4057,7 +4118,8 @@ static bool read_gtids_and_update_trx_parser_from_relaylog(
   of the Gtid_log_event. If lock is needed in the sid_map, the caller
   must hold it.
   @param verify_checksum Set to true to verify event checksums.
-
+  @param is_relay_log Set to true, if filename is a Relay Log, false if it is a
+  Binary Log.
   @retval GOT_GTIDS The file was successfully read and it contains
   both Gtid_log_events and Previous_gtids_log_events.
   This is only possible if either all_gtids or first_gtid are not null.
@@ -4074,13 +4136,6 @@ static bool read_gtids_and_update_trx_parser_from_relaylog(
   @retval TRUNCATED The file was truncated before the end of the
   first Previous_gtids_log_event.
 */
-enum enum_read_gtids_from_binlog_status {
-  GOT_GTIDS,
-  GOT_PREVIOUS_GTIDS,
-  NO_GTIDS,
-  ERROR,
-  TRUNCATED
-};
 static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
     const char *filename, Gtid_set *all_gtids, Gtid_set *prev_gtids,
     Gtid *first_gtid, Sid_map *sid_map, bool verify_checksum,
@@ -4088,7 +4143,7 @@ static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
   DBUG_TRACE;
   DBUG_PRINT("info", ("Opening file %s", filename));
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   unsigned long event_counter = 0;
   /*
     We assert here that both all_gtids and prev_gtids, if specified,
@@ -4097,8 +4152,8 @@ static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
     the caller, the lock applies to all the GTID sets this function is
     dealing with.
   */
-  if (all_gtids) DBUG_ASSERT(all_gtids->get_sid_map() == sid_map);
-  if (prev_gtids) DBUG_ASSERT(prev_gtids->get_sid_map() == sid_map);
+  if (all_gtids) assert(all_gtids->get_sid_map() == sid_map);
+  if (prev_gtids) assert(prev_gtids->get_sid_map() == sid_map);
 #endif
 
   Binlog_file_reader binlog_file_reader(verify_checksum);
@@ -4121,7 +4176,7 @@ static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
   bool done = false;
   bool seen_first_gtid = false;
   while (!done && (ev = binlog_file_reader.read_event_object()) != nullptr) {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     event_counter++;
 #endif
     DBUG_PRINT("info", ("Read event of type %s", ev->get_type_str()));
@@ -4140,7 +4195,7 @@ static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
         else if (prev_gtids != nullptr &&
                  prev_gtids_ev->add_to_set(prev_gtids) != 0)
           ret = ERROR, done = true;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
         char *prev_buffer = prev_gtids_ev->get_str(nullptr, nullptr);
         DBUG_PRINT("info", ("Got Previous_gtids from file '%s': Gtid_set='%s'.",
                             filename, prev_buffer));
@@ -4235,9 +4290,9 @@ static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
           done = true;
           break;
         }
-        DBUG_ASSERT(prev_gtids == nullptr
-                        ? true
-                        : all_gtids != nullptr || first_gtid != nullptr);
+        assert(prev_gtids == nullptr
+                   ? true
+                   : all_gtids != nullptr || first_gtid != nullptr);
       }
       // Fall through.
       default:
@@ -4284,7 +4339,7 @@ static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
     first_gtid->dbug_print(sid_map, "first_gtid");
 
   DBUG_PRINT("info", ("returning %d", ret));
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (!is_relay_log && prev_gtids != nullptr && all_gtids == nullptr &&
       first_gtid == nullptr)
     LogErr(INFORMATION_LEVEL, ER_BINLOG_EVENTS_READ_FROM_BINLOG_INFO,
@@ -4368,8 +4423,8 @@ bool MYSQL_BIN_LOG::find_first_log_not_in_gtid_set(char *binlog_file_name,
             Verify that the selected binlog is not the first binlog,
           */
           DBUG_EXECUTE_IF("slave_reconnect_with_gtid_set_executed",
-                          DBUG_ASSERT(strcmp(filename_list.begin()->c_str(),
-                                             binlog_file_name) != 0););
+                          assert(strcmp(filename_list.begin()->c_str(),
+                                        binlog_file_name) != 0););
           goto end;
         }
       case TRUNCATED:
@@ -4380,25 +4435,7 @@ bool MYSQL_BIN_LOG::find_first_log_not_in_gtid_set(char *binlog_file_name,
   }
 
   if (rit == filename_list.rend()) {
-    char *missing_gtids = nullptr;
-    Gtid_set gtid_missing(gtid_set->get_sid_map());
-    gtid_missing.add_gtid_set(gtid_set);
-    gtid_missing.remove_gtid_set(&binlog_previous_gtid_set);
-    gtid_missing.to_string(&missing_gtids, false, nullptr);
-
-    String tmp_uuid;
-    mysql_mutex_lock(&current_thd->LOCK_thd_data);
-    const auto it = current_thd->user_vars.find("slave_uuid");
-    if (it != current_thd->user_vars.end() && it->second->length() > 0) {
-      tmp_uuid.copy(it->second->ptr(), it->second->length(), nullptr);
-    }
-    mysql_mutex_unlock(&current_thd->LOCK_thd_data);
-
-    LogErr(WARNING_LEVEL, ER_FOUND_MISSING_GTIDS, tmp_uuid.ptr(),
-           missing_gtids);
-    my_free(missing_gtids);
-
-    *errmsg = ER_THD(current_thd, ER_MASTER_HAS_PURGED_REQUIRED_GTIDS);
+    report_missing_gtids(&binlog_previous_gtid_set, gtid_set, errmsg);
     error = -5;
   }
 
@@ -4426,10 +4463,10 @@ bool MYSQL_BIN_LOG::init_gtid_sets(Gtid_set *all_gtids, Gtid_set *lost_gtids,
     If this is a relay log, we must have the IO thread Master_info trx_parser
     in order to correctly feed it with relay log events.
   */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (is_relay_log) {
-    DBUG_ASSERT(trx_parser != nullptr);
-    DBUG_ASSERT(lost_gtids == nullptr);
+    assert(trx_parser != nullptr);
+    assert(lost_gtids == nullptr);
   }
 #endif
 
@@ -4496,7 +4533,7 @@ bool MYSQL_BIN_LOG::init_gtid_sets(Gtid_set *all_gtids, Gtid_set *lost_gtids,
                 reached_first_file ? "" : rit->c_str(), reached_first_file));
     while (!can_stop_reading && !reached_first_file) {
       const char *filename = rit->c_str();
-      DBUG_ASSERT(rit != filename_list.rend());
+      assert(rit != filename_list.rend());
       rit++;
       reached_first_file = (rit == filename_list.rend());
       DBUG_PRINT("info", ("filename='%s' can_stop_reading=%d "
@@ -4536,8 +4573,8 @@ bool MYSQL_BIN_LOG::init_gtid_sets(Gtid_set *all_gtids, Gtid_set *lost_gtids,
           */
           if (binlog_gtid_simple_recovery && is_server_starting &&
               !is_relay_log) {
-            DBUG_ASSERT(all_gtids->is_empty());
-            DBUG_ASSERT(lost_gtids->is_empty());
+            assert(all_gtids->is_empty());
+            assert(lost_gtids->is_empty());
             goto end;
           }
           /*FALLTHROUGH*/
@@ -4596,9 +4633,9 @@ bool MYSQL_BIN_LOG::init_gtid_sets(Gtid_set *all_gtids, Gtid_set *lost_gtids,
         need to start parsing, as it was incremented after generating
         the relay log file name.
       */
-      DBUG_ASSERT(rit != filename_list.rbegin());
+      assert(rit != filename_list.rbegin());
       rit--;
-      DBUG_ASSERT(rit != filename_list.rend());
+      assert(rit != filename_list.rend());
       /* Reset the transaction parser before feeding it with events */
       trx_parser->reset();
       partial_trx->clear();
@@ -4644,7 +4681,7 @@ bool MYSQL_BIN_LOG::init_gtid_sets(Gtid_set *all_gtids, Gtid_set *lost_gtids,
     DBUG_PRINT("info", ("Iterating forwards through binary logs, looking for "
                         "the first binary log that contains both a "
                         "Previous_gtids_log_event and a Gtid_log_event."));
-    DBUG_ASSERT(!is_relay_log);
+    assert(!is_relay_log);
     for (it = filename_list.begin(); it != filename_list.end(); it++) {
       /*
         We should pass a first_gtid to read_gtids_from_binlog when
@@ -4723,7 +4760,7 @@ bool MYSQL_BIN_LOG::open_binlog(
     Format_description_log_event *extra_description_event,
     uint32 new_index_number) {
   // lock_index must be acquired *before* sid_lock.
-  DBUG_ASSERT(need_sid_lock || !need_lock_index);
+  assert(need_sid_lock || !need_lock_index);
   DBUG_TRACE;
   DBUG_PRINT("enter", ("base filename: %s", log_name));
 
@@ -4731,7 +4768,7 @@ bool MYSQL_BIN_LOG::open_binlog(
 
   if (init_and_set_log_file_name(log_name, new_name, new_index_number)) {
     LogErr(ERROR_LEVEL, ER_BINLOG_CANT_GENERATE_NEW_FILE_NAME);
-    return 1;
+    return true;
   }
 
   DBUG_PRINT("info", ("generated filename: %s", log_file_name));
@@ -4758,25 +4795,25 @@ bool MYSQL_BIN_LOG::open_binlog(
     });
 
     LogErr(ERROR_LEVEL, ER_BINLOG_FAILED_TO_SYNC_INDEX_FILE_IN_OPEN);
-    return 1;
+    return true;
   }
   DBUG_EXECUTE_IF("crash_create_non_critical_before_update_index",
                   DBUG_SUICIDE(););
 
-  write_error = 0;
+  write_error = false;
 
   /* open the main log file */
   if (open(m_key_file_log, log_name, new_name, new_index_number)) {
     close_purge_index_file();
-    return 1; /* all warnings issued */
+    return true; /* all warnings issued */
   }
 
   max_size = max_size_arg;
 
-  bool write_file_name_to_index_file = 0;
+  bool write_file_name_to_index_file = false;
 
   /* This must be before goto err. */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   binary_log_debug::debug_pretend_version_50034_in_binlog =
       DBUG_EVALUATE_IF("pretend_version_50034_in_binlog", true, false);
 #endif
@@ -4793,7 +4830,7 @@ bool MYSQL_BIN_LOG::open_binlog(
                              BIN_LOG_HEADER_SIZE))
       goto err;
     bytes_written += BIN_LOG_HEADER_SIZE;
-    write_file_name_to_index_file = 1;
+    write_file_name_to_index_file = true;
   }
 
   /*
@@ -4936,7 +4973,7 @@ bool MYSQL_BIN_LOG::open_binlog(
   if (write_file_name_to_index_file) {
     DBUG_EXECUTE_IF("crash_create_critical_before_update_index",
                     DBUG_SUICIDE(););
-    DBUG_ASSERT(my_b_inited(&index_file) != 0);
+    assert(my_b_inited(&index_file) != 0);
 
     /*
       The new log file name is appended into crash safe index file after
@@ -4969,7 +5006,7 @@ bool MYSQL_BIN_LOG::open_binlog(
   close_purge_index_file();
 
   update_binlog_end_pos();
-  return 0;
+  return false;
 
 err:
   if (is_inited_purge_index_file())
@@ -4985,7 +5022,7 @@ err:
            (new_name) ? new_name : name, errno);
     close(LOG_CLOSE_INDEX, false, need_lock_index);
   }
-  return 1;
+  return true;
 }
 
 /**
@@ -5111,7 +5148,7 @@ recoverable_err:
                             O_RDWR | O_CREAT, MYF(MY_WME))) < 0 ||
       mysql_file_sync(fd, MYF(MY_WME)) ||
       init_io_cache_ext(&index_file, fd, IO_SIZE, READ_CACHE,
-                        mysql_file_seek(fd, 0L, MY_SEEK_END, MYF(0)), 0,
+                        mysql_file_seek(fd, 0L, MY_SEEK_END, MYF(0)), false,
                         MYF(MY_WME | MY_WAIT_IF_FULL),
                         key_file_binlog_index_cache)) {
     LogErr(ERROR_LEVEL, ER_BINLOG_FAILED_TO_OPEN_INDEX_FILE_AFTER_REBUILDING,
@@ -5236,7 +5273,7 @@ bool MYSQL_BIN_LOG::check_write_error(const THD *thd) {
 void MYSQL_BIN_LOG::report_cache_write_error(THD *thd, bool is_transactional) {
   DBUG_TRACE;
 
-  write_error = 1;
+  write_error = true;
 
   if (check_write_error(thd)) return;
 
@@ -5482,7 +5519,7 @@ std::pair<int, std::list<std::string>> MYSQL_BIN_LOG::get_log_index(
 */
 bool MYSQL_BIN_LOG::reset_logs(THD *thd, bool delete_only) {
   LOG_INFO linfo;
-  bool error = 0;
+  bool error = false;
   int err;
   const char *save_name = nullptr;
   Checkable_rwlock *sid_lock = nullptr;
@@ -5492,11 +5529,11 @@ bool MYSQL_BIN_LOG::reset_logs(THD *thd, bool delete_only) {
     Flush logs for storage engines, so that the last transaction
     is persisted inside storage engines.
   */
-  DBUG_ASSERT(!thd->is_log_reset());
+  assert(!thd->is_log_reset());
   thd->set_log_reset();
   if (ha_flush_logs()) {
     thd->clear_log_reset();
-    return 1;
+    return true;
   }
   thd->clear_log_reset();
 
@@ -5536,7 +5573,7 @@ bool MYSQL_BIN_LOG::reset_logs(THD *thd, bool delete_only) {
     uint errcode = purge_log_get_error_code(err);
     LogErr(ERROR_LEVEL, ER_BINLOG_CANT_LOCATE_OLD_BINLOG_OR_RELAY_LOG_FILES);
     my_error(errcode, MYF(0));
-    error = 1;
+    error = true;
     goto err;
   }
 
@@ -5549,7 +5586,7 @@ bool MYSQL_BIN_LOG::reset_logs(THD *thd, bool delete_only) {
         LogErr(INFORMATION_LEVEL, ER_BINLOG_CANT_DELETE_FILE,
                linfo.log_file_name);
         set_my_errno(0);
-        error = 0;
+        error = false;
       } else {
         push_warning_printf(current_thd, Sql_condition::SL_WARNING,
                             ER_BINLOG_PURGE_FATAL_ERR,
@@ -5558,7 +5595,7 @@ bool MYSQL_BIN_LOG::reset_logs(THD *thd, bool delete_only) {
                             "of your binlog index file "
                             "to the actual binlog files",
                             linfo.log_file_name);
-        error = 1;
+        error = true;
         goto err;
       }
     }
@@ -5577,7 +5614,7 @@ bool MYSQL_BIN_LOG::reset_logs(THD *thd, bool delete_only) {
           ER_THD(current_thd, ER_LOG_PURGE_NO_FILE), index_file_name);
       LogErr(INFORMATION_LEVEL, ER_BINLOG_CANT_DELETE_FILE, index_file_name);
       set_my_errno(0);
-      error = 0;
+      error = false;
     } else {
       push_warning_printf(current_thd, Sql_condition::SL_WARNING,
                           ER_BINLOG_PURGE_FATAL_ERR,
@@ -5586,13 +5623,13 @@ bool MYSQL_BIN_LOG::reset_logs(THD *thd, bool delete_only) {
                           "of your binlog index file "
                           "to the actual binlog files",
                           index_file_name);
-      error = 1;
+      error = true;
       goto err;
     }
   }
   DBUG_EXECUTE_IF("wait_for_kill_gtid_state_clear", {
     const char action[] = "now WAIT_FOR kill_gtid_state_clear";
-    DBUG_ASSERT(!debug_sync_set_action(thd, STRING_WITH_LEN(action)));
+    assert(!debug_sync_set_action(thd, STRING_WITH_LEN(action)));
   };);
 
   /*
@@ -5601,7 +5638,7 @@ bool MYSQL_BIN_LOG::reset_logs(THD *thd, bool delete_only) {
   */
   if (!is_relay_log) {
     if (gtid_state->clear(thd)) {
-      error = 1;
+      error = true;
     }
     /*
       Don't clear global_sid_map because gtid_state->clear() above didn't
@@ -5611,8 +5648,9 @@ bool MYSQL_BIN_LOG::reset_logs(THD *thd, bool delete_only) {
   }
 
   if (!delete_only) {
-    if (!open_index_file(index_file_name, 0, false /*need_lock_index=false*/))
-      error = open_binlog(save_name, 0, max_size, false,
+    if (!open_index_file(index_file_name, nullptr,
+                         false /*need_lock_index=false*/))
+      error = open_binlog(save_name, nullptr, max_size, false,
                           false /*need_lock_index=false*/,
                           false /*need_sid_lock=false*/, nullptr,
                           thd->lex->next_binlog_file_nr) ||
@@ -5677,8 +5715,8 @@ int MYSQL_BIN_LOG::open_crash_safe_index_file() {
 
     if ((file = my_open(crash_safe_index_file_name, O_RDWR | O_CREAT,
                         MYF(MY_WME))) < 0 ||
-        init_io_cache(&crash_safe_index_file, file, IO_SIZE, WRITE_CACHE, 0, 0,
-                      flags)) {
+        init_io_cache(&crash_safe_index_file, file, IO_SIZE, WRITE_CACHE, 0,
+                      false, flags)) {
       error = 1;
       LogErr(ERROR_LEVEL, ER_BINLOG_FAILED_TO_OPEN_TEMPORARY_INDEX_FILE);
     }
@@ -5775,7 +5813,8 @@ err:
 
   @param to_log	      Delete all log file name before this file.
   @param included            If true, to_log is deleted too.
-  @param need_lock_index
+  @param need_lock_index     Set to true, if the lock_index of the binary log
+  shall be acquired, false if the called is already the owner of the lock_index.
   @param need_update_threads If we want to update the log coordinates of
                              all threads. False for relay logs, true otherwise.
   @param decrease_log_space  If not null, decrement this variable of
@@ -5786,12 +5825,10 @@ err:
     If any of the logs before the deleted one is in use,
     only purge logs up to this one.
 
-  @retval
-    0			ok
-  @retval
-    LOG_INFO_EOF		to_log not found
-    LOG_INFO_EMFILE             too many files opened
-    LOG_INFO_FATAL              if any other than ENOENT error from
+  @retval 0			ok
+  @retval LOG_INFO_EOF		to_log not found
+  @retval LOG_INFO_EMFILE       too many files opened
+  @retval LOG_INFO_FATAL        if any other than ENOENT error from
                                 mysql_file_stat() or mysql_file_delete()
 */
 
@@ -5800,7 +5837,7 @@ int MYSQL_BIN_LOG::purge_logs(const char *to_log, bool included,
                               ulonglong *decrease_log_space, bool auto_purge) {
   int error = 0, no_of_log_files_to_purge = 0, no_of_log_files_purged = 0;
   int no_of_threads_locking_log = 0;
-  bool exit_loop = 0;
+  bool exit_loop = false;
   LOG_INFO log_info;
   THD *thd = current_thd;
   DBUG_TRACE;
@@ -5941,7 +5978,7 @@ int MYSQL_BIN_LOG::open_purge_index_file(bool destroy) {
     if ((file = my_open(purge_index_file_name, O_RDWR | O_CREAT, MYF(MY_WME))) <
             0 ||
         init_io_cache(&purge_index_file, file, IO_SIZE,
-                      (destroy ? WRITE_CACHE : READ_CACHE), 0, 0, flags)) {
+                      (destroy ? WRITE_CACHE : READ_CACHE), 0, false, flags)) {
       error = 1;
       LogErr(ERROR_LEVEL, ER_BINLOG_FAILED_TO_OPEN_REGISTER_FILE);
     }
@@ -6006,9 +6043,10 @@ int MYSQL_BIN_LOG::purge_index_entry(THD *thd, ulonglong *decrease_log_space,
 
   DBUG_TRACE;
 
-  DBUG_ASSERT(my_b_inited(&purge_index_file));
+  assert(my_b_inited(&purge_index_file));
 
-  if ((error = reinit_io_cache(&purge_index_file, READ_CACHE, 0, 0, 0))) {
+  if ((error =
+           reinit_io_cache(&purge_index_file, READ_CACHE, 0, false, false))) {
     LogErr(ERROR_LEVEL, ER_BINLOG_FAILED_TO_REINIT_REGISTER_FILE);
     goto err;
   }
@@ -6099,7 +6137,7 @@ int MYSQL_BIN_LOG::purge_index_entry(THD *thd, ulonglong *decrease_log_space,
           DBUG_EXECUTE_IF("wait_in_purge_index_entry", {
             const char action[] =
                 "now SIGNAL in_purge_index_entry WAIT_FOR go_ahead_sql";
-            DBUG_ASSERT(!debug_sync_set_action(thd, STRING_WITH_LEN(action)));
+            assert(!debug_sync_set_action(thd, STRING_WITH_LEN(action)));
             DBUG_SET("-d,wait_in_purge_index_entry");
           };);
 
@@ -6262,7 +6300,7 @@ int MYSQL_BIN_LOG::purge_logs_before_date(time_t purge_time, bool auto_purge) {
 
   error = (to_log[0] ? purge_logs(to_log, true, false /*need_lock_index=false*/,
                                   true /*need_update_threads=true*/,
-                                  (ulonglong *)0, auto_purge)
+                                  (ulonglong *)nullptr, auto_purge)
                      : 0);
 
 err:
@@ -6298,7 +6336,7 @@ bool MYSQL_BIN_LOG::is_active(const char *log_file_name_arg) {
 
 void MYSQL_BIN_LOG::inc_prep_xids(THD *thd) {
   DBUG_TRACE;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   int result = ++m_atomic_prep_xids;
   DBUG_PRINT("debug", ("m_atomic_prep_xids: %d", result));
 #else
@@ -6498,13 +6536,13 @@ int MYSQL_BIN_LOG::new_file_impl(
   DEBUG_SYNC(current_thd, "after_rotate_event_appended");
 
   old_name = name;
-  name = 0;  // Don't free name
+  name = nullptr;  // Don't free name
   close(LOG_CLOSE_TO_BE_OPENED | LOG_CLOSE_INDEX, false /*need_lock_log=false*/,
         false /*need_lock_index=false*/);
 
   if (checksum_alg_reset != binary_log::BINLOG_CHECKSUM_ALG_UNDEF) {
-    DBUG_ASSERT(!is_relay_log);
-    DBUG_ASSERT(binlog_checksum_options != checksum_alg_reset);
+    assert(!is_relay_log);
+    assert(binlog_checksum_options != checksum_alg_reset);
     binlog_checksum_options = checksum_alg_reset;
   }
   /*
@@ -6524,7 +6562,8 @@ int MYSQL_BIN_LOG::new_file_impl(
 
   /* reopen index binlog file, BUG#34582 */
   file_to_open = index_file_name;
-  error = open_index_file(index_file_name, 0, false /*need_lock_index=false*/);
+  error = open_index_file(index_file_name, nullptr,
+                          false /*need_lock_index=false*/);
   if (!error) {
     /* reopen the binary log file. */
     file_to_open = new_name_ptr;
@@ -6604,7 +6643,7 @@ bool MYSQL_BIN_LOG::after_write_to_relay_log(Master_info *mi) {
 
   // Check pre-conditions
   mysql_mutex_assert_owner(&LOCK_log);
-  DBUG_ASSERT(is_relay_log);
+  assert(is_relay_log);
 
   /*
     We allow the relay log rotation by relay log size
@@ -6612,7 +6651,7 @@ bool MYSQL_BIN_LOG::after_write_to_relay_log(Master_info *mi) {
   */
   bool can_rotate = mi->transaction_parser.is_not_inside_transaction();
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (m_binlog_file->get_real_file_size() >
           DBUG_EVALUATE_IF("rotate_slave_debug_group", 500, max_size) &&
       !can_rotate) {
@@ -6622,7 +6661,7 @@ bool MYSQL_BIN_LOG::after_write_to_relay_log(Master_info *mi) {
 #endif
 
   // Flush and sync
-  bool error = flush_and_sync(0);
+  bool error = flush_and_sync(false);
   if (error) {
     mi->report(ERROR_LEVEL, ER_SLAVE_RELAY_LOG_WRITE_FAILURE,
                ER_THD(current_thd, ER_SLAVE_RELAY_LOG_WRITE_FAILURE),
@@ -6650,6 +6689,18 @@ bool MYSQL_BIN_LOG::after_write_to_relay_log(Master_info *mi) {
 
       if (mi->is_queueing_trx()) {
         mi->finished_queueing();
+
+        Trx_monitoring_info processing;
+        Trx_monitoring_info last;
+        mi->get_gtid_monitoring_info()->copy_info_to(&processing, &last);
+
+        // update the compression information
+        binlog::global_context.monitoring_context()
+            .transaction_compression()
+            .update(binlog::monitoring::log_type::RELAY, last.compression_type,
+                    last.gtid, last.end_time, last.compressed_bytes,
+                    last.uncompressed_bytes,
+                    mi->rli->get_gtid_set()->get_sid_map());
       }
       mysql_mutex_unlock(&mi->data_lock);
 
@@ -6687,7 +6738,7 @@ bool MYSQL_BIN_LOG::write_event(Log_event *ev, Master_info *mi) {
 
   DBUG_EXECUTE_IF("fail_to_write_ignored_event_to_relay_log", { return true; });
   // check preconditions
-  DBUG_ASSERT(is_relay_log);
+  assert(is_relay_log);
 
   mysql_mutex_assert_owner(&LOCK_log);
 
@@ -6711,7 +6762,7 @@ bool MYSQL_BIN_LOG::write_buffer(const char *buf, uint len, Master_info *mi) {
   DBUG_TRACE;
 
   // check preconditions
-  DBUG_ASSERT(is_relay_log);
+  assert(is_relay_log);
   mysql_mutex_assert_owner(&LOCK_log);
 
   // write data
@@ -6745,7 +6796,7 @@ bool MYSQL_BIN_LOG::flush_and_sync(const bool force) {
 }
 
 void MYSQL_BIN_LOG::start_union_events(THD *thd, query_id_t query_id_param) {
-  DBUG_ASSERT(!thd->binlog_evt_union.do_union);
+  assert(!thd->binlog_evt_union.do_union);
   thd->binlog_evt_union.do_union = true;
   thd->binlog_evt_union.unioned_events = false;
   thd->binlog_evt_union.unioned_events_trans = false;
@@ -6753,7 +6804,7 @@ void MYSQL_BIN_LOG::start_union_events(THD *thd, query_id_t query_id_param) {
 }
 
 void MYSQL_BIN_LOG::stop_union_events(THD *thd) {
-  DBUG_ASSERT(thd->binlog_evt_union.do_union);
+  assert(thd->binlog_evt_union.do_union);
   thd->binlog_evt_union.do_union = false;
 }
 
@@ -6786,13 +6837,13 @@ int MYSQL_BIN_LOG::flush_and_set_pending_rows_event(THD *thd,
                                                     Rows_log_event *event,
                                                     bool is_transactional) {
   DBUG_TRACE;
-  DBUG_ASSERT(mysql_bin_log.is_open());
+  assert(mysql_bin_log.is_open());
   DBUG_PRINT("enter", ("event: %p", event));
 
   int error = 0;
   binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
 
-  DBUG_ASSERT(cache_mngr);
+  assert(cache_mngr);
 
   binlog_cache_data *cache_data =
       cache_mngr->get_binlog_cache_data(is_transactional);
@@ -6827,7 +6878,7 @@ int MYSQL_BIN_LOG::flush_and_set_pending_rows_event(THD *thd,
 
 bool MYSQL_BIN_LOG::write_event(Log_event *event_info) {
   THD *thd = event_info->thd;
-  bool error = 1;
+  bool error = true;
   DBUG_TRACE;
 
   if (thd->binlog_evt_union.do_union) {
@@ -6838,7 +6889,7 @@ bool MYSQL_BIN_LOG::write_event(Log_event *event_info) {
     thd->binlog_evt_union.unioned_events = true;
     thd->binlog_evt_union.unioned_events_trans |=
         event_info->is_using_trans_cache();
-    return 0;
+    return false;
   }
 
   /*
@@ -6877,10 +6928,10 @@ bool MYSQL_BIN_LOG::write_event(Log_event *event_info) {
          thd->lex->sql_command != SQLCOM_SAVEPOINT &&
          (!event_info->is_no_filter_event() &&
           !binlog_filter->db_ok(local_db))))
-      return 0;
+      return false;
 
-    DBUG_ASSERT(event_info->is_using_trans_cache() ||
-                event_info->is_using_stmt_cache());
+    assert(event_info->is_using_trans_cache() ||
+           event_info->is_using_stmt_cache());
 
     if (binlog_start_trans_and_stmt(thd, event_info)) return error;
 
@@ -6961,7 +7012,7 @@ bool MYSQL_BIN_LOG::write_event(Log_event *event_info) {
     if (is_trans_cache && stmt_cannot_safely_rollback(thd))
       cache_mngr->trx_cache.set_cannot_rollback();
 
-    error = 0;
+    error = false;
 
   err:
     if (error) {
@@ -6996,7 +7047,7 @@ int MYSQL_BIN_LOG::rotate(bool force_rotate, bool *check_purge) {
   int error = 0;
   DBUG_TRACE;
 
-  DBUG_ASSERT(!is_relay_log);
+  assert(!is_relay_log);
   mysql_mutex_assert_owner(&LOCK_log);
 
   *check_purge = false;
@@ -7075,7 +7126,7 @@ int MYSQL_BIN_LOG::rotate_and_purge(THD *thd, bool force_rotate) {
   */
   ha_binlog_wait(thd);
 
-  DBUG_ASSERT(!is_relay_log);
+  assert(!is_relay_log);
   mysql_mutex_lock(&LOCK_log);
   error = rotate(force_rotate, &check_purge);
   /*
@@ -7150,7 +7201,7 @@ bool MYSQL_BIN_LOG::do_write_cache(Binlog_cache_storage *cache,
     return true;
   });
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   uint64 expected_total_len = cache->length();
   DBUG_PRINT("info", ("bytes in cache= %" PRIu64, expected_total_len));
 #endif
@@ -7182,13 +7233,45 @@ bool MYSQL_BIN_LOG::write_incident(Incident_log_event *ev, THD *thd,
                                    bool do_flush_and_sync) {
   uint error = 0;
   DBUG_TRACE;
-  DBUG_ASSERT(err_msg);
+  assert(err_msg);
 
   if (!is_open()) return error;
 
-  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  binlog_cache_mngr *cache_mngr = thd_get_cache_mngr(thd);
 
-#ifndef DBUG_OFF
+  /*
+    thd->cache_mngr may be uninitialized when first transaction resulted in an
+    incident. If there is no cache manager exists for the session, then we
+    create one, so that a GTID is generated and is written prior to flushing
+    the stmt_cache.
+  */
+  if (cache_mngr == NULL ||
+      DBUG_EVALUATE_IF("simulate_cache_creation_failure", 1, 0)) {
+    if (thd->binlog_setup_trx_data() ||
+        DBUG_EVALUATE_IF("simulate_cache_creation_failure", 1, 0)) {
+      auto gtid_mode = global_gtid_mode.get();
+      if (gtid_mode == Gtid_mode::ON || gtid_mode == Gtid_mode::ON_PERMISSIVE) {
+        std::ostringstream message;
+
+        message << "Could not create IO cache while writing an incident event "
+                   "to the binary log. Since GTID_MODE = "
+                << gtid_mode
+                << ", server is unable to proceed with logging. Query: '";
+        /**
+          The reason for the error may be that the query was
+          huge. Better cut it to not run into resource problems.
+        */
+        message.write(thd->query().str, MYSQL_ERRMSG_SIZE);
+        message << "'.";
+
+        handle_binlog_flush_or_sync_error(thd, true, message.str().c_str());
+        return true;
+      }
+    } else
+      cache_mngr = thd_get_cache_mngr(thd);
+  }
+
+#ifndef NDEBUG
   if (DBUG_EVALUATE_IF("simulate_write_incident_event_into_binlog_directly", 1,
                        0) &&
       !cache_mngr->stmt_cache.is_binlog_empty()) {
@@ -7268,13 +7351,12 @@ bool MYSQL_BIN_LOG::write_incident(Incident_log_event *ev, THD *thd,
 }
 
 bool MYSQL_BIN_LOG::write_dml_directly(THD *thd, const char *stmt,
-                                       size_t stmt_len) {
+                                       size_t stmt_len,
+                                       enum_sql_command sql_command) {
   bool ret = false;
   /* backup the original command */
   enum_sql_command save_sql_command = thd->lex->sql_command;
-
-  /* Fake it as a DELETE statement, so it can be binlogged correctly */
-  thd->lex->sql_command = SQLCOM_DELETE;
+  thd->lex->sql_command = sql_command;
 
   if (thd->binlog_query(THD::STMT_QUERY_TYPE, stmt, stmt_len, false, false,
                         false, 0) ||
@@ -7305,7 +7387,7 @@ bool MYSQL_BIN_LOG::write_incident(THD *thd, bool need_lock_log,
                                    bool do_flush_and_sync) {
   DBUG_TRACE;
 
-  if (!is_open()) return 0;
+  if (!is_open()) return false;
 
   LEX_CSTRING write_error_msg = {err_msg, strlen(err_msg)};
   binary_log::Incident_event::enum_incident incident =
@@ -7326,8 +7408,8 @@ inline bool MYSQL_BIN_LOG::write_event_to_binlog(Log_event *ev) {
       is_relay_log
           ? relay_log_checksum_alg
           : static_cast<enum_binlog_checksum_alg>(binlog_checksum_options);
-  DBUG_ASSERT(ev->common_footer->checksum_alg !=
-              binary_log::BINLOG_CHECKSUM_ALG_UNDEF);
+  assert(ev->common_footer->checksum_alg !=
+         binary_log::BINLOG_CHECKSUM_ALG_UNDEF);
 
   /*
     Stores current position into log_pos, it is used to calculate correcty
@@ -7389,7 +7471,7 @@ bool MYSQL_BIN_LOG::write_cache(THD *thd, binlog_cache_data *cache_data,
 
   mysql_mutex_assert_owner(&LOCK_log);
 
-  DBUG_ASSERT(is_open());
+  assert(is_open());
   if (likely(is_open()))  // Should always be true
   {
     /*
@@ -7509,8 +7591,8 @@ void MYSQL_BIN_LOG::close(
           is_relay_log
               ? relay_log_checksum_alg
               : static_cast<enum_binlog_checksum_alg>(binlog_checksum_options);
-      DBUG_ASSERT(!is_relay_log || relay_log_checksum_alg !=
-                                       binary_log::BINLOG_CHECKSUM_ALG_UNDEF);
+      assert(!is_relay_log ||
+             relay_log_checksum_alg != binary_log::BINLOG_CHECKSUM_ALG_UNDEF);
       if (!write_event_to_binlog(&s) && !m_binlog_file->flush())
         update_binlog_end_pos();
     }
@@ -7569,7 +7651,7 @@ void MYSQL_BIN_LOG::close(
 
 void MYSQL_BIN_LOG::harvest_bytes_written(Relay_log_info *rli,
                                           bool need_log_space_lock) {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   char buf1[22], buf2[22];
 #endif
 
@@ -7618,9 +7700,9 @@ int MYSQL_BIN_LOG::open_binlog(const char *opt_name) {
     This function is used for 2pc transaction coordination.  Hence, it
     is never used for relay logs.
   */
-  DBUG_ASSERT(!is_relay_log);
-  DBUG_ASSERT(total_ha_2pc > 1 || (1 == total_ha_2pc && opt_bin_log));
-  DBUG_ASSERT(opt_name && opt_name[0]);
+  assert(!is_relay_log);
+  assert(total_ha_2pc > 1 || (1 == total_ha_2pc && opt_bin_log));
+  assert(opt_name && opt_name[0]);
 
   if (!my_b_inited(&index_file)) {
     /* There was a failure to open the index file, can't open the binlog */
@@ -7631,7 +7713,7 @@ int MYSQL_BIN_LOG::open_binlog(const char *opt_name) {
   if (using_heuristic_recover()) {
     /* generate a new binlog to mask a corrupted one */
     mysql_mutex_lock(&LOCK_log);
-    open_binlog(opt_name, 0, max_binlog_size, false,
+    open_binlog(opt_name, nullptr, max_binlog_size, false,
                 true /*need_lock_index=true*/, true /*need_sid_lock=true*/,
                 nullptr);
     mysql_mutex_unlock(&LOCK_log);
@@ -7672,7 +7754,8 @@ int MYSQL_BIN_LOG::open_binlog(const char *opt_name) {
 
     /*
       If the binary log was not properly closed it means that the server
-      may have crashed. In that case, we need to call MYSQL_BIN_LOG::recover
+      may have crashed. In that case, we need to call
+      MYSQL_BIN_LOG::binlog_recover
       to:
 
         a) collect logged XIDs;
@@ -7744,7 +7827,7 @@ err:
 bool MYSQL_BIN_LOG::truncate_relaylog_file(Master_info *mi,
                                            my_off_t truncate_pos) {
   DBUG_TRACE;
-  DBUG_ASSERT(is_relay_log);
+  assert(is_relay_log);
   mysql_mutex_assert_owner(&LOCK_log);
   Relay_log_info *rli = mi->rli;
   bool error = false;
@@ -7771,8 +7854,8 @@ bool MYSQL_BIN_LOG::truncate_relaylog_file(Master_info *mi,
              relaylog_file_size, truncate_pos);
 
       // Re-init the SQL thread IO_CACHE
-      DBUG_ASSERT(strcmp(rli->get_event_relay_log_name(), log_file_name) ||
-                  rli->get_event_relay_log_pos() <= truncate_pos);
+      assert(strcmp(rli->get_event_relay_log_name(), log_file_name) ||
+             rli->get_event_relay_log_pos() <= truncate_pos);
       rli->notify_relay_log_truncated();
     }
   }
@@ -7795,13 +7878,13 @@ void MYSQL_BIN_LOG::close() {}
 int MYSQL_BIN_LOG::prepare(THD *thd, bool all) {
   DBUG_TRACE;
 
-  DBUG_ASSERT(opt_bin_log);
+  assert(opt_bin_log);
   /*
     The applier thread explicitly overrides the value of sql_log_bin
     with the value of log_slave_updates.
   */
-  DBUG_ASSERT(thd->slave_thread ? opt_log_slave_updates
-                                : thd->variables.sql_log_bin);
+  assert(thd->slave_thread ? opt_log_slave_updates
+                           : thd->variables.sql_log_bin);
 
   /*
     Set HA_IGNORE_DURABILITY to not flush the prepared record of the
@@ -7907,10 +7990,10 @@ TC_LOG::enum_result MYSQL_BIN_LOG::commit(THD *thd, bool all) {
   if (thd->lex->sql_command == SQLCOM_XA_COMMIT) {
     /* The Commit phase of the XA two phase logging. */
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     bool one_phase = get_xa_opt(thd) == XA_ONE_PHASE;
-    DBUG_ASSERT(all || (thd->slave_thread && one_phase));
-    DBUG_ASSERT(!skip_commit || one_phase);
+    assert(all || (thd->slave_thread && one_phase));
+    assert(!skip_commit || one_phase);
 #endif
 
     XID_STATE *xs = thd->get_transaction()->xid_state();
@@ -7973,11 +8056,11 @@ TC_LOG::enum_result MYSQL_BIN_LOG::commit(THD *thd, bool all) {
       /* The prepare phase of XA transaction two phase logging. */
       int err = 0;
 
-      DBUG_ASSERT(thd->lex->sql_command != SQLCOM_XA_COMMIT || one_phase);
+      assert(thd->lex->sql_command != SQLCOM_XA_COMMIT || one_phase);
 
       XA_prepare_log_event end_evt(thd, xs->get_xid(), one_phase);
 
-      DBUG_ASSERT(!is_loggable_xa || skip_commit);
+      assert(!is_loggable_xa || skip_commit);
 
       err = cache_mngr->trx_cache.finalize(thd, &end_evt, xs);
       if (err) return RESULT_ABORTED;
@@ -8078,7 +8161,7 @@ TC_LOG::enum_result MYSQL_BIN_LOG::commit(THD *thd, bool all) {
 
     DBUG_EXECUTE_IF("ensure_binlog_cache_is_reset", {
       /* Assert that binlog cache is reset at commit time. */
-      DBUG_ASSERT(binlog_cache_is_reset);
+      assert(binlog_cache_is_reset);
       binlog_cache_is_reset = false;
     };);
 
@@ -8135,48 +8218,97 @@ std::pair<int, my_off_t> MYSQL_BIN_LOG::flush_thread_caches(THD *thd) {
   return std::make_pair(error, bytes);
 }
 
-/**
-  Execute the flush stage.
+void MYSQL_BIN_LOG::init_thd_variables(THD *thd, bool all, bool skip_commit) {
+  /*
+    These values are used while committing a transaction, so clear
+    everything.
 
-  @param[out] total_bytes_var Pointer to variable that will be set to total
-  number of bytes flushed, or NULL.
+    Notes:
 
-  @param[out] rotate_var Pointer to variable that will be set to true if
-  binlog rotation should be performed after releasing locks. If rotate
-  is not necessary, the variable will not be touched.
+    - It would be good if we could keep transaction coordinator
+      log-specific data out of the THD structure, but that is not the
+      case right now.
 
-  @param[out] out_queue_var  Pointer to the sessions queue in flush stage.
-
-  @return Error code on error, zero on success
- */
-
-int MYSQL_BIN_LOG::process_flush_stage_queue(my_off_t *total_bytes_var,
-                                             bool *rotate_var,
-                                             THD **out_queue_var) {
-  DBUG_TRACE;
-#ifndef DBUG_OFF
-  // number of flushes per group.
-  int no_flushes = 0;
+    - Everything in the transaction structure is reset when calling
+      ha_commit_low since that calls Transaction_ctx::cleanup.
+  */
+  thd->tx_commit_pending = true;
+  thd->commit_error = THD::CE_NONE;
+  thd->next_to_commit = nullptr;
+  thd->durability_property = HA_IGNORE_DURABILITY;
+  thd->get_transaction()->m_flags.real_commit = all;
+  thd->get_transaction()->m_flags.xid_written = false;
+  thd->get_transaction()->m_flags.commit_low = !skip_commit;
+  thd->get_transaction()->m_flags.run_hooks = !skip_commit;
+#ifndef NDEBUG
+  /*
+     The group commit Leader may have to wait for follower whose transaction
+     is not ready to be preempted. Initially the status is pessimistic.
+     Preemption guarding logics is necessary only when !NDEBUG is set.
+     It won't be required for the dbug-off case as long as the follower won't
+     execute any thread-specific write access code in this method, which is
+     the case as of current.
+  */
+  thd->get_transaction()->m_flags.ready_preempt = 0;
 #endif
-  DBUG_ASSERT(total_bytes_var && rotate_var && out_queue_var);
-  my_off_t total_bytes = 0;
-  int flush_error = 1;
-  mysql_mutex_assert_owner(&LOCK_log);
+}
 
+THD *MYSQL_BIN_LOG::fetch_and_process_flush_stage_queue(
+    const bool check_and_skip_flush_logs) {
   /*
     Fetch the entire flush queue and empty it, so that the next batch
     has a leader. We must do this before invoking ha_flush_logs(...)
     for guaranteeing to flush prepared records of transactions before
     flushing them to binary log, which is required by crash recovery.
   */
-  THD *first_seen = stage_manager.fetch_queue_for(Stage_manager::FLUSH_STAGE);
-  DBUG_ASSERT(first_seen != nullptr);
+  Commit_stage_manager::get_instance().lock_queue(
+      Commit_stage_manager::BINLOG_FLUSH_STAGE);
+
+  THD *first_seen =
+      Commit_stage_manager::get_instance().fetch_queue_skip_acquire_lock(
+          Commit_stage_manager::BINLOG_FLUSH_STAGE);
+  assert(first_seen != nullptr);
+
+  THD *commit_order_thd =
+      Commit_stage_manager::get_instance().fetch_queue_skip_acquire_lock(
+          Commit_stage_manager::COMMIT_ORDER_FLUSH_STAGE);
+
+  Commit_stage_manager::get_instance().unlock_queue(
+      Commit_stage_manager::BINLOG_FLUSH_STAGE);
+
+  if (!check_and_skip_flush_logs ||
+      (check_and_skip_flush_logs && commit_order_thd != nullptr)) {
+    /*
+      We flush prepared records of transactions to the log of storage
+      engine (for example, InnoDB redo log) in a group right before
+      flushing them to binary log.
+    */
+    ha_flush_logs(true);
+  }
+
   /*
-    We flush prepared records of transactions to the log of storage
-    engine (for example, InnoDB redo log) in a group right before
-    flushing them to binary log.
+    The transactions are flushed to the disk and so threads
+    executing slave preserve commit order can be unblocked.
   */
-  ha_flush_logs(true);
+  Commit_stage_manager::get_instance()
+      .process_final_stage_for_ordered_commit_group(commit_order_thd);
+  return first_seen;
+}
+
+int MYSQL_BIN_LOG::process_flush_stage_queue(my_off_t *total_bytes_var,
+                                             bool *rotate_var,
+                                             THD **out_queue_var) {
+  DBUG_TRACE;
+#ifndef NDEBUG
+  // number of flushes per group.
+  int no_flushes = 0;
+#endif
+  assert(total_bytes_var && rotate_var && out_queue_var);
+  my_off_t total_bytes = 0;
+  int flush_error = 1;
+  mysql_mutex_assert_owner(&LOCK_log);
+
+  THD *first_seen = fetch_and_process_flush_stage_queue();
   DBUG_EXECUTE_IF("crash_after_flush_engine_log", DBUG_SUICIDE(););
   assign_automatic_gtids_to_flush_group(first_seen);
   /* Flush thread caches to binary log. */
@@ -8184,7 +8316,7 @@ int MYSQL_BIN_LOG::process_flush_stage_queue(my_off_t *total_bytes_var,
     std::pair<int, my_off_t> result = flush_thread_caches(head);
     total_bytes += result.second;
     if (flush_error == 1) flush_error = result.first;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     no_flushes++;
 #endif
   }
@@ -8195,7 +8327,7 @@ int MYSQL_BIN_LOG::process_flush_stage_queue(my_off_t *total_bytes_var,
       (m_binlog_file->get_real_file_size() >= (my_off_t)max_size ||
        DBUG_EVALUATE_IF("simulate_max_binlog_size", true, false)))
     *rotate_var = true;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   DBUG_PRINT("info", ("no_flushes:= %d", no_flushes));
   no_flushes = 0;
 #endif
@@ -8220,8 +8352,9 @@ int MYSQL_BIN_LOG::process_flush_stage_queue(my_off_t *total_bytes_var,
 
 void MYSQL_BIN_LOG::process_commit_stage_queue(THD *thd, THD *first) {
   mysql_mutex_assert_owner(&LOCK_commit);
-#ifndef DBUG_OFF
-  thd->get_transaction()->m_flags.ready_preempt = 1;  // formality by the leader
+#ifndef NDEBUG
+  thd->get_transaction()->m_flags.ready_preempt =
+      true;  // formality by the leader
 #endif
   for (THD *head = first; head; head = head->next_to_commit) {
     DBUG_PRINT("debug", ("Thread ID: %u, commit_error: %d, commit_pending: %s",
@@ -8238,8 +8371,8 @@ void MYSQL_BIN_LOG::process_commit_stage_queue(THD *thd, THD *first) {
       If flush succeeded, attach to the session and commit it in the
       engines.
     */
-#ifndef DBUG_OFF
-    stage_manager.clear_preempt_status(head);
+#ifndef NDEBUG
+    Commit_stage_manager::get_instance().clear_preempt_status(head);
 #endif
     if (head->get_transaction()->sequence_number != SEQ_UNINIT) {
       mysql_mutex_lock(&LOCK_slave_trans_dep_tracker);
@@ -8251,12 +8384,12 @@ void MYSQL_BIN_LOG::process_commit_stage_queue(THD *thd, THD *first) {
       to commit phase. And thd->commit_error cannot be
       COMMIT_ERROR at this moment.
     */
-    DBUG_ASSERT(head->commit_error != THD::CE_COMMIT_ERROR);
+    assert(head->commit_error != THD::CE_COMMIT_ERROR);
     Thd_backup_and_restore switch_thd(thd, head);
     bool all = head->get_transaction()->m_flags.real_commit;
     if (head->get_transaction()->m_flags.commit_low) {
       /* head is parked to have exited append() */
-      DBUG_ASSERT(head->get_transaction()->m_flags.ready_preempt);
+      assert(head->get_transaction()->m_flags.ready_preempt);
       /*
         storage engine commit
        */
@@ -8314,7 +8447,7 @@ void MYSQL_BIN_LOG::process_after_commit_stage_queue(THD *thd, THD *first) {
   }
 }
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 /** Names for the stages. */
 static const char *g_stage_name[] = {
     "FLUSH",
@@ -8323,70 +8456,25 @@ static const char *g_stage_name[] = {
 };
 #endif
 
-/**
-  Enter a stage of the ordered commit procedure.
-
-  Entering is stage is done by:
-
-  - Atomically enqueueing a queue of processes (which is just one for
-    the first phase).
-
-  - If the queue was empty, the thread is the leader for that stage
-    and it should process the entire queue for that stage.
-
-  - If the queue was not empty, the thread is a follower and can go
-    waiting for the commit to finish.
-
-  The function will lock the stage mutex if it was designated the
-  leader for the phase.
-
-  @param thd    Session structure
-  @param stage  The stage to enter
-  @param queue  Queue of threads to enqueue for the stage
-  @param leave_mutex  Mutex that will be released when changing stage
-  @param enter_mutex  Mutex that will be taken when changing stage
-
-  @retval true  The thread should "bail out" and go waiting for the
-                commit to finish
-  @retval false The thread is the leader for the stage and should do
-                the processing.
-*/
-
 bool MYSQL_BIN_LOG::change_stage(THD *thd MY_ATTRIBUTE((unused)),
-                                 Stage_manager::StageID stage, THD *queue,
-                                 mysql_mutex_t *leave_mutex,
+                                 Commit_stage_manager::StageID stage,
+                                 THD *queue, mysql_mutex_t *leave_mutex,
                                  mysql_mutex_t *enter_mutex) {
   DBUG_TRACE;
   DBUG_PRINT("enter", ("thd: 0x%llx, stage: %s, queue: 0x%llx", (ulonglong)thd,
                        g_stage_name[stage], (ulonglong)queue));
-  DBUG_ASSERT(0 <= stage && stage < Stage_manager::STAGE_COUNTER);
-  DBUG_ASSERT(enter_mutex);
-  DBUG_ASSERT(queue);
+  assert(0 <= stage && stage < Commit_stage_manager::STAGE_COUNTER);
+  assert(enter_mutex);
+  assert(queue);
   /*
     enroll_for will release the leave_mutex once the sessions are
     queued.
   */
-  if (!stage_manager.enroll_for(stage, queue, leave_mutex)) {
-    DBUG_ASSERT(!thd_get_cache_mngr(thd)->dbug_any_finalized());
+  if (!Commit_stage_manager::get_instance().enroll_for(
+          stage, queue, leave_mutex, enter_mutex)) {
+    assert(!thd_get_cache_mngr(thd)->dbug_any_finalized());
     return true;
   }
-
-#ifndef DBUG_OFF
-  if (stage == Stage_manager::SYNC_STAGE)
-    DEBUG_SYNC(thd, "bgc_between_flush_and_sync");
-#endif
-
-  /*
-    We do not lock the enter_mutex if it is LOCK_log when rotating binlog
-    caused by logging incident log event, since it is already locked.
-  */
-  bool need_lock_enter_mutex =
-      !(is_rotating_caused_by_incident && enter_mutex == &LOCK_log);
-
-  if (need_lock_enter_mutex)
-    mysql_mutex_lock(enter_mutex);
-  else
-    mysql_mutex_assert_owner(enter_mutex);
 
   return false;
 }
@@ -8447,7 +8535,7 @@ std::pair<bool, bool> MYSQL_BIN_LOG::sync_binlog_file(bool force) {
 
    It is typically used in this manner:
    @code
-   if (enter_stage(thd, Thread_queue::FLUSH_STAGE, thd, &LOCK_log))
+   if (enter_stage(thd, Thread_queue::BINLOG_FLUSH_STAGE, thd, &LOCK_log))
      return finish_commit(thd);
    @endcode
 
@@ -8466,6 +8554,7 @@ int MYSQL_BIN_LOG::finish_commit(THD *thd) {
     binlog_cache_mngr *cache_mngr = thd_get_cache_mngr(thd);
     if (cache_mngr) cache_mngr->reset();
   }
+
   if (thd->get_transaction()->sequence_number != SEQ_UNINIT) {
     mysql_mutex_lock(&LOCK_slave_trans_dep_tracker);
     m_dependency_tracker.update_max_committed(thd);
@@ -8477,7 +8566,7 @@ int MYSQL_BIN_LOG::finish_commit(THD *thd) {
       Now flush error and sync erros are ignored and we are continuing and
       committing. And at this time, commit_error cannot be COMMIT_ERROR.
     */
-    DBUG_ASSERT(thd->commit_error != THD::CE_COMMIT_ERROR);
+    assert(thd->commit_error != THD::CE_COMMIT_ERROR);
     /*
       storage engine commit
     */
@@ -8520,11 +8609,11 @@ int MYSQL_BIN_LOG::finish_commit(THD *thd) {
 
   DBUG_EXECUTE_IF("leaving_finish_commit", {
     const char act[] = "now SIGNAL signal_leaving_finish_commit";
-    DBUG_ASSERT(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+    assert(!debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
   };);
 
-  DBUG_ASSERT(thd->commit_error || !thd->get_transaction()->m_flags.run_hooks);
-  DBUG_ASSERT(!thd_get_cache_mngr(thd)->dbug_any_finalized());
+  assert(thd->commit_error || !thd->get_transaction()->m_flags.run_hooks);
+  assert(!thd_get_cache_mngr(thd)->dbug_any_finalized());
   DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d", thd->thread_id(),
                         thd->commit_error));
   /*
@@ -8543,7 +8632,7 @@ static inline int call_after_sync_hook(THD *queue_head) {
 
   if (NO_HOOK(binlog_storage)) return 0;
 
-  DBUG_ASSERT(queue_head != nullptr);
+  assert(queue_head != nullptr);
   for (THD *thd = queue_head; thd != nullptr; thd = thd->next_to_commit)
     if (likely(thd->commit_error == THD::CE_NONE))
       thd->get_trans_fixed_pos(&log_file, &pos);
@@ -8571,19 +8660,24 @@ static inline int call_after_sync_hook(THD *queue_head) {
                        > Indicates false if LOCK_log is already acquired
                          by the thread (happens when we are handling flush
                          error)
+  @param message Message stating the reason of the failure
 */
 void MYSQL_BIN_LOG::handle_binlog_flush_or_sync_error(THD *thd,
-                                                      bool need_lock_log) {
-  char errmsg[MYSQL_ERRMSG_SIZE];
-  sprintf(
-      errmsg,
-      "An error occurred during %s stage of the commit. "
-      "'binlog_error_action' is set to '%s'.",
-      thd->commit_error == THD::CE_FLUSH_ERROR ? "flush" : "sync",
-      binlog_error_action == ABORT_SERVER ? "ABORT_SERVER" : "IGNORE_ERROR");
+                                                      bool need_lock_log,
+                                                      const char *message) {
+  char errmsg[MYSQL_ERRMSG_SIZE] = {0};
+  if (message == nullptr)
+    sprintf(
+        errmsg,
+        "An error occurred during %s stage of the commit. "
+        "'binlog_error_action' is set to '%s'.",
+        thd->commit_error == THD::CE_FLUSH_ERROR ? "flush" : "sync",
+        binlog_error_action == ABORT_SERVER ? "ABORT_SERVER" : "IGNORE_ERROR");
+  else
+    strncpy(errmsg, message, MYSQL_ERRMSG_SIZE - 1);
   if (binlog_error_action == ABORT_SERVER) {
-    char err_buff[MYSQL_ERRMSG_SIZE + 27];
-    sprintf(err_buff, "%s Hence aborting the server.", errmsg);
+    char err_buff[MYSQL_ERRMSG_SIZE + 25];
+    sprintf(err_buff, "%s Server is being stopped.", errmsg);
     exec_binlog_error_action_abort(err_buff);
   } else {
     DEBUG_SYNC(thd, "before_binlog_closed_due_to_error");
@@ -8608,62 +8702,15 @@ void MYSQL_BIN_LOG::handle_binlog_flush_or_sync_error(THD *thd,
       binlog_error_action=IGNORE_ERROR, clear the error
       and allow the commit to happen in storage engine.
     */
-    if (check_write_error(thd)) thd->clear_error();
+    if (check_write_error(thd) &&
+        DBUG_EVALUATE_IF("simulate_cache_creation_failure", false, true))
+      thd->clear_error();
 
     if (need_lock_log) mysql_mutex_unlock(&LOCK_log);
     DEBUG_SYNC(thd, "after_binlog_closed_due_to_error");
   }
 }
-/**
-  Flush and commit the transaction.
 
-  This will execute an ordered flush and commit of all outstanding
-  transactions and is the main function for the binary log group
-  commit logic. The function performs the ordered commit in two
-  phases.
-
-  The first phase flushes the caches to the binary log and under
-  LOCK_log and marks all threads that were flushed as not pending.
-
-  The second phase executes under LOCK_commit and commits all
-  transactions in order.
-
-  The procedure is:
-
-  1. Queue ourselves for flushing.
-  2. Grab the log lock, which might result is blocking if the mutex is
-     already held by another thread.
-  3. If we were not committed while waiting for the lock
-     1. Fetch the queue
-     2. For each thread in the queue:
-        a. Attach to it
-        b. Flush the caches, saving any error code
-     3. Flush and sync (depending on the value of sync_binlog).
-     4. Signal that the binary log was updated
-  4. Release the log lock
-  5. Grab the commit lock
-     1. For each thread in the queue:
-        a. If there were no error when flushing and the transaction shall be
-  committed:
-           - Commit the transaction, saving the result of executing the commit.
-  6. Release the commit lock
-  7. Call purge, if any of the committed thread requested a purge.
-  8. Return with the saved error code
-
-  @todo The use of @c skip_commit is a hack that we use since the @c
-  TC_LOG Interface does not contain functions to handle
-  savepoints. Once the binary log is eliminated as a handlerton and
-  the @c TC_LOG interface is extended with savepoint handling, this
-  parameter can be removed.
-
-  @param thd Session to commit transaction for
-  @param all   This is @c true if this is a real transaction commit, and
-               @c false otherwise.
-  @param skip_commit
-               This is @c true if the call to @c ha_commit_low should
-               be skipped (it is handled by the caller somehow) and @c
-               false otherwise (the normal case).
- */
 int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   DBUG_TRACE;
   int flush_error = 0, sync_error = 0;
@@ -8671,44 +8718,28 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   bool do_rotate = false;
 
   DBUG_EXECUTE_IF("crash_commit_before_log", DBUG_SUICIDE(););
-  /*
-    These values are used while flushing a transaction, so clear
-    everything.
-
-    Notes:
-
-    - It would be good if we could keep transaction coordinator
-      log-specific data out of the THD structure, but that is not the
-      case right now.
-
-    - Everything in the transaction structure is reset when calling
-      ha_commit_low since that calls Transaction_ctx::cleanup.
-  */
-  thd->tx_commit_pending = true;
-  thd->commit_error = THD::CE_NONE;
-  thd->next_to_commit = nullptr;
-  thd->durability_property = HA_IGNORE_DURABILITY;
-  thd->get_transaction()->m_flags.real_commit = all;
-  thd->get_transaction()->m_flags.xid_written = false;
-  thd->get_transaction()->m_flags.commit_low = !skip_commit;
-  thd->get_transaction()->m_flags.run_hooks = !skip_commit;
-#ifndef DBUG_OFF
-  /*
-     The group commit Leader may have to wait for follower whose transaction
-     is not ready to be preempted. Initially the status is pessimistic.
-     Preemption guarding logics is necessary only when !DBUG_OFF is set.
-     It won't be required for the dbug-off case as long as the follower won't
-     execute any thread-specific write access code in this method, which is
-     the case as of current.
-  */
-  thd->get_transaction()->m_flags.ready_preempt = 0;
-#endif
-
+  init_thd_variables(thd, all, skip_commit);
   DBUG_PRINT("enter", ("commit_pending: %s, commit_error: %d, thread_id: %u",
                        YESNO(thd->tx_commit_pending), thd->commit_error,
                        thd->thread_id()));
 
   DEBUG_SYNC(thd, "bgc_before_flush_stage");
+
+  /*
+    Stage #0: ensure slave threads commit order as they appear in the slave's
+              relay log for transactions flushing to binary log.
+
+    This will make thread wait until its turn to commit.
+    Commit_order_manager maintains it own queue and its own order for the
+    commit. So Stage#0 doesn't maintain separate StageID.
+  */
+  if (Commit_order_manager::wait_for_its_turn_before_flush_stage(thd) ||
+      ending_trans(thd, all) ||
+      Commit_order_manager::get_rollback_status(thd)) {
+    if (Commit_order_manager::wait(thd)) {
+      return thd->commit_error;
+    }
+  }
 
   /*
     Stage #1: flushing transactions to binary log
@@ -8719,19 +8750,8 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     appointed itself leader for the flush phase.
   */
 
-  if (has_commit_order_manager(thd)) {
-    Slave_worker *worker = dynamic_cast<Slave_worker *>(thd->rli_slave);
-    Commit_order_manager *mngr = worker->get_commit_order_manager();
-
-    if (mngr->wait_for_its_turn(worker, all)) {
-      thd->commit_error = THD::CE_COMMIT_ERROR;
-      return thd->commit_error;
-    }
-
-    if (change_stage(thd, Stage_manager::FLUSH_STAGE, thd, nullptr, &LOCK_log))
-      return finish_commit(thd);
-  } else if (change_stage(thd, Stage_manager::FLUSH_STAGE, thd, nullptr,
-                          &LOCK_log)) {
+  if (change_stage(thd, Commit_stage_manager::BINLOG_FLUSH_STAGE, thd, nullptr,
+                   &LOCK_log)) {
     DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d", thd->thread_id(),
                           thd->commit_error));
     return finish_commit(thd);
@@ -8742,7 +8762,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   my_off_t flush_end_pos = 0;
   bool update_binlog_end_pos_after_sync;
   if (unlikely(!is_open())) {
-    final_queue = stage_manager.fetch_queue_for(Stage_manager::FLUSH_STAGE);
+    final_queue = fetch_and_process_flush_stage_queue(true);
     leave_mutex_before_commit_stage = &LOCK_log;
     /*
       binary log is closed, flush stage and sync stage should be
@@ -8770,7 +8790,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
   */
   if (flush_error == 0) {
     const char *file_name_ptr = log_file_name + dirname_length(log_file_name);
-    DBUG_ASSERT(flush_end_pos != 0);
+    assert(flush_end_pos != 0);
     if (RUN_HOOK(binlog_storage, after_flush,
                  (thd, file_name_ptr, flush_end_pos))) {
       LogErr(ERROR_LEVEL, ER_BINLOG_FAILED_TO_RUN_AFTER_FLUSH_HOOK);
@@ -8786,7 +8806,11 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     /*
       Handle flush error (if any) after leader finishes it's flush stage.
     */
-    handle_binlog_flush_or_sync_error(thd, false /* need_lock_log */);
+    handle_binlog_flush_or_sync_error(
+        thd, false /* need_lock_log */,
+        (thd->commit_error == THD::CE_FLUSH_GNO_EXHAUSTED_ERROR)
+            ? ER_THD(thd, ER_GNO_EXHAUSTED)
+            : nullptr);
   }
 
   DEBUG_SYNC(thd, "bgc_after_flush_stage_before_sync_stage");
@@ -8795,7 +8819,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     Stage #2: Syncing binary log file to disk
   */
 
-  if (change_stage(thd, Stage_manager::SYNC_STAGE, wait_queue, &LOCK_log,
+  if (change_stage(thd, Commit_stage_manager::SYNC_STAGE, wait_queue, &LOCK_log,
                    &LOCK_sync)) {
     DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d", thd->thread_id(),
                           thd->commit_error));
@@ -8811,11 +8835,12 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit) {
     for every group just like how it is done when sync_binlog= 1.
   */
   if (!flush_error && (sync_counter + 1 >= get_sync_period()))
-    stage_manager.wait_count_or_timeout(
+    Commit_stage_manager::get_instance().wait_count_or_timeout(
         opt_binlog_group_commit_sync_no_delay_count,
-        opt_binlog_group_commit_sync_delay, Stage_manager::SYNC_STAGE);
+        opt_binlog_group_commit_sync_delay, Commit_stage_manager::SYNC_STAGE);
 
-  final_queue = stage_manager.fetch_queue_for(Stage_manager::SYNC_STAGE);
+  final_queue = Commit_stage_manager::get_instance().fetch_queue_acquire_lock(
+      Commit_stage_manager::SYNC_STAGE);
 
   if (flush_error == 0 && total_bytes > 0) {
     DEBUG_SYNC(thd, "before_sync_binlog_file");
@@ -8859,14 +8884,15 @@ commit_stage:
   /* Clone needs binlog commit order. */
   if ((opt_binlog_order_commits || Clone_handler::need_commit_order()) &&
       (sync_error == 0 || binlog_error_action != ABORT_SERVER)) {
-    if (change_stage(thd, Stage_manager::COMMIT_STAGE, final_queue,
+    if (change_stage(thd, Commit_stage_manager::COMMIT_STAGE, final_queue,
                      leave_mutex_before_commit_stage, &LOCK_commit)) {
       DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d", thd->thread_id(),
                             thd->commit_error));
       return finish_commit(thd);
     }
     THD *commit_queue =
-        stage_manager.fetch_queue_for(Stage_manager::COMMIT_STAGE);
+        Commit_stage_manager::get_instance().fetch_queue_acquire_lock(
+            Commit_stage_manager::COMMIT_STAGE);
     DBUG_EXECUTE_IF("semi_sync_3-way_deadlock",
                     DEBUG_SYNC(thd, "before_process_commit_stage_queue"););
 
@@ -8907,14 +8933,14 @@ commit_stage:
     Handle sync error after we release all locks in order to avoid deadlocks
   */
   if (sync_error)
-    handle_binlog_flush_or_sync_error(thd, true /* need_lock_log */);
+    handle_binlog_flush_or_sync_error(thd, true /* need_lock_log */, nullptr);
 
   DEBUG_SYNC(thd, "before_signal_done");
   /* Commit done so signal all waiting threads */
-  stage_manager.signal_done(final_queue);
+  Commit_stage_manager::get_instance().signal_done(final_queue);
   DBUG_EXECUTE_IF("block_leader_after_delete", {
     const char action[] = "now SIGNAL leader_proceed";
-    DBUG_ASSERT(!debug_sync_set_action(thd, STRING_WITH_LEN(action)));
+    assert(!debug_sync_set_action(thd, STRING_WITH_LEN(action)));
   };);
 
   /*
@@ -8992,46 +9018,66 @@ commit_stage:
   the binary log is rotated we force engines to commit (and we fsync
   the old binary log).
 
-  @retval 0 Success
-  @retval 1 Out of memory, or storage engine returns error.
+  @retval false Success
+  @retval true Out of memory, or storage engine returns error.
 */
-static int binlog_recover(Binlog_file_reader *binlog_file_reader,
-                          my_off_t *valid_pos) {
-  Log_event *ev;
+static bool binlog_recover(Binlog_file_reader *binlog_file_reader,
+                           my_off_t *valid_pos) {
+  bool res = false;
+  binlog::tools::Iterator it(binlog_file_reader);
+  it.set_copy_event_buffer();
+
   /*
     The flag is used for handling the case that a transaction
     is partially written to the binlog.
   */
   bool in_transaction = false;
   int memory_page_size = my_getpagesize();
-
   {
     MEM_ROOT mem_root(key_memory_binlog_recover_exec, memory_page_size);
-    memroot_unordered_set<my_xid> xids(&mem_root);
+    mem_root_unordered_set<my_xid> xids(&mem_root);
 
-    while ((ev = binlog_file_reader->read_event_object())) {
-      if (ev->get_type_code() == binary_log::QUERY_EVENT &&
-          !strcmp(((Query_log_event *)ev)->query, "BEGIN"))
-        in_transaction = true;
+    /*
+      now process events in the queue. Queue is dynamically changed
+      everytime we process an event. This may be a bit suboptimal
+      since it adds an indirection, but it helps to generalize the
+      usage of the transaction payload event (which unfolds into
+      several events into the queue when it is processed).
+    */
+    for (Log_event *ev = it.begin(); !res && (ev != it.end()); ev = it.next()) {
+      switch (ev->get_type_code()) {
+        // may be begin, middle or end of a transaction
+        case binary_log::QUERY_EVENT: {
+          // starts a transaction
+          if (!strcmp(((Query_log_event *)ev)->query, "BEGIN"))
+            in_transaction = true;
 
-      if (ev->get_type_code() == binary_log::QUERY_EVENT &&
-          !strcmp(((Query_log_event *)ev)->query, "COMMIT")) {
-        DBUG_ASSERT(in_transaction == true);
-        in_transaction = false;
-      } else if (ev->get_type_code() == binary_log::XID_EVENT ||
-                 is_atomic_ddl_event(ev)) {
-        my_xid xid;
-
-        if (ev->get_type_code() == binary_log::XID_EVENT) {
-          DBUG_ASSERT(in_transaction == true);
-          in_transaction = false;
-          Xid_log_event *xev = (Xid_log_event *)ev;
-          xid = xev->xid;
-        } else {
-          xid = ((Query_log_event *)ev)->ddl_xid;
+          // ends a transaction
+          if (!strcmp(((Query_log_event *)ev)->query, "COMMIT")) {
+            assert(in_transaction == true);
+            in_transaction = false;
+          }
+          // starts and ends a transaction
+          if (is_atomic_ddl_event(ev)) {
+            assert(in_transaction == false);
+            auto qev = dynamic_cast<Query_log_event *>(ev);
+            assert(qev != nullptr);
+            res = (qev == nullptr || !xids.insert(qev->ddl_xid).second);
+          }
+          break;
         }
-
-        if (!xids.insert(xid).second) goto err1;
+        // ends a transaction
+        case binary_log::XID_EVENT: {
+          assert(in_transaction == true);
+          in_transaction = false;
+          Xid_log_event *xev = dynamic_cast<Xid_log_event *>(ev);
+          assert(xev != nullptr);
+          res = (xev == nullptr || !xids.insert(xev->xid).second);
+          break;
+        }
+        default: {
+          break;
+        }
       }
 
       /*
@@ -9073,6 +9119,8 @@ static int binlog_recover(Binlog_file_reader *binlog_file_reader,
         *valid_pos = binlog_file_reader->position();
 
       delete ev;
+      ev = nullptr;
+      res = it.has_error();
     }
 
     /*
@@ -9081,14 +9129,133 @@ static int binlog_recover(Binlog_file_reader *binlog_file_reader,
       will result in an assert. (Production builds would be safe since
       ha_recover returns right away if total_ha_2pc <= opt_log_bin.)
      */
-    if (total_ha_2pc > 1 && ha_recover(&xids)) goto err1;
+    res = res || (total_ha_2pc > 1 && ha_recover(&xids));
   }
 
-  return 0;
+  if (res) LogErr(ERROR_LEVEL, ER_BINLOG_CRASH_RECOVERY_FAILED);
+  return res;
+}
 
-err1:
-  LogErr(ERROR_LEVEL, ER_BINLOG_CRASH_RECOVERY_FAILED);
-  return 1;
+void MYSQL_BIN_LOG::report_missing_purged_gtids(
+    const Gtid_set *slave_executed_gtid_set, const char **errmsg) {
+  DBUG_TRACE;
+  THD *thd = current_thd;
+  Gtid_set gtid_missing(gtid_state->get_lost_gtids()->get_sid_map());
+  gtid_missing.add_gtid_set(gtid_state->get_lost_gtids());
+  gtid_missing.remove_gtid_set(slave_executed_gtid_set);
+
+  String tmp_uuid;
+
+  /* Protects thd->user_vars. */
+  mysql_mutex_lock(&current_thd->LOCK_thd_data);
+  const auto it = current_thd->user_vars.find("slave_uuid");
+  if (it != current_thd->user_vars.end() && it->second->length() > 0) {
+    tmp_uuid.copy(it->second->ptr(), it->second->length(), NULL);
+  }
+  mysql_mutex_unlock(&current_thd->LOCK_thd_data);
+
+  char *missing_gtids = NULL;
+  char *slave_executed_gtids = NULL;
+  gtid_missing.to_string(&missing_gtids, NULL);
+  slave_executed_gtid_set->to_string(&slave_executed_gtids, NULL);
+
+  /*
+     Log the information about the missing purged GTIDs to the error log.
+  */
+  std::ostringstream log_info;
+  log_info << "The missing transactions are '" << missing_gtids << "'";
+
+  LogErr(WARNING_LEVEL, ER_FOUND_MISSING_GTIDS, tmp_uuid.ptr(),
+         log_info.str().c_str());
+
+  /*
+     Send the information about the slave executed GTIDs and missing
+     purged GTIDs to slave if the message is less than MYSQL_ERRMSG_SIZE.
+  */
+  std::ostringstream gtid_info;
+  gtid_info << "The GTID set sent by the slave is '" << slave_executed_gtids
+            << "', and the missing transactions are '" << missing_gtids << "'";
+  *errmsg = ER_THD(thd, ER_MASTER_HAS_PURGED_REQUIRED_GTIDS);
+
+  /* Don't consider the "%s" in the format string. Subtract 2 from the
+     total length */
+  int total_length = (strlen(*errmsg) - 2 + gtid_info.str().length());
+
+  DBUG_EXECUTE_IF("simulate_long_missing_gtids",
+                  { total_length = MYSQL_ERRMSG_SIZE + 1; });
+
+  if (total_length > MYSQL_ERRMSG_SIZE)
+    gtid_info.str(
+        "The GTID sets and the missing purged transactions are too"
+        " long to print in this message. For more information,"
+        " please see the master's error log or the manual for"
+        " GTID_SUBTRACT");
+
+  /* Buffer for formatting the message about the missing GTIDs. */
+  static char buff[MYSQL_ERRMSG_SIZE];
+  snprintf(buff, MYSQL_ERRMSG_SIZE, *errmsg, gtid_info.str().c_str());
+  *errmsg = const_cast<const char *>(buff);
+
+  my_free(missing_gtids);
+  my_free(slave_executed_gtids);
+}
+
+void MYSQL_BIN_LOG::report_missing_gtids(
+    const Gtid_set *previous_gtid_set, const Gtid_set *slave_executed_gtid_set,
+    const char **errmsg) {
+  DBUG_TRACE;
+  THD *thd = current_thd;
+  char *missing_gtids = NULL;
+  char *slave_executed_gtids = NULL;
+  Gtid_set gtid_missing(slave_executed_gtid_set->get_sid_map());
+  gtid_missing.add_gtid_set(slave_executed_gtid_set);
+  gtid_missing.remove_gtid_set(previous_gtid_set);
+  gtid_missing.to_string(&missing_gtids, NULL);
+  slave_executed_gtid_set->to_string(&slave_executed_gtids, NULL);
+
+  String tmp_uuid;
+
+  /* Protects thd->user_vars. */
+  mysql_mutex_lock(&current_thd->LOCK_thd_data);
+  const auto it = current_thd->user_vars.find("slave_uuid");
+  if (it != current_thd->user_vars.end() && it->second->length() > 0) {
+    tmp_uuid.copy(it->second->ptr(), it->second->length(), NULL);
+  }
+  mysql_mutex_unlock(&current_thd->LOCK_thd_data);
+
+  /*
+     Log the information about the missing purged GTIDs to the error log.
+  */
+  std::ostringstream log_info;
+  log_info << "If the binary log files have been deleted from disk,"
+              " check the consistency of 'GTID_PURGED' variable."
+              " The missing transactions are '"
+           << missing_gtids << "'";
+  LogErr(WARNING_LEVEL, ER_FOUND_MISSING_GTIDS, tmp_uuid.ptr(),
+         log_info.str().c_str());
+  /*
+     Send the information about the slave executed GTIDs and missing
+     purged GTIDs to slave if the message is less than MYSQL_ERRMSG_SIZE.
+  */
+  std::ostringstream gtid_info;
+  gtid_info << "The GTID set sent by the slave is '" << slave_executed_gtids
+            << "', and the missing transactions are '" << missing_gtids << "'";
+  *errmsg = ER_THD(thd, ER_MASTER_HAS_PURGED_REQUIRED_GTIDS);
+
+  /* Don't consider the "%s" in the format string. Subtract 2 from the
+     total length */
+  if ((strlen(*errmsg) - 2 + gtid_info.str().length()) > MYSQL_ERRMSG_SIZE)
+    gtid_info.str(
+        "The GTID sets and the missing purged transactions are too"
+        " long to print in this message. For more information,"
+        " please see the master's error log or the manual for"
+        " GTID_SUBTRACT");
+  /* Buffer for formatting the message about the missing GTIDs. */
+  static char buff[MYSQL_ERRMSG_SIZE];
+  snprintf(buff, MYSQL_ERRMSG_SIZE, *errmsg, gtid_info.str().c_str());
+  *errmsg = const_cast<const char *>(buff);
+  my_free(missing_gtids);
+  my_free(slave_executed_gtids);
 }
 
 void MYSQL_BIN_LOG::update_binlog_end_pos(bool need_lock) {
@@ -9115,16 +9282,16 @@ bool THD::is_binlog_cache_empty(bool is_transactional) const {
 
   // If opt_bin_log==0, it is not safe to call thd_get_cache_mngr
   // because binlog_hton has not been completely set up.
-  DBUG_ASSERT(opt_bin_log);
+  assert(opt_bin_log);
   binlog_cache_mngr *cache_mngr = thd_get_cache_mngr(this);
 
   // cache_mngr is NULL until we call thd->binlog_setup_trx_data, so
   // we assert that this has been done.
-  DBUG_ASSERT(cache_mngr != nullptr);
+  assert(cache_mngr != nullptr);
 
   binlog_cache_data *cache_data =
       cache_mngr->get_binlog_cache_data(is_transactional);
-  DBUG_ASSERT(cache_data != nullptr);
+  assert(cache_data != nullptr);
 
   return cache_data->is_binlog_empty();
 }
@@ -9319,8 +9486,8 @@ int THD::binlog_write_table_map(TABLE *table, bool is_transactional,
                        table->s->table_map_id.id()));
 
   /* Pre-conditions */
-  DBUG_ASSERT(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
-  DBUG_ASSERT(table->s->table_map_id.is_valid());
+  assert(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
+  assert(table->s->table_map_id.is_valid());
 
   Table_map_log_event the_event(this, table, table->s->table_map_id,
                                 is_transactional);
@@ -9462,7 +9629,7 @@ void THD::add_to_binlog_accessed_dbs(const char *db_param) {
       char **ref_cur_db = it.ref();
       int cmp = strcmp(after_db, *ref_cur_db);
 
-      DBUG_ASSERT(!swap || cmp < 0);
+      assert(!swap || cmp < 0);
 
       if (cmp == 0) {
         after_db = nullptr; /* dup to ignore */
@@ -9496,10 +9663,10 @@ static bool has_write_table_with_auto_increment(TABLE_LIST *tables) {
     /* we must do preliminary checks as table->table may be NULL */
     if (!table->is_placeholder() && table->table->found_next_number_field &&
         (table->lock_descriptor().type >= TL_WRITE_ALLOW_WRITE))
-      return 1;
+      return true;
   }
 
-  return 0;
+  return false;
 }
 
 /*
@@ -9507,7 +9674,7 @@ static bool has_write_table_with_auto_increment(TABLE_LIST *tables) {
    with auto-increment column.
 
   SYNOPSIS
-   has_two_write_locked_tables_with_auto_increment_and_select
+   has_two_write_locked_tables_with_auto_increment_and_query_block
       tables        Table list
 
   RETURN VALUES
@@ -9519,17 +9686,18 @@ static bool has_write_table_with_auto_increment(TABLE_LIST *tables) {
    -false otherwise
 */
 
-static bool has_write_table_with_auto_increment_and_select(TABLE_LIST *tables) {
-  bool has_select = false;
+static bool has_write_table_with_auto_increment_and_query_block(
+    TABLE_LIST *tables) {
+  bool has_query_block = false;
   bool has_auto_increment_tables = has_write_table_with_auto_increment(tables);
   for (TABLE_LIST *table = tables; table; table = table->next_global) {
     if (!table->is_placeholder() &&
         (table->lock_descriptor().type <= TL_READ_NO_INSERT)) {
-      has_select = true;
+      has_query_block = true;
       break;
     }
   }
-  return (has_select && has_auto_increment_tables);
+  return (has_query_block && has_auto_increment_tables);
 }
 
 /*
@@ -9548,10 +9716,10 @@ static bool has_write_table_auto_increment_not_first_in_pk(TABLE_LIST *tables) {
     if (!table->is_placeholder() && table->table->found_next_number_field &&
         (table->lock_descriptor().type >= TL_WRITE_ALLOW_WRITE) &&
         table->table->s->next_number_keypart != 0)
-      return 1;
+      return true;
   }
 
-  return 0;
+  return false;
 }
 
 /**
@@ -9582,6 +9750,24 @@ static bool has_write_table_with_nondeterministic_default(
   return false;
 }
 
+/**
+  Checks if we have reads from ACL tables in table list.
+
+  @param  thd       Current thread
+  @param  tl_list   TABLE_LIST used by current command.
+
+  @returns true, if we statement is unsafe, otherwise false.
+*/
+static bool has_acl_table_read(THD *thd, const TABLE_LIST *tl_list) {
+  for (const TABLE_LIST *tl = tl_list; tl != nullptr; tl = tl->next_global) {
+    if (is_acl_table_in_non_LTM(tl, thd->locked_tables_mode) &&
+        (tl->lock_descriptor().type == TL_READ_DEFAULT ||
+         tl->lock_descriptor().type == TL_READ_HIGH_PRIORITY))
+      return true;
+  }
+  return false;
+}
+
 /*
   Function to check whether the table in query uses a fulltext parser
   plugin or not.
@@ -9598,7 +9784,7 @@ static bool inline fulltext_unsafe_set(TABLE_SHARE *s) {
   }
   return false;
 }
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 const char *get_locked_tables_mode_name(
     enum_locked_tables_mode locked_tables_mode) {
   switch (locked_tables_mode) {
@@ -9816,7 +10002,7 @@ int THD::decide_logging_format(TABLE_LIST *tables) {
       on modifying gtid_executed table.
     */
     int warned_gtid_executed_table = 0;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     {
       DBUG_PRINT("debug", ("prelocked_mode: %s",
                            get_locked_tables_mode_name(locked_tables_mode)));
@@ -9830,7 +10016,7 @@ int THD::decide_logging_format(TABLE_LIST *tables) {
         are fetched fron the select tables cannot be determined and may differ
         on master and slave.
        */
-      if (has_write_table_with_auto_increment_and_select(tables))
+      if (has_write_table_with_auto_increment_and_query_block(tables))
         lex->set_stmt_unsafe(LEX::BINLOG_STMT_UNSAFE_WRITE_AUTOINC_SELECT);
 
       if (has_write_table_auto_increment_not_first_in_pk(tables))
@@ -9857,6 +10043,18 @@ int THD::decide_logging_format(TABLE_LIST *tables) {
               lex->first_not_own_table()))
         lex->set_stmt_unsafe(
             LEX::BINLOG_STMT_UNSAFE_DEFAULT_EXPRESSION_IN_SUBSTATEMENT);
+
+      /*
+        A DML or DDL statement is unsafe if it reads a ACL table while
+        modifing the table, because SE skips acquiring row locks.
+        Therefore rows seen by DML or DDL may not have same effect on slave.
+
+        We skip checking the same under lock tables mode, because we do
+        not skip row locks on ACL table in this mode.
+      */
+      if (has_acl_table_read(this, tables)) {
+        lex->set_stmt_unsafe(LEX::BINLOG_STMT_UNSAFE_ACL_TABLE_READ_IN_DML_DDL);
+      }
     }
 
     /*
@@ -10008,8 +10206,8 @@ int THD::decide_logging_format(TABLE_LIST *tables) {
 
       prev_access_table = table->table;
     }
-    DBUG_ASSERT(!is_write || write_to_some_transactional_table ||
-                write_to_some_non_transactional_table);
+    assert(!is_write || write_to_some_transactional_table ||
+           write_to_some_non_transactional_table);
     /*
       write_all_non_transactional_are_tmp_tables may be true if any
       non-transactional table was not updated, so we fix its value here.
@@ -10156,11 +10354,12 @@ int THD::decide_logging_format(TABLE_LIST *tables) {
          I.e., nothing prevents us from row logging if needed. */
       else {
         if (lex->is_stmt_unsafe() || lex->is_stmt_row_injection() ||
+            lex->is_stmt_unsafe_with_mixed_mode() ||
             (flags_write_all_set & HA_BINLOG_STMT_CAPABLE) == 0 ||
             lex->stmt_accessed_table(LEX::STMT_READS_TEMP_TRANS_TABLE) ||
             lex->stmt_accessed_table(LEX::STMT_READS_TEMP_NON_TRANS_TABLE) ||
             is_create_drop_temp_table) {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
           int flags = lex->get_stmt_unsafe_flags();
           DBUG_PRINT("info", ("setting row format for unsafe statement"));
           for (int i = 0; i < Query_tables_list::BINLOG_STMT_UNSAFE_COUNT;
@@ -10177,6 +10376,8 @@ int THD::decide_logging_format(TABLE_LIST *tables) {
                      ("is_row_injection=%d", lex->is_stmt_row_injection()));
           DBUG_PRINT("info", ("stmt_capable=%llu",
                               (flags_write_all_set & HA_BINLOG_STMT_CAPABLE)));
+          DBUG_PRINT("info", ("lex->is_stmt_unsafe_with_mixed_mode = %d",
+                              lex->is_stmt_unsafe_with_mixed_mode()));
 #endif
           /* log in row format! */
           set_current_stmt_binlog_format_row_if_mixed();
@@ -10222,9 +10423,9 @@ int THD::decide_logging_format(TABLE_LIST *tables) {
       for (TABLE_LIST *table = tables; table; table = table->next_global) {
         if (table->is_placeholder()) continue;
 
-        DBUG_ASSERT(table->table);
+        assert(table->table);
 
-        if (table->table->file->referenced_by_foreign_key()) {
+        if (table->table->s->is_referenced_by_foreign_key()) {
           /*
              FK-referenced dbs can't be gathered currently. The following
              event will be marked for sequential execution on slave.
@@ -10323,11 +10524,11 @@ static bool handle_gtid_consistency_violation(THD *thd, int error_code,
   global_sid_lock->rdlock();
   enum_gtid_consistency_mode gtid_consistency_mode =
       get_gtid_consistency_mode();
-  enum_gtid_mode gtid_mode = get_gtid_mode(GTID_MODE_LOCK_SID);
+  auto gtid_mode = global_gtid_mode.get();
 
   DBUG_PRINT("info", ("gtid_next.type=%d gtid_mode=%s "
                       "gtid_consistency_mode=%d error=%d query=%s",
-                      gtid_next_type, get_gtid_mode_string(gtid_mode),
+                      gtid_next_type, Gtid_mode::to_string(gtid_mode),
                       gtid_consistency_mode, error_code, thd->query().str));
 
   /*
@@ -10339,7 +10540,7 @@ static bool handle_gtid_consistency_violation(THD *thd, int error_code,
     - ENFORCE_GTID_CONSISTENCY=ON.
   */
   if ((gtid_next_type == AUTOMATIC_GTID &&
-       gtid_mode >= GTID_MODE_ON_PERMISSIVE) ||
+       gtid_mode >= Gtid_mode::ON_PERMISSIVE) ||
       gtid_next_type == ASSIGNED_GTID ||
       gtid_consistency_mode == GTID_CONSISTENCY_MODE_ON) {
     global_sid_lock->unlock();
@@ -10364,7 +10565,7 @@ static bool handle_gtid_consistency_violation(THD *thd, int error_code,
       if (gtid_next_type == AUTOMATIC_GTID)
         gtid_state->begin_automatic_gtid_violating_transaction();
       else {
-        DBUG_ASSERT(gtid_next_type == ANONYMOUS_GTID);
+        assert(gtid_next_type == ANONYMOUS_GTID);
         gtid_state->begin_anonymous_gtid_violating_transaction();
       }
 
@@ -10402,31 +10603,34 @@ bool THD::is_ddl_gtid_compatible() {
       mysql_bin_log.is_open() == false)
     return true;
 
-  DBUG_PRINT("info",
-             ("SQLCOM_CREATE:%d CREATE-TMP:%d SELECT:%d SQLCOM_DROP:%d "
-              "DROP-TMP:%d trx:%d",
-              lex->sql_command == SQLCOM_CREATE_TABLE,
-              (lex->sql_command == SQLCOM_CREATE_TABLE &&
-               (lex->create_info->options & HA_LEX_CREATE_TMP_TABLE)),
-              lex->select_lex->item_list.elements,
-              lex->sql_command == SQLCOM_DROP_TABLE,
-              (lex->sql_command == SQLCOM_DROP_TABLE && lex->drop_temporary),
-              in_multi_stmt_transaction_mode()));
+  DBUG_PRINT(
+      "info",
+      ("SQLCOM_CREATE:%d CREATE-TMP:%d SELECT:%zu SQLCOM_DROP:%d "
+       "DROP-TMP:%d trx:%d",
+       lex->sql_command == SQLCOM_CREATE_TABLE,
+       (lex->sql_command == SQLCOM_CREATE_TABLE &&
+        (lex->create_info->options & HA_LEX_CREATE_TMP_TABLE)),
+       lex->query_block->fields.size(), lex->sql_command == SQLCOM_DROP_TABLE,
+       (lex->sql_command == SQLCOM_DROP_TABLE && lex->drop_temporary),
+       in_multi_stmt_transaction_mode()));
 
   if (lex->sql_command == SQLCOM_CREATE_TABLE &&
       !(lex->create_info->options & HA_LEX_CREATE_TMP_TABLE) &&
-      lex->select_lex->item_list.elements) {
-    /*
-      CREATE ... SELECT (without TEMPORARY) is unsafe because if
-      binlog_format=row it will be logged as a CREATE TABLE followed
-      by row events, re-executed non-atomically as two transactions,
-      and then written to the slave's binary log as two separate
-      transactions with the same GTID.
-    */
-    bool ret = handle_gtid_consistency_violation(
-        this, ER_GTID_UNSAFE_CREATE_SELECT,
-        ER_RPL_GTID_UNSAFE_STMT_CREATE_SELECT);
-    return ret;
+      !lex->query_block->field_list_is_empty()) {
+    if (!(get_default_handlerton(this, lex->create_info->db_type)->flags &
+          HTON_SUPPORTS_ATOMIC_DDL)) {
+      /*
+        CREATE ... SELECT (without TEMPORARY) for engines not supporting atomic
+        DDL is unsafe because if binlog_format=row it will be logged as a CREATE
+        TABLE followed by row events, re-executed non-atomically as two
+        transactions, and then written to the slave's binary log as two separate
+        transactions with the same GTID.
+      */
+      bool ret = handle_gtid_consistency_violation(
+          this, ER_GTID_UNSAFE_CREATE_SELECT,
+          ER_RPL_GTID_UNSAFE_STMT_CREATE_SELECT);
+      return ret;
+    }
   } else if ((lex->sql_command == SQLCOM_CREATE_TABLE &&
               (lex->create_info->options & HA_LEX_CREATE_TMP_TABLE) != 0) ||
              (lex->sql_command == SQLCOM_DROP_TABLE && lex->drop_temporary)) {
@@ -10531,6 +10735,8 @@ Rows_log_event *THD::binlog_prepare_pending_rows_event(
     const unsigned char *extra_row_info, uint32 source_part_id) {
   DBUG_TRACE;
 
+  DBUG_EXECUTE_IF("simulate_null_pending_rows_event", { return nullptr; });
+
   /* Fetch the type code for the RowsEventT template parameter */
   int const general_type_code = RowsEventT::TYPE_CODE;
 
@@ -10611,30 +10817,31 @@ class Row_data_memory {
     @param data
     Pointer to the table record.
    */
-  Row_data_memory(TABLE *table, const uchar *data) : m_memory(0) {
-#ifndef DBUG_OFF
+  Row_data_memory(TABLE *table, const uchar *data) : m_memory(nullptr) {
+#ifndef NDEBUG
     m_alloc_checked = false;
 #endif
     allocate_memory(table, max_row_length(table, data));
-    m_ptr[0] = has_memory() ? m_memory : 0;
-    m_ptr[1] = 0;
+    m_ptr[0] = has_memory() ? m_memory : nullptr;
+    m_ptr[1] = nullptr;
   }
 
   Row_data_memory(TABLE *table, const uchar *data1, const uchar *data2,
                   ulonglong value_options = 0)
-      : m_memory(0) {
-#ifndef DBUG_OFF
+      : m_memory(nullptr) {
+#ifndef NDEBUG
     m_alloc_checked = false;
 #endif
     size_t len1 = max_row_length(table, data1);
     size_t len2 = max_row_length(table, data2, value_options);
     allocate_memory(table, len1 + len2);
-    m_ptr[0] = has_memory() ? m_memory : 0;
-    m_ptr[1] = has_memory() ? m_memory + len1 : 0;
+    m_ptr[0] = has_memory() ? m_memory : nullptr;
+    m_ptr[1] = has_memory() ? m_memory + len1 : nullptr;
   }
 
   ~Row_data_memory() {
-    if (m_memory != 0 && m_release_memory_on_destruction) my_free(m_memory);
+    if (m_memory != nullptr && m_release_memory_on_destruction)
+      my_free(m_memory);
   }
 
   /**
@@ -10644,16 +10851,16 @@ class Row_data_memory {
      @retval false Memory allocation failed
    */
   bool has_memory() const {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     m_alloc_checked = true;
 #endif
-    return m_memory != 0;
+    return m_memory != nullptr;
   }
 
   uchar *slot(uint s) {
-    DBUG_ASSERT(s < sizeof(m_ptr) / sizeof(*m_ptr));
-    DBUG_ASSERT(m_ptr[s] != 0);
-    DBUG_ASSERT(m_alloc_checked == true);
+    assert(s < sizeof(m_ptr) / sizeof(*m_ptr));
+    assert(m_ptr[s] != nullptr);
+    assert(m_alloc_checked == true);
     return m_ptr[s];
   }
 
@@ -10670,101 +10877,99 @@ class Row_data_memory {
   size_t max_row_length(TABLE *table, const uchar *data,
                         ulonglong value_options = 0) {
     TABLE_SHARE *table_s = table->s;
+    Replicated_columns_view fields{table, Replicated_columns_view::OUTBOUND};
     /*
-      The server stores rows using "records".  A record is a
-      sequence of bytes which contains values or pointers to values
-      for all fields (columns).  The server uses table_s->reclength
-      bytes for a row record.
+      The server stores rows using "records".  A record is a sequence of bytes
+      which contains values or pointers to values for all fields (columns).  The
+      server uses table_s->reclength bytes for a row record.
 
       The layout of a record is roughly:
 
-      - N+1+B bits, packed into CEIL((N+1+B)/8) bytes, where N is
-        the number of nullable columns in the table, and B is the
-        sum of the number of bits of all BIT columns.
+      - N+1+B bits, packed into CEIL((N+1+B)/8) bytes, where N is the number of
+        nullable columns in the table, and B is the sum of the number of bits of
+        all BIT columns.
 
-      - A sequence of serialized fields, each corresponding to a
-        non-BIT, non-NULL column in the table.
+      - A sequence of serialized fields, each corresponding to a non-BIT,
+        non-NULL column in the table.
 
-        For variable-length columns, the first component of the
-        serialized field is a length, stored using 1, 2, 3, or 4
-        bytes depending on the maximum length for the data type.
+        For variable-length columns, the first component of the serialized field
+        is a length, stored using 1, 2, 3, or 4 bytes depending on the maximum
+        length for the data type.
 
-        For most data types, the next component of the serialized
-        field is the actual data.  But for for VARCHAR, VARBINARY,
-        TEXT, BLOB, and JSON, the next component of the serialized
-        field is a serialized pointer, i.e. sizeof(pointer) bytes,
-        which point to another memory area where the actual data is
-        stored.
+        For most data types, the next component of the serialized field is the
+        actual data.  But for for VARCHAR, VARBINARY, TEXT, BLOB, and JSON, the
+        next component of the serialized field is a serialized pointer,
+        i.e. sizeof(pointer) bytes, which point to another memory area where the
+        actual data is stored.
 
       The layout of a row image in the binary log is roughly:
 
-      - If this is an after-image and partial JSON is enabled, 1
-        byte containing value_options.  If the PARTIAL_JSON bit of
-        value_options is set, this is followed by P bits (the
-        "partial_bits"), packed into CEIL(P) bytes, where P is the
-        number of JSON columns in the table.
+      - If this is an after-image and partial JSON is enabled, 1 byte containing
+        value_options.  If the PARTIAL_JSON bit of value_options is set, this is
+        followed by P bits (the "partial_bits"), packed into CEIL(P) bytes,
+        where P is the number of JSON columns in the table.
 
-      - M bits (the "null_bits"), packed into CEIL(M) bytes, where M
-        is the number of columns in the image.
+      - M bits (the "null_bits"), packed into CEIL(M) bytes, where M is the
+        number of columns in the image.
 
-      - A sequence of serialized fields, each corresponding to a
-        non-NULL column in the row image.
+      - A sequence of serialized fields, each corresponding to a non-NULL column
+        in the row image.
 
-        For variable-length columns, the first component of the
-        serialized field is a length, stored using 1, 2, 3, or 4
-        bytes depending on the maximum length for the data type.
+        For variable-length columns, the first component of the serialized field
+        is a length, stored using 1, 2, 3, or 4 bytes depending on the maximum
+        length for the data type.
 
-        For most data types, the next component of the serialized
-        field is the actual field data.  But for JSON fields where
-        the corresponding bit of the partial_bits is 1, this is a
-        sequence of diffs instead.
+        For most data types, the next component of the serialized field is the
+        actual field data.  But for JSON fields where the corresponding bit of
+        the partial_bits is 1, this is a sequence of diffs instead.
 
-      Now we try to use table_s->reclength to estimate how much
-      memory to allocate for a row image in the binlog.  Due to the
-      differences this will only be an upper bound.  Notice the
-      differences:
+      Now we try to use table_s->reclength to estimate how much memory to
+      allocate for a row image in the binlog.  Due to the differences this will
+      only be an upper bound.  Notice the differences:
 
-      - The binlog may only include a subset of the fields (the row
-        image), whereas reclength contains space for all fields.
+      - The binlog may only include a subset of the fields (the row image),
+        whereas reclength contains space for all fields.
 
-      - BIT columns are not packed together with NULL bits in the
-        binlog, so up to 1 more byte per BIT column may be needed.
+      - BIT columns are not packed together with NULL bits in the binlog, so up
+        to 1 more byte per BIT column may be needed.
 
-      - The binlog has a null bit even for non-nullable fields,
-        whereas the reclength only contains space nullable fields,
-        so the binlog may need up to CEIL(table_s->fields/8) more
-        bytes.
+      - The binlog has a null bit even for non-nullable fields, whereas the
+        reclength only contains space nullable fields, so the binlog may need up
+        to CEIL(table_s->fields/8) more bytes.
 
-      - The binlog only has a null bit for fields in the image,
-        whereas the reclength contains space for all fields.
+      - The binlog only has a null bit for fields in the image, whereas the
+        reclength contains space for all fields.
 
-      - The binlog contains the full blob whereas the record only
-        contains sizeof(pointer) bytes.
+      - The binlog contains the full blob whereas the record only contains
+        sizeof(pointer) bytes.
 
-      - The binlog contains value_options and partial_bits.  So this
-        may use up to 1+CEIL(table_s->fields/8) more bytes.
+      - The binlog contains value_options and partial_bits.  So this may use up
+        to 1+CEIL(table_s->fields/8) more bytes.
 
-      - The binlog may contain partial JSON.  This is guaranteed to
-        be smaller than the size of the full value.
+      - The binlog may contain partial JSON.  This is guaranteed to be smaller
+        than the size of the full value.
 
-      For those data types that are not stored using a pointer, the
-      size of the field in the binary log is at most 2 bytes more
-      than what the field contributes to in table_s->reclength,
-      because those data types use at most 1 byte for the length and
-      waste less than a byte on extra padding and extra bits in
-      null_bits or BIT columns.
+      - There may exist columns that, due to their nature, are not replicated,
+        for instance, hidden generated columns used for functional indexes.
 
-      For those data types that are stored using a pointer, the size
-      of the field in the binary log is at most 2 bytes more than
-      what the field contributes to in table_s->reclength, plus the
-      size of the data.  The size of the pointer is at least 4 on
-      all supported platforms, so it is bigger than what is used by
-      partial_bits, value_format, or any waste due to extra padding
-      and extra bits in null_bits.
+      For those data types that are not stored using a pointer, the size of the
+      field in the binary log is at most 2 bytes more than what the field
+      contributes to in table_s->reclength, because those data types use at most
+      1 byte for the length and waste less than a byte on extra padding and
+      extra bits in null_bits or BIT columns.
+
+      For those data types that are stored using a pointer, the size of the
+      field in the binary log is at most 2 bytes more than what the field
+      contributes to in table_s->reclength, plus the size of the data.  The size
+      of the pointer is at least 4 on all supported platforms, so it is bigger
+      than what is used by partial_bits, value_format, or any waste due to extra
+      padding and extra bits in null_bits.
     */
-    size_t length = table_s->reclength + 2 * table_s->fields;
+    size_t length = table_s->reclength + 2 * (fields.filtered_size());
 
     for (uint i = 0; i < table_s->blob_fields; i++) {
+      if (fields.is_excluded(table_s->blob_field[i])) continue;
+
       Field *field = table->field[table_s->blob_field[i]];
       Field_blob *field_blob = down_cast<Field_blob *>(field);
 
@@ -10798,7 +11003,7 @@ class Row_data_memory {
         allocated. We allocate memory for two records so that it can
         be used when processing update rows as well.
       */
-      if (table->write_row_record == 0)
+      if (table->write_row_record == nullptr)
         table->write_row_record = (uchar *)table->mem_root.Alloc(2 * maxlen);
       m_memory = table->write_row_record;
       m_release_memory_on_destruction = false;
@@ -10809,7 +11014,7 @@ class Row_data_memory {
     }
   }
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   mutable bool m_alloc_checked;
 #endif
   bool m_release_memory_on_destruction;
@@ -10821,7 +11026,7 @@ class Row_data_memory {
 
 int THD::binlog_write_row(TABLE *table, bool is_trans, uchar const *record,
                           const unsigned char *extra_row_info) {
-  DBUG_ASSERT(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
+  assert(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
 
   /*
     Pack records into format for transfer. We are allocating more
@@ -10839,7 +11044,7 @@ int THD::binlog_write_row(TABLE *table, bool is_trans, uchar const *record,
       binlog_prepare_pending_rows_event<Write_rows_log_event>(
           table, server_id, len, is_trans, extra_row_info);
 
-  if (unlikely(ev == 0)) return HA_ERR_OUT_OF_MEM;
+  if (unlikely(ev == nullptr)) return HA_ERR_OUT_OF_MEM;
 
   return ev->add_row_data(row_data, len);
 }
@@ -10848,7 +11053,7 @@ int THD::binlog_update_row(TABLE *table, bool is_trans,
                            const uchar *before_record,
                            const uchar *after_record,
                            const unsigned char *extra_row_info) {
-  DBUG_ASSERT(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
+  assert(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
   int error = 0;
 
   /**
@@ -10898,10 +11103,11 @@ int THD::binlog_update_row(TABLE *table, bool is_trans,
           table, server_id, before_size + after_size, is_trans, extra_row_info,
           source_part_id);
 
+  if (unlikely(ev == nullptr)) return HA_ERR_OUT_OF_MEM;
+
   if (part_info) {
     ev->m_extra_row_info.set_source_partition_id(source_part_id);
   }
-  if (unlikely(ev == 0)) return HA_ERR_OUT_OF_MEM;
 
   error = ev->add_row_data(before_row, before_size) ||
           ev->add_row_data(after_row, after_size);
@@ -10916,7 +11122,7 @@ int THD::binlog_update_row(TABLE *table, bool is_trans,
 
 int THD::binlog_delete_row(TABLE *table, bool is_trans, uchar const *record,
                            const unsigned char *extra_row_info) {
-  DBUG_ASSERT(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
+  assert(is_current_stmt_binlog_format_row() && mysql_bin_log.is_open());
   int error = 0;
 
   /**
@@ -10951,7 +11157,7 @@ int THD::binlog_delete_row(TABLE *table, bool is_trans, uchar const *record,
       binlog_prepare_pending_rows_event<Delete_rows_log_event>(
           table, server_id, len, is_trans, extra_row_info);
 
-  if (unlikely(ev == 0)) return HA_ERR_OUT_OF_MEM;
+  if (unlikely(ev == nullptr)) return HA_ERR_OUT_OF_MEM;
 
   error = ev->add_row_data(row_data, len);
 
@@ -10985,9 +11191,9 @@ void binlog_prepare_row_images(const THD *thd, TABLE *table) {
       Just to be sure that tmp_set is currently not in use as
       the read_set already.
     */
-    DBUG_ASSERT(table->read_set != &table->tmp_set);
+    assert(table->read_set != &table->tmp_set);
     // Verify it's not used
-    DBUG_ASSERT(bitmap_is_clear_all(&table->tmp_set));
+    assert(bitmap_is_clear_all(&table->tmp_set));
 
     switch (thd->variables.binlog_row_image) {
       case BINLOG_ROW_IMAGE_MINIMAL:
@@ -11004,12 +11210,12 @@ void binlog_prepare_row_images(const THD *thd, TABLE *table) {
         for (Field **ptr = table->field; *ptr; ptr++) {
           Field *field = (*ptr);
           if ((field->type() == MYSQL_TYPE_BLOB) &&
-              !(field->flags & PRI_KEY_FLAG))
-            bitmap_clear_bit(&table->tmp_set, field->field_index);
+              !field->is_flag_set(PRI_KEY_FLAG))
+            bitmap_clear_bit(&table->tmp_set, field->field_index());
         }
         break;
       default:
-        DBUG_ASSERT(0);  // impossible.
+        assert(0);  // impossible.
     }
 
     /* set the temporary read_set */
@@ -11041,14 +11247,14 @@ int THD::binlog_flush_pending_rows_event(bool stmt_end, bool is_transactional) {
       binlog_table_maps = 0;
     }
 
-    error = mysql_bin_log.flush_and_set_pending_rows_event(this, 0,
+    error = mysql_bin_log.flush_and_set_pending_rows_event(this, nullptr,
                                                            is_transactional);
   }
 
   return error;
 }
 
-#if !defined(DBUG_OFF)
+#if !defined(NDEBUG)
 static const char *show_query_type(THD::enum_binlog_query_type qtype) {
   switch (qtype) {
     case THD::ROW_QUERY_TYPE:
@@ -11057,7 +11263,7 @@ static const char *show_query_type(THD::enum_binlog_query_type qtype) {
       return "STMT";
     case THD::QUERY_TYPE_COUNT:
     default:
-      DBUG_ASSERT(0 <= qtype && qtype < THD::QUERY_TYPE_COUNT);
+      assert(0 <= qtype && qtype < THD::QUERY_TYPE_COUNT);
   }
   static char buf[64];
   sprintf(buf, "UNKNOWN#%d", qtype);
@@ -11102,7 +11308,7 @@ static void do_unsafe_limit_checkout(char *buf, int unsafe_type,
                                      const char *query) {
   ulonglong now;
   DBUG_TRACE;
-  DBUG_ASSERT(unsafe_type == LEX::BINLOG_STMT_UNSAFE_LIMIT);
+  assert(unsafe_type == LEX::BINLOG_STMT_UNSAFE_LIMIT);
   limit_unsafe_warning_count++;
   /*
     INITIALIZING:
@@ -11176,8 +11382,8 @@ void THD::issue_unsafe_warnings() {
     Ensure that binlog_unsafe_warning_flags is big enough to hold all
     bits.  This is actually a constant expression.
   */
-  DBUG_ASSERT(LEX::BINLOG_STMT_UNSAFE_COUNT <=
-              sizeof(binlog_unsafe_warning_flags) * CHAR_BIT);
+  assert(LEX::BINLOG_STMT_UNSAFE_COUNT <=
+         sizeof(binlog_unsafe_warning_flags) * CHAR_BIT);
 
   uint32 unsafe_type_flags = binlog_unsafe_warning_flags;
 
@@ -11233,7 +11439,7 @@ int THD::binlog_query(THD::enum_binlog_query_type qtype, const char *query_arg,
   DBUG_TRACE;
   DBUG_PRINT("enter",
              ("qtype: %s  query: '%s'", show_query_type(qtype), query_arg));
-  DBUG_ASSERT(query_arg && mysql_bin_log.is_open());
+  assert(query_arg && mysql_bin_log.is_open());
 
   if (get_binlog_local_stmt_filter() == BINLOG_FILTER_SET) {
     /*
@@ -11328,7 +11534,7 @@ int THD::binlog_query(THD::enum_binlog_query_type qtype, const char *query_arg,
 
     case THD::QUERY_TYPE_COUNT:
     default:
-      DBUG_ASSERT(0 <= qtype && qtype < QUERY_TYPE_COUNT);
+      assert(0 <= qtype && qtype < QUERY_TYPE_COUNT);
   }
   return 0;
 }
@@ -11342,7 +11548,7 @@ mysql_declare_plugin(binlog){
     MYSQL_STORAGE_ENGINE_PLUGIN,
     &binlog_storage_engine,
     "binlog",
-    "MySQL AB",
+    PLUGIN_AUTHOR_ORACLE,
     "This is a pseudo storage engine to represent the binlog in a transaction",
     PLUGIN_LICENSE_GPL,
     binlog_init,   /* Plugin Init */

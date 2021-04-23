@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -58,9 +58,9 @@ SELECT sys.format_statement(DIGEST_TEXT) AS query,
        COUNT_STAR AS exec_count,
        SUM_ERRORS AS err_count,
        SUM_WARNINGS AS warn_count,
-       sys.format_time(SUM_TIMER_WAIT) AS total_latency,
-       sys.format_time(MAX_TIMER_WAIT) AS max_latency,
-       sys.format_time(AVG_TIMER_WAIT) AS avg_latency,
+       format_pico_time(SUM_TIMER_WAIT) AS total_latency,
+       format_pico_time(MAX_TIMER_WAIT) AS max_latency,
+       format_pico_time(AVG_TIMER_WAIT) AS avg_latency,
        SUM_ROWS_SENT AS rows_sent,
        ROUND(IFNULL(SUM_ROWS_SENT / NULLIF(COUNT_STAR, 0), 0)) AS rows_sent_avg,
        SUM_ROWS_EXAMINED AS rows_examined,

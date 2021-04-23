@@ -1,4 +1,4 @@
--- Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+-- Copyright (c) 2014, 2021, Oracle and/or its affiliates.
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -13,13 +13,13 @@
 -- along with this program; if not, write to the Free Software
 -- Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
 
-DROP FUNCTION IF EXISTS format_time;
+DROP FUNCTION IF EXISTS sys.format_time;
 
 DELIMITER $$
 
-CREATE DEFINER='mysql.sys'@'localhost' FUNCTION format_time (
-        -- We feed in and return TEXT here, as aggregates of
-        -- picoseconds can return numbers larger than BIGINT UNSIGNED
+CREATE DEFINER='mysql.sys'@'localhost' FUNCTION sys.format_time (
+-- We feed in and return TEXT here, as aggregates of
+-- picoseconds can return numbers larger than BIGINT UNSIGNED
         picoseconds TEXT
     )
     RETURNS TEXT CHARSET UTF8MB4

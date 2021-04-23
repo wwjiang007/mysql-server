@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2003, 2021, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
@@ -305,6 +305,36 @@ InitConfigFileParser::storeNameValuePair(Context& ctx,
 					 const char* fname,
 					 const char* value)
 {
+  if (native_strcasecmp(fname, "MaxNoOfConcurrentScans") == 0 ||
+      native_strcasecmp(fname, "MaxNoOfConcurrentIndexOperations") == 0 ||
+      native_strcasecmp(fname, "MaxNoOfConcurrentOperations") == 0 ||
+      native_strcasecmp(fname, "MaxNoOfConcurrentTransactions") == 0)
+  {
+    if (ctx.m_currentSection->contains("TransactionMemory"))
+    {
+      ctx.reportError(
+          "[%s] Parameter %s can not be set along with TransactionMemory",
+          ctx.fname, fname);
+      return false;
+    }
+  }
+
+  if (native_strcasecmp(fname, "TransactionMemory") == 0)
+  {
+    if (ctx.m_currentSection->contains("MaxNoOfConcurrentScans") ||
+        ctx.m_currentSection->contains("MaxNoOfConcurrentIndexOperations") ||
+        ctx.m_currentSection->contains("MaxNoOfConcurrentOperations") ||
+        ctx.m_currentSection->contains("MaxNoOfConcurrentTransactions"))
+    {
+      ctx.reportError(
+          "[%s] Parameter %s can not be set along with any of the below "
+          "deprecated parameter(s) MaxNoOfConcurrentScans, "
+          "MaxNoOfConcurrentIndexOperations, MaxNoOfConcurrentOperations "
+          "and MaxNoOfConcurrentTransactions",
+          ctx.fname, fname);
+      return false;
+    }
+  }
 
   if (ctx.m_currentSection->contains(fname))
   {
@@ -325,7 +355,7 @@ InitConfigFileParser::storeNameValuePair(Context& ctx,
   if (status == ConfigInfo::CI_DEPRECATED) {
     const char * desc = m_info->getDescription(ctx.m_currentInfo, fname);
     if(desc && desc[0]){
-      ctx.reportWarning("[%s] %s is deprecated, use %s instead",
+      ctx.reportWarning("[%s] %s is deprecated, will use %s instead",
 			ctx.fname, fname, desc);
     } else if (desc == 0){
       ctx.reportWarning("[%s] %s is deprecated", ctx.fname, fname);
@@ -857,7 +887,7 @@ InitConfigFileParser::load_mycnf_groups(Vector<struct my_option> & options,
   release the memory allocated by my_strdup() from handle_options().
 */
 Config *
-InitConfigFileParser::parse_mycnf() 
+InitConfigFileParser::parse_mycnf(const char* cluster_config_suffix)
 {
   Config * res = 0;
   bool release_current_section = true;
@@ -952,6 +982,11 @@ InitConfigFileParser::parse_mycnf()
   
   Context ctx(m_info);
   const char *groups[]= { "cluster_config", 0 };
+  const char *save_group_suffix = my_defaults_group_suffix;
+  if (cluster_config_suffix != nullptr)
+  {
+    my_defaults_group_suffix = cluster_config_suffix;
+  }
   if (load_defaults(options, groups))
     goto end;
 
@@ -1069,6 +1104,8 @@ InitConfigFileParser::parse_mycnf()
   release_current_section = false;
 
 end:
+  my_defaults_group_suffix = save_group_suffix;
+
   for (int i = 0; options[i].name; i++)
   {
     if (options[i].var_type == GET_STR_ALLOC)
